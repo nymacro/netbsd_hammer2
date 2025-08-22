@@ -1870,12 +1870,6 @@ restart:
 			wakeup(&ip->flags);
 
 		/*
-		 * Relock the inode, and we inherit a ref from the above.
-		 * We will check for a race after we acquire the vnode.
-		 */
-		hammer2_mtx_ex(&ip->lock);
-
-		/*
 		 * We need the vp in order to vfsync() dirty buffers, so if
 		 * one isn't attached we can skip it.
 		 *
@@ -1912,8 +1906,8 @@ restart:
 				dorestart |= 1;
 				debug_hprintf("inum %016llx vn_lock failed\n",
 				    (long long)ip->meta.inum);
+				hammer2_mtx_ex(&ip->lock);
 				hammer2_inode_delayed_sideq(ip);
-
 				hammer2_mtx_unlock(&ip->lock);
 				hammer2_inode_drop(ip);
 
@@ -1927,9 +1921,14 @@ restart:
 				hammer2_spin_ex(&pmp->list_spin);
 				continue;
 			}
-		} else {
-			vp = NULL;
 		}
+
+		/*
+		 * Relock the inode, and we inherit a ref from the above.
+		 * We will check for a race after we acquire the vnode.
+		 */
+		/* XXX2 DragonFly takes inode lock before vget */
+		hammer2_mtx_ex(&ip->lock);
 
 		/*
 		 * If the inode wound up on a SIDEQ again it will already be

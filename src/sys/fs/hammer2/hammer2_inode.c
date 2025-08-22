@@ -216,6 +216,7 @@ void
 hammer2_inode_lock(hammer2_inode_t *ip, int how)
 {
 	hammer2_pfs_t *pmp;
+	int error __unused;
 
 	hammer2_inode_ref(ip);
 	pmp = ip->pmp;
@@ -251,9 +252,11 @@ hammer2_inode_lock(hammer2_inode_t *ip, int how)
 			hammer2_spin_unex(&pmp->list_spin);
 			hammer2_mtx_unlock(&ip->lock);
 			/* race window here */
-			tsleep(&ip->flags, 0, "h2sync",
-			    hz / 10 /* 0 in DragonFly */);
+			error = tsleep(&ip->flags, 0, "h2sync",
+			    hz / 100 /* 0 in DragonFly */);
 			hammer2_mtx_ex(&ip->lock);
+			debug_hprintf("inum %016llx wokeup error %d\n",
+			    (long long)ip->meta.inum, error);
 			continue;
 		}
 		hammer2_spin_unex(&pmp->list_spin);
@@ -359,6 +362,8 @@ restart:
 void
 hammer2_inode_unlock(hammer2_inode_t *ip)
 {
+	/* XXX2 DragonFly doesn't take list_spin here */
+	hammer2_spin_ex(&ip->pmp->list_spin);
 	if (ip->flags & HAMMER2_INODE_SYNCQ_WAKEUP) {
 		atomic_clear_int(&ip->flags, HAMMER2_INODE_SYNCQ_WAKEUP);
 		hammer2_mtx_unlock(&ip->lock);
@@ -366,6 +371,7 @@ hammer2_inode_unlock(hammer2_inode_t *ip)
 	} else {
 		hammer2_mtx_unlock(&ip->lock);
 	}
+	hammer2_spin_unex(&ip->pmp->list_spin);
 	hammer2_inode_drop(ip);
 }
 

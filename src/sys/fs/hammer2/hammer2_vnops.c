@@ -1325,21 +1325,20 @@ hammer2_lookup(void *v)
 	kauth_cred_t cred = cnp->cn_cred;
 	hammer2_xop_nresolve_t *xop;
 	hammer2_inode_t *ip, *dip = VTOI(dvp);
-	int nameiop, error;
+	uint32_t flags = cnp->cn_flags;
+	uint32_t nameiop = cnp->cn_nameiop;
+	int error;
 
 	KASSERT(VOP_ISLOCKED(dvp));
 	KKASSERT(ap->a_vpp);
 	*ap->a_vpp = NULL;
-
-	nameiop = cnp->cn_nameiop;
 
 	/* Check accessibility of directory. */
 	error = VOP_ACCESS(dvp, VEXEC, cred);
 	if (error)
 		return (error);
 
-	if ((cnp->cn_flags & ISLASTCN) &&
-	    (dvp->v_mount->mnt_flag & MNT_RDONLY) &&
+	if ((flags & ISLASTCN) && (dvp->v_mount->mnt_flag & MNT_RDONLY) &&
 	    (nameiop == DELETE || nameiop == RENAME))
 		return (EROFS);
 
@@ -1350,8 +1349,8 @@ hammer2_lookup(void *v)
 	 * check the name cache to see if the directory/name pair
 	 * we are looking for is known already.
 	 */
-	if (cache_lookup(dvp, cnp->cn_nameptr, cnp->cn_namelen, nameiop,
-	    cnp->cn_flags, NULL, ap->a_vpp)) {
+	if (cache_lookup(dvp, cnp->cn_nameptr, cnp->cn_namelen, nameiop, flags,
+	    NULL, ap->a_vpp)) {
 		if (*ap->a_vpp == NULLVP)
 			return (ENOENT);
 		else
@@ -1363,24 +1362,18 @@ hammer2_lookup(void *v)
 		return (ENOLCK);
 
 	/* NetBSD needs "." and ".." handling. */
-	if (cnp->cn_flags & ISDOTDOT) {
-		if ((cnp->cn_flags & ISLASTCN) && nameiop == RENAME)
-			return (EINVAL);
+	if (flags & ISDOTDOT) {
 		/* NetBSD requires unlocked vnode. */
 		error = VFS_VGET(dip->pmp->mp, dip->meta.iparent, LK_NONE, &vp);
 		if (error)
 			return (error);
 		*ap->a_vpp = vp;
-		cache_enter(dvp, vp, cnp->cn_nameptr, cnp->cn_namelen,
-		    cnp->cn_flags);
+		cache_enter(dvp, vp, cnp->cn_nameptr, cnp->cn_namelen, flags);
 		return (0);
 	} else if (cnp->cn_namelen == 1 && cnp->cn_nameptr[0] == '.') {
-		if ((cnp->cn_flags & ISLASTCN) && nameiop == RENAME)
-			return (EISDIR);
 		vref(dvp); /* we want ourself, ie "." */
 		*ap->a_vpp = dvp;
-		cache_enter(dvp, dvp, cnp->cn_nameptr, cnp->cn_namelen,
-		    cnp->cn_flags);
+		cache_enter(dvp, dvp, cnp->cn_nameptr, cnp->cn_namelen, flags);
 		return (0);
 	}
 
@@ -1397,59 +1390,81 @@ hammer2_lookup(void *v)
 	hammer2_inode_unlock(dip);
 
 	if (ip) {
-		/* NetBSD requires unlocked vnode. */
-		error = hammer2_igetv(ip, LK_NONE, &vp);
-		if (error == 0) {
-			if (nameiop == DELETE && (cnp->cn_flags & ISLASTCN)) {
-				error = VOP_ACCESS(dvp, VWRITE, cred);
-				if (error) {
-					vrele(vp);
-					hammer2_inode_unlock(ip);
-					goto out;
-				}
-				/*
-				 * If directory is "sticky", then user must own
-				 * the directory, or the file in it, else she
-				 * may not delete it (unless she's root). This
-				 * implements append-only directories.
-				 */
-				if (kauth_authorize_vnode(cred, KAUTH_VNODE_DELETE,
-				    vp, dvp, genfs_can_sticky(dvp, cred,
-				    hammer2_inode_to_uid(dip),
-				    hammer2_inode_to_uid(ip)))) {
-					error = EPERM;
-					vput(vp);
-					hammer2_inode_unlock(ip);
-					goto out;
-				}
-				*ap->a_vpp = vp;
-			} else if (nameiop == RENAME &&
-			    (cnp->cn_flags & ISLASTCN)) {
-				error = VOP_ACCESS(dvp, VWRITE, cred);
-				if (error) {
-					vrele(vp);
-					hammer2_inode_unlock(ip);
-					goto out;
-				}
-				*ap->a_vpp = vp;
-			} else {
-				*ap->a_vpp = vp;
-				cache_enter(dvp, vp, cnp->cn_nameptr,
-				    cnp->cn_namelen, cnp->cn_flags);
+		if (nameiop == DELETE && (flags & ISLASTCN)) {
+			/* Write access to directory required. */
+			error = VOP_ACCESS(dvp, VWRITE, cred);
+			if (error) {
+				hammer2_inode_unlock(ip);
+				goto out;
 			}
+			/* NetBSD requires unlocked vnode. */
+			error = hammer2_igetv(ip, LK_NONE, &vp);
+			if (error) {
+				hammer2_inode_unlock(ip);
+				goto out;
+			}
+			/*
+			 * If directory is "sticky", then user must own
+			 * the directory, or the file in it, else she
+			 * may not delete it (unless she's root). This
+			 * implements append-only directories.
+			 */
+			if (kauth_authorize_vnode(cred, KAUTH_VNODE_DELETE,
+			    vp, dvp, genfs_can_sticky(dvp, cred,
+			    hammer2_inode_to_uid(dip),
+			    hammer2_inode_to_uid(ip)))) {
+				error = EPERM;
+				vrele(vp);
+				hammer2_inode_unlock(ip);
+				goto out;
+			}
+			*ap->a_vpp = vp;
+		} else if (nameiop == RENAME && (flags & ISLASTCN)) {
+			/* Write access to directory required. */
+			error = VOP_ACCESS(dvp, VWRITE, cred);
+			if (error) {
+				hammer2_inode_unlock(ip);
+				goto out;
+			}
+			/* NetBSD requires unlocked vnode. */
+			error = hammer2_igetv(ip, LK_NONE, &vp);
+			if (error) {
+				hammer2_inode_unlock(ip);
+				goto out;
+			}
+			*ap->a_vpp = vp;
+		} else {
+			/* NetBSD requires unlocked vnode. */
+			error = hammer2_igetv(ip, LK_NONE, &vp);
+			if (error) {
+				hammer2_inode_unlock(ip);
+				goto out;
+			}
+			*ap->a_vpp = vp;
+			cache_enter(dvp, vp, cnp->cn_nameptr,
+			    cnp->cn_namelen, flags);
 		}
 		hammer2_inode_unlock(ip);
 	} else {
 		if ((nameiop == CREATE || nameiop == RENAME) &&
-		    (cnp->cn_flags & ISLASTCN)) {
+		    (flags & ISLASTCN)) {
+			/*
+			 * Access for write is interpreted as allowing
+			 * creation of files in the directory.
+			 */
 			error = VOP_ACCESS(dvp, VWRITE, cred);
 			if (error)
 				goto out;
+			/* We return with the directory locked. */
 			error = EJUSTRETURN;
 		} else {
+			/*
+			 * Insert name into cache (as non-existent) if
+			 * appropriate.
+			 */
 			if (nameiop != CREATE)
 				cache_enter(dvp, NULLVP, cnp->cn_nameptr,
-				    cnp->cn_namelen, cnp->cn_flags);
+				    cnp->cn_namelen, flags);
 			error = ENOENT;
 		}
 	}
@@ -1564,6 +1579,9 @@ hammer2_mkdir(void *v)
 	hammer2_tid_t inum;
 	uint64_t mtime;
 	int error;
+
+	if ((nlink_t)dip->meta.nlinks >= HAMMER2_LINK_MAX)
+		return (EMLINK);
 
 	if (dip->pmp->rdonly || (dip->pmp->flags & HAMMER2_PMPF_EMERG))
 		return (EROFS);
@@ -2039,6 +2057,13 @@ hammer2_rename(void *v)
 			VOP_UNLOCK(fvp);
 			goto abortit;
 		}
+		if ((nlink_t)tdip->meta.nlinks >= HAMMER2_LINK_MAX) {
+			error = EMLINK;
+			if (fdvp != tdvp)
+				VOP_UNLOCK(fdvp);
+			VOP_UNLOCK(fvp);
+			goto abortit;
+		}
 	}
 
 	hammer2_trans_init(tdip->pmp, 0);
@@ -2092,13 +2117,13 @@ hammer2_rename(void *v)
 	hammer2_xop_retire(&sxop->head, HAMMER2_XOPMASK_VOP);
 	if (error) {
 		if (error != ENOENT)
-			goto done2;
+			goto done;
 		++tlhc;
 		error = 0;
 	}
 	if ((lhcbase ^ tlhc) & ~HAMMER2_DIRHASH_LOMASK) {
 		error = ENOSPC;
-		goto done2;
+		goto done;
 	}
 
 	/*
@@ -2146,7 +2171,7 @@ hammer2_rename(void *v)
 		update_fdip = 1;
 		update_tdip = 1;
 	}
-done2:
+done:
 	/*
 	 * If no error, the backend has replaced the target directory entry.
 	 * We must adjust nlinks on the original replace target if it exists.
@@ -2199,7 +2224,7 @@ done2:
 		vrele(fdvp);
 	vput(fvp);
 	vput(tdvp);
-	if (tvp != NULL) {
+	if (tvp) {
 		if (tvp != tdvp)
 			vput(tvp);
 		else /* how ? */
@@ -2210,7 +2235,7 @@ abortit:
 	vrele(fdvp);
 	vrele(fvp);
 	vput(tdvp);
-	if (tvp != NULL) {
+	if (tvp) {
 		if (tvp != tdvp)
 			vput(tvp);
 		else /* how ? */
@@ -2237,6 +2262,9 @@ hammer2_link(void *v)
 
 	if (dvp->v_mount != vp->v_mount)
 		return (EXDEV);
+
+	if ((nlink_t)ip->meta.nlinks >= HAMMER2_LINK_MAX)
+		return (EMLINK);
 
 	if (ip->meta.uflags & (IMMUTABLE | APPEND))
 		return (EPERM);
@@ -2497,7 +2525,7 @@ hammer2_pathconf(void *v)
 
 	switch (ap->a_name) {
 	case _PC_LINK_MAX:
-		*ap->a_retval = INT_MAX;
+		*ap->a_retval = HAMMER2_LINK_MAX;
 		break;
 	case _PC_NAME_MAX:
 		*ap->a_retval = NAME_MAX; /* < HAMMER2_INODE_MAXNAME */

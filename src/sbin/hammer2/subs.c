@@ -43,6 +43,7 @@
 #include <sys/mount.h>
 #include <sys/statvfs.h>
 #include <sys/disk.h>
+#include <sys/disklabel.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -314,12 +315,27 @@ hammer2_off_t
 check_volume(int fd)
 {
 	struct stat st;
+	struct dkwedge_info dkw;
+	struct disklabel dl;
 	hammer2_off_t size;
+	int part;
 
 	/*
-	 * Get basic information about the volume
+	 * Get basic information about the volume.
+	 *
+	 * NetBSD: DIOCGMEDIASIZE returns the whole-disk size even for a
+	 * disklabel partition device, so query the wedge (partition)
+	 * size first, then the disklabel partition, and only then the
+	 * whole-disk media size.
 	 */
-	if (ioctl(fd, DIOCGMEDIASIZE, &size) < 0) {
+	if (ioctl(fd, DIOCGWEDGEINFO, &dkw) == 0) {
+		size = (hammer2_off_t)dkw.dkw_size * 512;
+	} else if (fstat(fd, &st) == 0 && (S_ISBLK(st.st_mode) ||
+	    S_ISCHR(st.st_mode)) && ioctl(fd, DIOCGDINFO, &dl) == 0) {
+		part = minor(st.st_rdev) % MAXPARTITIONS;
+		size = (hammer2_off_t)dl.d_partitions[part].p_size *
+		    dl.d_secsize;
+	} else if (ioctl(fd, DIOCGMEDIASIZE, &size) < 0) {
 		/*
 		 * Allow the formatting of regular files as HAMMER2 volumes
 		 */

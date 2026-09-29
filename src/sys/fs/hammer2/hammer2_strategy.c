@@ -46,8 +46,9 @@
 
 static int hammer2_strategy_read(struct vop_strategy_args *);
 static int hammer2_strategy_write(struct vop_strategy_args *);
+static int hammer2_strategy_suboff(struct buf *);
 static void hammer2_strategy_read_completion(hammer2_chain_t *, const char *,
-    struct buf *);
+    struct buf *, int, int);
 static void hammer2_dedup_record(hammer2_chain_t *, hammer2_io_t *,
     const char *);
 static hammer2_off_t hammer2_dedup_lookup(hammer2_dev_t *, char **, int);
@@ -83,11 +84,11 @@ hammer2_strategy(void *v)
  */
 static void
 hammer2_decompress_LZ4_callback(const char *data, unsigned int bytes,
-    struct buf *bp)
+    struct buf *bp, int off, int len)
 {
 	char *compressed_buffer;
 	int compressed_size;
-	int result;
+	int result, n;
 
 	KKASSERT(bp->b_bufsize <= HAMMER2_PBUFSIZE);
 	compressed_size = *(const int *)data;
@@ -96,18 +97,23 @@ hammer2_decompress_LZ4_callback(const char *data, unsigned int bytes,
 	compressed_buffer = hmalloc(HAMMER2_PBUFSIZE, M_HAMMER2_RBUF,
 	    M_WAITOK | M_ZERO);
 	result = LZ4_decompress_safe(__DECONST(char *, &data[sizeof(int)]),
-	    compressed_buffer, compressed_size, bp->b_bufsize);
+	    compressed_buffer, compressed_size, HAMMER2_PBUFSIZE);
 	if (result < 0) {
 		hprintf("error during decompression: buf %016llx/%016llx/%d\n",
 		    (long long)bp->b_lblkno, (long long)bp->b_blkno, bytes);
 		/* Make sure it isn't random garbage. */
-		bzero(compressed_buffer, bp->b_bufsize);
+		bzero(compressed_buffer, HAMMER2_PBUFSIZE);
+		result = 0;
 	}
 
-	KKASSERT(result <= bp->b_bufsize);
-	bcopy(compressed_buffer, bp->b_data, bp->b_bufsize);
-	if (result < bp->b_bufsize)
-		bzero((char *)bp->b_data + result, bp->b_bufsize - result);
+	KKASSERT(result <= HAMMER2_PBUFSIZE);
+	n = 0;
+	if (off < result) {
+		n = MIN(len, result - off);
+		bcopy(compressed_buffer + off, bp->b_data, n);
+	}
+	if (n < len)
+		bzero((char *)bp->b_data + n, len - n);
 	hfree(compressed_buffer, M_HAMMER2_RBUF, HAMMER2_PBUFSIZE);
 	bp->b_resid = 0;
 }
@@ -117,11 +123,11 @@ hammer2_decompress_LZ4_callback(const char *data, unsigned int bytes,
  */
 static void
 hammer2_decompress_ZLIB_callback(const char *data, unsigned int bytes,
-    struct buf *bp)
+    struct buf *bp, int off, int len)
 {
 	char *compressed_buffer;
 	z_stream strm_decompress;
-	int result;
+	int result, produced, n;
 
 	KKASSERT(bp->b_bufsize <= HAMMER2_PBUFSIZE);
 	bzero(&strm_decompress, sizeof(strm_decompress));
@@ -140,21 +146,41 @@ hammer2_decompress_ZLIB_callback(const char *data, unsigned int bytes,
 	/* XXX Supply proper size, subset of device bp. */
 	strm_decompress.avail_in = bytes;
 	strm_decompress.next_out = compressed_buffer;
-	strm_decompress.avail_out = bp->b_bufsize;
+	strm_decompress.avail_out = HAMMER2_PBUFSIZE;
 
 	result = inflate(&strm_decompress, Z_FINISH);
 	if (result != Z_STREAM_END) {
 		hprintf("fatal error during decompression\n");
-		bzero(compressed_buffer, bp->b_bufsize);
+		bzero(compressed_buffer, HAMMER2_PBUFSIZE);
 	}
-	bcopy(compressed_buffer, bp->b_data, bp->b_bufsize);
-	result = bp->b_bufsize - strm_decompress.avail_out;
-	if (result < bp->b_bufsize)
-		bzero((char *)bp->b_data + result, strm_decompress.avail_out);
+	produced = HAMMER2_PBUFSIZE - strm_decompress.avail_out;
+	n = 0;
+	if (off < produced) {
+		n = MIN(len, produced - off);
+		bcopy(compressed_buffer + off, bp->b_data, n);
+	}
+	if (n < len)
+		bzero((char *)bp->b_data + n, len - n);
 	hfree(compressed_buffer, M_HAMMER2_RBUF, HAMMER2_PBUFSIZE);
 	inflateEnd(&strm_decompress);
 
 	bp->b_resid = 0;
+}
+
+/*
+ * Return the intra-logical-block byte offset of a buffer, or 0 for
+ * buffers coming from the logical buffer cache (bread/bwrite), where
+ * b_lblkno is set and b_blkno == b_lblkno.
+ */
+static int
+hammer2_strategy_suboff(struct buf *bp)
+{
+	if (bp->b_lblkno == 0 && bp->b_blkno != 0) {
+		/* genfs pager path: see hammer2_strategy_read(). */
+		return (bp->b_blkno & (HAMMER2_PBUFSIZE / DEV_BSIZE - 1)) *
+		    DEV_BSIZE;
+	}
+	return (0);
 }
 
 /*
@@ -169,6 +195,15 @@ hammer2_strategy_read(struct vop_strategy_args *ap)
 	hammer2_key_t lbase;
 
 	lbase = (hammer2_key_t)bp->b_lblkno * hammer2_get_logical();
+	if (bp->b_lblkno == 0 && bp->b_blkno != 0) {
+		/*
+		 * genfs pager path (genfs_getpages_read): b_lblkno is zeroed
+		 * and the logical block# + intra-block offset are packed in
+		 * b_blkno by hammer2_bmap().
+		 */
+		lbase = (hammer2_key_t)(bp->b_blkno >>
+		    (HAMMER2_PBUFRADIX - DEV_BSHIFT)) << HAMMER2_PBUFRADIX;
+	}
 	KKASSERT(((int)lbase & HAMMER2_PBUFMASK) == 0);
 
 	xop = hammer2_xop_alloc(ip, HAMMER2_XOP_STRATEGY);
@@ -223,7 +258,8 @@ hammer2_xop_strategy_read(hammer2_xop_t *arg, void *scratch, int clindex)
 	case 0:
 		data = hammer2_xop_gdata(&xop->head)->buf;
 		hammer2_strategy_read_completion(xop->head.cluster.focus, data,
-		    xop->bp);
+		    xop->bp, hammer2_strategy_suboff(xop->bp),
+		    xop->bp->b_bcount);
 		hammer2_xop_pdata(&xop->head);
 		biodone(bp);
 		break;
@@ -244,14 +280,20 @@ hammer2_xop_strategy_read(hammer2_xop_t *arg, void *scratch, int clindex)
 
 static void
 hammer2_strategy_read_completion(hammer2_chain_t *focus, const char *data,
-    struct buf *bp)
+    struct buf *bp, int off, int len)
 {
+	int n;
+
 	if (focus->bref.type == HAMMER2_BREF_TYPE_INODE) {
 		/* Copy from in-memory inode structure. */
-		bcopy(((const hammer2_inode_data_t *)data)->u.data, bp->b_data,
-		    HAMMER2_EMBEDDED_BYTES);
-		bzero((char *)bp->b_data + HAMMER2_EMBEDDED_BYTES,
-		    bp->b_bcount - HAMMER2_EMBEDDED_BYTES);
+		n = 0;
+		if (off < HAMMER2_EMBEDDED_BYTES) {
+			n = MIN(len, HAMMER2_EMBEDDED_BYTES - off);
+			bcopy(((const hammer2_inode_data_t *)data)->u.data + off,
+			    bp->b_data, n);
+		}
+		if (n < len)
+			bzero((char *)bp->b_data + n, len - n);
 		bp->b_resid = 0;
 		bp->b_error = 0;
 	} else if (focus->bref.type == HAMMER2_BREF_TYPE_DATA) {
@@ -270,22 +312,27 @@ hammer2_strategy_read_completion(hammer2_chain_t *focus, const char *data,
 		/* Decompression and copy. */
 		switch (HAMMER2_DEC_COMP(focus->bref.methods)) {
 		case HAMMER2_COMP_LZ4:
-			hammer2_decompress_LZ4_callback(data, focus->bytes, bp);
+			hammer2_decompress_LZ4_callback(data, focus->bytes, bp,
+			    off, len);
 			/* b_resid set by call */
 			break;
 		case HAMMER2_COMP_ZLIB:
-			hammer2_decompress_ZLIB_callback(data, focus->bytes, bp);
+			hammer2_decompress_ZLIB_callback(data, focus->bytes, bp,
+			    off, len);
 			/* b_resid set by call */
 			break;
-		case HAMMER2_COMP_NONE:
-			KKASSERT(focus->bytes <= (unsigned int)bp->b_bcount);
-			bcopy(data, bp->b_data, focus->bytes);
-			if (focus->bytes < (unsigned int)bp->b_bcount)
-				bzero((char *)bp->b_data + focus->bytes,
-				    bp->b_bcount - focus->bytes);
+		case HAMMER2_COMP_NONE: {
+			int avail = (focus->bytes > (unsigned int)off) ?
+			    focus->bytes - off : 0;
+
+			n = MIN(len, avail);
+			bcopy(data + off, bp->b_data, n);
+			if (n < len)
+				bzero((char *)bp->b_data + n, len - n);
 			bp->b_resid = 0;
 			bp->b_error = 0;
 			break;
+		}
 		default:
 			hpanic("bad comp type %02x", focus->bref.methods);
 			break;

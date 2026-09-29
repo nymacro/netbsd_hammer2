@@ -110,6 +110,7 @@ struct hammer2_ioc_bulkfree {
 	hammer2_off_t		total_fragmented;	/* merged result */
 	hammer2_off_t		total_allocated;	/* merged result */
 	hammer2_off_t		total_scanned;		/* bytes of storage */
+	hammer2_off_t		count_staged;	/* bits staged this run */
 };
 
 typedef struct hammer2_ioc_bulkfree hammer2_ioc_bulkfree_t;

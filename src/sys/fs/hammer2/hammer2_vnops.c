@@ -302,7 +302,9 @@ hammer2_getattr(void *v)
 	vap->va_nlink = ip->meta.nlinks;
 	vap->va_uid = hammer2_inode_to_uid(ip);
 	vap->va_gid = hammer2_inode_to_gid(ip);
-	vap->va_rdev = NODEV;
+	vap->va_rdev = (ip->meta.type == HAMMER2_OBJTYPE_CDEV ||
+	    ip->meta.type == HAMMER2_OBJTYPE_BDEV) ?
+	    makedev(ip->meta.rmajor, ip->meta.rminor) : NODEV;
 	vap->va_size = ip->meta.size;
 	vap->va_flags = ip->meta.uflags;
 	hammer2_time_to_timespec(ip->meta.ctime, &vap->va_ctime);
@@ -1304,8 +1306,16 @@ hammer2_bmap(void *v)
 
 	if (ap->a_vpp != NULL)
 		*ap->a_vpp = ap->a_vp;
-	if (ap->a_bnp != NULL)
-		*ap->a_bnp = ap->a_bn;
+	if (ap->a_bnp != NULL) {
+		/*
+		 * Return the logical block# scaled to DEV_BSIZE units so
+		 * that genfs_getpages_read() (which zeroes b_lblkno and
+		 * packs the block#+intra-block offset into b_blkno) can be
+		 * decoded by hammer2_strategy_read().
+		 */
+		*ap->a_bnp = (daddr_t)ap->a_bn <<
+		    (HAMMER2_PBUFRADIX - DEV_BSHIFT);
+	}
 	if (ap->a_runp != NULL)
 		*ap->a_runp = 0;
 
@@ -2579,7 +2589,8 @@ hammer2_vinit(struct mount *mp, struct vnode **vpp)
 	case VCHR:
 	case VBLK:
 		vp->v_op = hammer2_specop_p;
-		spec_node_init(vp, (dev_t)(uintptr_t)vp);
+		spec_node_init(vp,
+		    makedev(ip->meta.rmajor, ip->meta.rminor));
 		break;
 	case VFIFO:
 		vp->v_op = hammer2_fifoop_p;

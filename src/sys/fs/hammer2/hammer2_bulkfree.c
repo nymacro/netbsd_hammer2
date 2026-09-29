@@ -36,6 +36,7 @@
  */
 
 #include "hammer2.h"
+#include <sys/kthread.h>
 
 /* breadth-first search */
 typedef struct hammer2_chain_save {
@@ -403,15 +404,260 @@ done:
  * allocated can be specified.  If it is not sufficient multiple topology
  * passes will be made.
  */
+/*
+ * Auto-bulkfree support.  The NetBSD port has no userspace service
+ * daemon to run bulkfree (DragonFly's mount_hammer2 service does this),
+ * so reclaimed space would otherwise never be returned to the allocator
+ * (all deleted/superseded blocks keep their freemap bits until a
+ * bulkfree pass transitions them through POSSIBLY-FREE).
+ *
+ * A kernel thread is created per device (hmp).  It runs a bulkfree pass
+ * whenever woken due to low allocator space, guaranteeing at least one
+ * sync between passes like the manual (ioctl) path.
+ */
+#define HAMMER2_BULKFREE_LOWWATER_DIV	8	/* wake at < size/8 free */
+#define HAMMER2_BULKFREE_MIN_TICKS	(5 * hz)
+#define HAMMER2_BULKFREE_BACKOFF_TICKS	(60 * hz)
+#define HAMMER2_BULKFREE_BUFSIZE	(1024 * 1024)
+
+static void hammer2_bulkfree_thread(void *);
+
 void
 hammer2_bulkfree_init(hammer2_dev_t *hmp)
 {
+	int error;
+
+	mutex_init(&hmp->bulkfree_mtx, MUTEX_DEFAULT, IPL_NONE);
+	cv_init(&hmp->bulkfree_cv, "h2bfcv");
+	hmp->bulkfree_wanted = 0;
+	hmp->bulkfree_running = 0;
+	hmp->bulkfree_quit = 0;
+	hmp->bulkfree_backoff = 0;
+	hmp->bulkfree_ticks_last = 0;
+	hmp->bulkfree_lwp = NULL;
+	if (hmp->rdonly)
+		return;
+	error = kthread_create(PRI_NONE, KTHREAD_MPSAFE | KTHREAD_MUSTJOIN,
+	    NULL, hammer2_bulkfree_thread, hmp, &hmp->bulkfree_lwp,
+	    "h2bulkfree");
+	if (error)
+		hprintf("failed to create auto bulkfree thread error %d\n",
+		    error);
 }
 
 void
 hammer2_bulkfree_uninit(hammer2_dev_t *hmp)
 {
+	if (hmp->bulkfree_lwp == NULL) {
+		mutex_destroy(&hmp->bulkfree_mtx);
+		cv_destroy(&hmp->bulkfree_cv);
+		return;
+	}
+	mutex_enter(&hmp->bulkfree_mtx);
+	hmp->bulkfree_quit = 1;
+	cv_broadcast(&hmp->bulkfree_cv);
+	mutex_exit(&hmp->bulkfree_mtx);
+	kthread_join(hmp->bulkfree_lwp);
+	hmp->bulkfree_lwp = NULL;
+	mutex_destroy(&hmp->bulkfree_mtx);
+	cv_destroy(&hmp->bulkfree_cv);
 }
+
+/*
+ * Wake the auto-bulkfree thread.  Called from the sync path when the
+ * allocator runs low on space and from the allocator on ENOSPC.
+ */
+void
+hammer2_bulkfree_wake(hammer2_dev_t *hmp)
+{
+	hammer2_off_t lowwater;
+	int wake;
+
+	if (hmp->bulkfree_lwp == NULL)
+		return;
+	lowwater = hmp->voldata.allocator_size /
+	    HAMMER2_BULKFREE_LOWWATER_DIV;
+	if (hmp->voldata.allocator_free >= lowwater)
+		return;
+	wake = 0;
+	mutex_enter(&hmp->bulkfree_mtx);
+	if (hmp->bulkfree_quit == 0 && hmp->bulkfree_wanted == 0) {
+		hmp->bulkfree_wanted = 1;
+		wake = 1;
+	}
+	cv_broadcast(&hmp->bulkfree_cv);
+	mutex_exit(&hmp->bulkfree_mtx);
+	if (wake)
+		debug_hprintf("bulkfree requested, free %lld of %lld\n",
+		    (long long)hmp->voldata.allocator_free,
+		    (long long)hmp->voldata.allocator_size);
+}
+
+static void
+hammer2_bulkfree_thread(void *arg)
+{
+	hammer2_dev_t *hmp = arg;
+	hammer2_ioc_bulkfree_t bfi;
+	hammer2_off_t afree_before, reclaimed;
+	int ticks, error, etmp, i;
+
+	mutex_enter(&hmp->bulkfree_mtx);
+	while (hmp->bulkfree_quit == 0) {
+		while (hmp->bulkfree_wanted == 0 && hmp->bulkfree_quit == 0) {
+			if (hmp->bulkfree_backoff)
+				cv_timedwait(&hmp->bulkfree_cv,
+				    &hmp->bulkfree_mtx,
+				    HAMMER2_BULKFREE_BACKOFF_TICKS);
+			else
+				cv_wait(&hmp->bulkfree_cv,
+				    &hmp->bulkfree_mtx);
+		}
+		if (hmp->bulkfree_quit)
+			break;
+		hmp->bulkfree_wanted = 0;
+
+		/* Rate limit: one pass minimum every few seconds. */
+		ticks = getticks();
+		if (ticks - hmp->bulkfree_ticks_last <
+		    HAMMER2_BULKFREE_MIN_TICKS) {
+			continue;
+		}
+		hmp->bulkfree_ticks_last = ticks;
+		hmp->bulkfree_running = 1;
+		mutex_exit(&hmp->bulkfree_mtx);
+
+		afree_before = hmp->voldata.allocator_free;
+		error = 0;
+		reclaimed = 0;
+		/*
+		 * Bulkfree works in two stages: a pass transitions
+		 * unreferenced blocks from ALLOCATED to POSSIBLY-FREE
+		 * ("staged"), and the NEXT pass transitions them to FREE.
+		 * Keep passing until nothing new is staged (or a hard
+		 * limit), otherwise a burst of COW churn would need two
+		 * separate wakeups before any space comes back.
+		 */
+		for (i = 0; i < 4; ++i) {
+			memset(&bfi, 0, sizeof(bfi));
+			bfi.size = HAMMER2_BULKFREE_BUFSIZE;
+			etmp = hammer2_bulkfree_dev_scan(hmp, &bfi);
+			if (etmp && error == 0)
+				error = etmp;
+			if (etmp == EINTR)
+				break;
+			if (bfi.count_staged == 0)
+				break;
+		}
+		reclaimed = hmp->voldata.allocator_free;
+		if (reclaimed > afree_before)
+			reclaimed -= afree_before;
+		else
+			reclaimed = 0;
+		hprintf("auto bulkfree error %d, reclaimed %lld bytes\n",
+		    error, (long long)reclaimed);
+
+		mutex_enter(&hmp->bulkfree_mtx);
+		hmp->bulkfree_running = 0;
+		/*
+		 * If nothing was staged, freed, or reclaimed then the
+		 * volume is either genuinely full or quiescent — back off
+		 * before honoring the next request.
+		 */
+		hmp->bulkfree_backoff =
+		    (reclaimed < HAMMER2_ALLOC_MAX && bfi.count_staged == 0 &&
+		    bfi.count_freed == 0);
+		cv_broadcast(&hmp->bulkfree_cv);
+	}
+	mutex_exit(&hmp->bulkfree_mtx);
+	kthread_exit(0);
+}
+
+/*
+ * Core of a manual (ioctl) or automatic (kernel thread) bulkfree pass.
+ * Serializes on hmp->bflk, guarantees at least one full sync between
+ * passes, then bulkfrees on a snapshot of the live topology (or on the
+ * live topology itself if the sync hit ENOSPC).
+ *
+ * Returns 0 or the first error from the sync/pass.  When the mntlk is
+ * not obtainable (unmount in progress) and quit is set, returns EINTR.
+ */
+int
+hammer2_bulkfree_dev_scan(hammer2_dev_t *hmp, struct hammer2_ioc_bulkfree *bfi)
+{
+	hammer2_pfs_t *pmp;
+	hammer2_chain_t *vchain;
+	int error = 0, etmp, i, didsnap;
+
+	/*
+	 * Bulkfree has to be serialized to guarantee at least one sync
+	 * inbetween bulkfrees.
+	 */
+	hammer2_lk_ex(&hmp->bflk);
+
+	/* Sync all mounts related to the media. */
+	while (mutex_tryenter(&hammer2_mntlk) == false) {
+		if (hmp->bulkfree_quit) {
+			hammer2_lk_unlock(&hmp->bflk);
+			return (EINTR);
+		}
+		kpause("h2bfmnt", false, 1, NULL);
+	}
+	TAILQ_FOREACH(pmp, &hammer2_pfslist, mntentry) {
+		for (i = 0; i < HAMMER2_MAXCLUSTER; ++i) {
+			if (pmp->pfs_hmps[i] != hmp)
+				continue;
+		etmp = hammer2_vfs_sync_pmp(pmp, MNT_WAIT);
+			if (etmp && (error == 0 || error == ENOSPC))
+				error = etmp;
+			break;
+		}
+	}
+	mutex_exit(&hammer2_mntlk);
+
+	if (error && error != ENOSPC)
+		goto failed;
+
+	/*
+	 * If we have an ENOSPC error we have to bulkfree on the live
+	 * topology.  Otherwise we can bulkfree on a snapshot.
+	 */
+	if (error) {
+		hprintf("WARNING: bulkfree forced to use live topology due to "
+		    "ENOSPC\n");
+		vchain = &hmp->vchain;
+		hammer2_chain_ref(vchain);
+		didsnap = 0;
+	} else {
+		vchain = hammer2_chain_bulksnap(hmp);
+		didsnap = 1;
+	}
+
+	/*
+	 * Normal bulkfree operations do not require a transaction because
+	 * they operate on a snapshot, and so can run concurrently with
+	 * any operation except another bulkfree.
+	 *
+	 * If we are running bulkfree on the live topology we have to be
+	 * in a FLUSH transaction.
+	 */
+	if (didsnap == 0)
+		hammer2_trans_init(hmp->spmp, HAMMER2_TRANS_ISFLUSH);
+	error = hammer2_bulkfree_pass(hmp, vchain, bfi);
+	if (didsnap) {
+		hammer2_chain_bulkdrop(vchain);
+	} else {
+		hammer2_chain_drop(vchain);
+		hammer2_trans_done(hmp->spmp, HAMMER2_TRANS_ISFLUSH |
+		    HAMMER2_TRANS_SIDEQ);
+	}
+
+	error = hammer2_error_to_errno(error);
+
+failed:
+	hammer2_lk_unlock(&hmp->bflk);
+	return (error);
+}
+
 
 int
 hammer2_bulkfree_pass(hammer2_dev_t *hmp, hammer2_chain_t *vchain,
@@ -613,6 +859,10 @@ hammer2_bulkfree_pass(hammer2_dev_t *hmp, hammer2_chain_t *vchain,
 	cbinfo.dedup = NULL;
 
 	bfi->sstop = cbinfo.sbase;
+	bfi->count_freed = (hammer2_off_t)cbinfo.count_10_00 *
+	    HAMMER2_FREEMAP_BLOCK_SIZE;
+	bfi->count_staged = (hammer2_off_t)cbinfo.count_11_10 *
+	    HAMMER2_FREEMAP_BLOCK_SIZE;
 
 	incr = bfi->sstop / (hmp->total_size / 10000);
 	if (incr > 10000)

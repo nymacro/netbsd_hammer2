@@ -508,17 +508,37 @@ hammer2_read_volume_header(struct vnode *devvp, const char *path,
 		error = VOP_IOCTL(devvp, DIOCGMEDIASIZE, &mediasize, FREAD,
 		    FSCRED);
 		if (error) {
-			hprintf("%s #%d: failed to get media size\n", path, i);
+			hprintf("%s #%d: failed to get media size %d\n",
+			    path, i, error);
 			continue;
 		}
 		blkoff = (off_t)i * HAMMER2_ZONE_BYTES64;
-		if (blkoff >= mediasize)
-			continue;
 
 		/* NetBSD bread(9) doesn't fail with blkno beyond its size. */
 		blkno = blkoff / DEV_BSIZE;
-		if (bread(devvp, blkno, HAMMER2_VOLUME_BYTES, 0, &bp))
+
+		/*
+		 * Read with an unkeyed buffer (geteblk), like
+		 * readdisklabel(9) does.  bread(9) must not be used here:
+		 * the buffer cache may already hold a smaller buffer for
+		 * the same (vnode, blkno), e.g. a disklabel-sized read
+		 * done by setroot(9) on the root device, and growing a
+		 * VBLK buffer does not re-read the data beyond the old
+		 * size, yielding stale/zeroed contents.
+		 */
+		bp = geteblk(HAMMER2_VOLUME_BYTES);
+		bp->b_blkno = bp->b_lblkno = bp->b_rawblkno = blkno;
+		bp->b_bcount = HAMMER2_VOLUME_BYTES;
+		bp->b_flags = (bp->b_flags & ~B_WRITE) | B_READ;
+		bp->b_oflags &= ~BO_DONE;
+		VOP_STRATEGY(devvp, bp);
+		error = biowait(bp);
+		if (error) {
+			hprintf("%s #%d: read blkno %lld failed %d\n",
+			    path, i, (long long)blkno, error);
+			brelse(bp, BC_INVAL);
 			continue;
+		}
 
 		vd = (struct hammer2_volume_data *)bp->b_data;
 		/* Verify volume header magic. */

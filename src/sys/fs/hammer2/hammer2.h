@@ -843,6 +843,14 @@ struct hammer2_dev {
 	hammer2_lk_t		vollk;		/* lockmgr lock */
 	hammer2_lk_t		bulklk;		/* bulkfree operation lock */
 	hammer2_lk_t		bflk;		/* bulk-free manual function lock */
+	kmutex_t		bulkfree_mtx;	/* auto bulkfree thread */
+	kcondvar_t		bulkfree_cv;
+	struct lwp		*bulkfree_lwp;
+	int			bulkfree_wanted;
+	int			bulkfree_running;
+	int			bulkfree_quit;
+	int			bulkfree_backoff;
+	int			bulkfree_ticks_last;
 	int			freemap_relaxed;
 	hammer2_off_t		free_reserved;	/* nominal free reserved */
 	hammer2_off_t		heur_freemap[HAMMER2_FREEMAP_HEUR_SIZE];
@@ -966,6 +974,8 @@ void hammer2_bulkfree_init(hammer2_dev_t *);
 void hammer2_bulkfree_uninit(hammer2_dev_t *);
 int hammer2_bulkfree_pass(hammer2_dev_t *, hammer2_chain_t *,
     struct hammer2_ioc_bulkfree *);
+int hammer2_bulkfree_dev_scan(hammer2_dev_t *, struct hammer2_ioc_bulkfree *);
+void hammer2_bulkfree_wake(hammer2_dev_t *);
 
 /* hammer2_chain.c */
 int hammer2_chain_cmp(const hammer2_chain_t *, const hammer2_chain_t *);

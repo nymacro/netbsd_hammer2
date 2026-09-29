@@ -438,6 +438,7 @@ hammer2_freemap_try_alloc(hammer2_chain_t **parentp, hammer2_blockref_t *bref,
 		 * return ENOSPC if the allocation map has been exhausted.
 		 */
 		error = hammer2_freemap_iterate(parentp, &chain, iter);
+		/*DIS*/ if (error == HAMMER2_ERROR_ENOSPC) (void)hmp;
 	}
 
 	/* Cleanup. */

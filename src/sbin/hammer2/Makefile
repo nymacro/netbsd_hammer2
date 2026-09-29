@@ -19,5 +19,6 @@ CFLAGS+=	-Wno-deprecated-declarations
 
 DPADD+=		${LIBZ}
 LDADD+=		-lz
+LDADD+=		-lcrypto
 
 .include <bsd.prog.mk>

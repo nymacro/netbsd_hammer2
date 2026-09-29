@@ -40,6 +40,9 @@
 
 #include <sys/module.h>
 #include <sys/sysctl.h>
+#include <sys/device.h>
+#include <sys/disklabel.h>
+#include <sys/fcntl.h>
 
 #include <miscfs/genfs/genfs.h>
 #include <miscfs/genfs/genfs_node.h>
@@ -58,6 +61,7 @@ static int hammer2_fixup_pfses(hammer2_dev_t *);
 static int hammer2_remount_impl(hammer2_dev_t *, struct mount *);
 static int hammer2_remount(hammer2_dev_t *, struct mount *);
 static int hammer2_statvfs(struct mount *, struct statvfs *);
+static int hammer2_mountroot(void);
 static void hammer2_update_pmps(hammer2_dev_t *);
 static void hammer2_mount_helper(struct mount *, hammer2_pfs_t *);
 static void hammer2_unmount_helper(struct mount *, hammer2_pfs_t *,
@@ -698,10 +702,21 @@ hammer2_mount(struct mount *mp, const char *path, void *data, size_t *data_len)
 		return (error);
 	}
 
-	error = copyinstr(args->fspec, devstr, sizeof(devstr), NULL);
-	if (error) {
-		hprintf("copyinstr failed %d\n", error);
-		return (error);
+	if (mp->mnt_flag & MNT_ROOTFS) {
+		/*
+		 * Root mount via vfs_mountroot(9) early during boot.
+		 * The device string was built in-kernel by
+		 * hammer2_mountroot() and the device vnode is rootvp,
+		 * so neither copyinstr(9) nor namei(9) can be used
+		 * (there is no address space nor /dev to resolve yet).
+		 */
+		strlcpy(devstr, args->fspec, sizeof(devstr));
+	} else {
+		error = copyinstr(args->fspec, devstr, sizeof(devstr), NULL);
+		if (error) {
+			hprintf("copyinstr failed %d\n", error);
+			return (error);
+		}
 	}
 	debug_hprintf("devstr \"%s\" mntpt \"%s\"\n", devstr, "<userspace>");
 
@@ -733,11 +748,35 @@ hammer2_mount(struct mount *mp, const char *path, void *data, size_t *data_len)
 
 	/* Initialize all device vnodes. */
 	TAILQ_INIT(&devvpl);
-	error = hammer2_init_devvp(mp, devstr, &devvpl);
-	if (error) {
-		hprintf("failed to initialize devvp in %s\n", devstr);
-		hammer2_cleanup_devvp(&devvpl);
-		return (error);
+	if (mp->mnt_flag & MNT_ROOTFS) {
+		/*
+		 * Root mount: resolve the device directly to rootvp,
+		 * which vfs_mountroot(9) has already opened (FREAD) for
+		 * us.  There is no /dev to run namei(9) against yet, and
+		 * re-opening the device would just fail with EBUSY.
+		 */
+		hammer2_devvp_t *re;
+
+		re = hmalloc(sizeof(*re), M_HAMMER2, M_WAITOK | M_ZERO);
+		re->devvp = rootvp;
+		re->path = hstrdup(devstr);
+		re->xflags = FREAD;
+		/*
+		 * Keep open = 0 so that error paths below (and the
+		 * unmount they trigger) do not close or release
+		 * rootvp: vfs_mountroot(9) opened it and closes it
+		 * itself if the mount fails.  It is marked open after
+		 * a successful mount so the final unmount balances it.
+		 */
+		re->open = 0;
+		TAILQ_INSERT_TAIL(&devvpl, re, entry);
+	} else {
+		error = hammer2_init_devvp(mp, devstr, &devvpl);
+		if (error) {
+			hprintf("failed to initialize devvp in %s\n", devstr);
+			hammer2_cleanup_devvp(&devvpl);
+			return (error);
+		}
 	}
 
 	/*
@@ -815,9 +854,21 @@ next_hmp:
 	 * HAMMER2 device mount (hmp).
 	 */
 	if (hmp == NULL) {
-		/* Now open the device(s). */
+			/* Now open the device(s) unless this is a root mount. */
 		KKASSERT(!TAILQ_EMPTY(&devvpl));
-		error = hammer2_open_devvp(mp, &devvpl);
+		if (mp->mnt_flag & MNT_ROOTFS) {
+			/*
+			 * Already opened by vfs_mountroot(9).  Do NOT set
+			 * spec_node_setmountedfs(rootvp, mp) here: if the
+			 * mount fails below, rootvp would keep a dangling
+			 * v_mountedhere into the freed mount structure and
+			 * crash the fallback mountroot attempts.  It is
+			 * set on the success path only.
+			 */
+			error = 0;
+		} else {
+			error = hammer2_open_devvp(mp, &devvpl);
+		}
 		if (error) {
 			hammer2_close_devvp(&devvpl);
 			hammer2_cleanup_devvp(&devvpl);
@@ -914,6 +965,15 @@ next_hmp:
 		}
 		KKASSERT(TAILQ_EMPTY(&devvpl));
 		KKASSERT(!TAILQ_EMPTY(&hmp->devvp_list));
+
+		/*
+		 * NOTE: rootvp is NOT taken over here.  The PFS lookup and
+		 * further initialization below can still fail, and the
+		 * failure teardown (hammer2_close_devvp on open entries)
+		 * must not close/release rootvp: vfs_mountroot(9) owns the
+		 * open and the reference until hammer2_mount() succeeds.
+		 * The takeover happens at the end of this function.
+		 */
 
 		/*
 		 * Really important to get these right or teardown code
@@ -1153,8 +1213,9 @@ next_hmp:
 	pmp->fspec = hmalloc(dlen, M_HAMMER2, M_WAITOK | M_ZERO);
 	snprintf(pmp->fspec, dlen, "%s@%s", devstr, label);
 
-	error = set_statvfs_info(path, UIO_USERSPACE, pmp->fspec, UIO_SYSSPACE,
-	    mp->mnt_op->vfs_name, mp, curlwp);
+	error = set_statvfs_info(path,
+	    (mp->mnt_flag & MNT_ROOTFS) ? UIO_SYSSPACE : UIO_USERSPACE,
+	    pmp->fspec, UIO_SYSSPACE, mp->mnt_op->vfs_name, mp, curlwp);
 	if (error) {
 		hprintf("set_statvfs_info failed %d\n", error);
 		hammer2_unmount_helper(mp, NULL, hmp);
@@ -1162,6 +1223,78 @@ next_hmp:
 		return (error);
 	}
 
+	if (mp->mnt_flag & MNT_ROOTFS) {
+		/*
+		 * Root mount fully succeeded: take over the rootvp open
+		 * done by vfs_mountroot(9) so that the final unmount closes
+		 * it (like ffs does).
+		 */
+		TAILQ_FOREACH(e, &hmp->devvp_list, entry) {
+			if (e->devvp == rootvp) {
+				e->open = 1;
+				spec_node_setmountedfs(rootvp, mp);
+			}
+		}
+	}
+
+	return (0);
+}
+
+/*
+ * Mount the root file system.  Called by vfs_mountroot(9) early during
+ * boot, before any userland exists and before there is a root directory
+ * to resolve device nodes against.  Modeled after ffs_mountroot().
+ *
+ * The whole-device (post-newfs_hammer2) or the partition the bootloader
+ * selected is mounted read-only from the default @DATA PFS; init(8)
+ * remounts it read-write later on.
+ */
+static int
+hammer2_mountroot(void)
+{
+	struct hammer2_mount_info args;
+	struct mount *mp;
+	char devstr[MNAMELEN];
+	char part = 'a' + (minor(rootdev) % MAXPARTITIONS);
+	size_t size;
+	int error;
+
+	if (device_class(root_device) != DV_DISK)
+		return (ENODEV);
+
+	if ((error = vfs_rootmountalloc(MOUNT_HAMMER2,
+	    device_xname(root_device), &mp))) {
+		vrele(rootvp);
+		return (error);
+	}
+
+	/*
+	 * Mount the default @DATA PFS from the root device, or the PFS
+	 * label captured from a root= device spec suffix ("ldXb@LABEL").
+	 * MNT_ROOTFS tells hammer2_mount() that fspec is a kernel string
+	 * and that the device vnode is rootvp (no /dev exists to namei(9)
+	 * yet).
+	 */
+	snprintf(devstr, sizeof(devstr), "%s%c@%s",
+	    device_xname(root_device), part,
+	    root_pfs_label[0] ? root_pfs_label : "DATA");
+	hprintf("mountroot: devstr=%s\n", devstr);
+	hprintf("DBG-MR devstr=%s label=%s\n", devstr, root_pfs_label);
+	memset(&args, 0, sizeof(args));
+	args.fspec = devstr;
+	args.hflags = 0;
+	size = sizeof(args);
+	mp->mnt_flag |= MNT_ROOTFS;
+
+	error = hammer2_mount(mp, "/", &args, &size);
+	if (error) {
+		vfs_unbusy(mp);
+		vfs_rele(mp);
+		return (error);
+	}
+
+	mountlist_append(mp);
+	vfs_unbusy(mp);
 	return (0);
 }
 
@@ -1796,7 +1929,6 @@ hammer2_vfs_sync_pmp(hammer2_pfs_t *pmp, int waitfor __unused)
 	 * inode_depend() are atomic with the spin-lock.
 	 */
 	hammer2_trans_init(pmp, HAMMER2_TRANS_ISFLUSH);
-	debug_hprintf("FILESYSTEM SYNC BOUNDARY\n");
 	dorestart = 0;
 
 	/*
@@ -2050,7 +2182,6 @@ restart:
 		dorestart = 1;
 		goto restart;
 	}
-	debug_hprintf("FILESYSTEM SYNC STAGE 2 BEGIN\n");
 
 	/*
 	 * We have to flush the PFS root last, even if it does not appear to
@@ -2072,7 +2203,25 @@ restart:
 	}
 	debug_hprintf("FILESYSTEM SYNC STAGE 2 DONE\n");
 
-	hammer2_bioq_sync(pmp);
+	/*
+	 * Auto-bulkfree: all deleted/superseded blocks keep their freemap
+	 * bits until a bulkfree pass reclaims them.  If allocator space is
+	 * running low, wake the device's bulkfree thread.  Without this,
+	 * COW churn (every modified block version) eventually exhausts the
+	 * volume even though most of the space is reclaimable.
+	 */
+	if (pmp->mp && !pmp->rdonly) {
+		hammer2_cluster_t *cluster = &pmp->iroot->cluster;
+		hammer2_chain_t *rchain;
+		int ci;
+
+		for (ci = 0; ci < cluster->nchains; ++ci) {
+			rchain = cluster->array[ci].chain;
+			if (rchain == NULL)
+				continue;
+			hammer2_bulkfree_wake(rchain->hmp);
+		}
+	}
 
 	error = 0; /* XXX */
 	hammer2_trans_done(pmp, HAMMER2_TRANS_ISFLUSH);
@@ -2464,7 +2613,7 @@ static struct vfsops hammer2_vfsops = {
 	.vfs_init = hammer2_init,
 	.vfs_reinit = hammer2_reinit,
 	.vfs_done = hammer2_done,
-	.vfs_mountroot = (void *)eopnotsupp,
+	.vfs_mountroot = hammer2_mountroot,
 	.vfs_snapshot = (void *)eopnotsupp,
 	.vfs_extattrctl = vfs_stdextattrctl,
 	.vfs_suspendctl = genfs_suspendctl,

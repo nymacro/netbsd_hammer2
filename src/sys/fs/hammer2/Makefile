@@ -1,4 +1,4 @@
-.include "/usr/src/sys/modules/Makefile.inc"
+.include "/home/ai/hammer-test/netbsd-src/usr/src/sys/modules/Makefile.inc"
 
 KMOD=	hammer2
 SRCS=	hammer2_admin.c hammer2_bulkfree.c hammer2_chain.c hammer2_cluster.c \

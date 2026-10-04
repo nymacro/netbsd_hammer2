@@ -102,15 +102,36 @@ hammer2_open_devvp(struct mount *mp, const hammer2_devvp_list_t *devvpl)
 		else
 			e->xflags = FREAD|FWRITE;
 		vn_lock(devvp, LK_EXCLUSIVE | LK_RETRY);
-		error = VOP_OPEN(devvp, e->xflags, FSCRED);
-		VOP_UNLOCK(devvp);
-		if (error) {
-			hprintf("VOP_OPEN failed %d\n", error);
-			return (error);
+		/*
+		 * Refuse to open a device another filesystem is already
+		 * mounted on (catches the same media being mounted through
+		 * different paths, e.g. a wedge and its parent disk).
+		 * (Upstream uses vcount() here; NetBSD's equivalent is the
+		 * specfs mountedfs association.)
+		 */
+		if (spec_node_getmountedfs(devvp) != NULL) {
+			VOP_UNLOCK(devvp);
+			hprintf("device already in use by a filesystem\n");
+			return (EBUSY);
 		}
-		spec_node_setmountedfs(devvp, mp);
-
-		e->open = 1;
+		/*
+		 * Discard any stale buffers cached for the device (e.g.
+		 * from newfs/fsck writes before this mount).
+		 */
+		error = vinvalbuf(devvp, V_SAVE, curlwp->l_cred, curlwp, 0, 0);
+		if (error == 0) {
+			KKASSERT(e->open == 0);
+			error = VOP_OPEN(devvp, e->xflags, FSCRED);
+			if (error == 0) {
+				spec_node_setmountedfs(devvp, mp);
+				e->open = 1;
+			} else {
+				hprintf("VOP_OPEN failed %d\n", error);
+			}
+		}
+		VOP_UNLOCK(devvp);
+		if (error)
+			return (error);
 		KKASSERT(e->open);
 	}
 

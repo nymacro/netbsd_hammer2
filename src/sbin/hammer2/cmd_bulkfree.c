@@ -41,11 +41,12 @@ int
 cmd_bulkfree(const char *sel_path)
 {
 	hammer2_ioc_bulkfree_t bfi;
+	size_t usermem;
+	size_t usermem_size = sizeof(usermem);
 	int ecode = 0;
 	int fd;
 	int res;
-	size_t usermem;
-	size_t usermem_size = sizeof(usermem);
+	int i;
 
 	bzero(&bfi, sizeof(bfi));
 	usermem = 0;
@@ -61,10 +62,32 @@ cmd_bulkfree(const char *sel_path)
 
 	if ((fd = hammer2_ioctl_handle(sel_path)) < 0)
 		return 1;
-	res = ioctl(fd, HAMMER2IOC_BULKFREE_SCAN, &bfi);
-	if (res) {
-		perror("ioctl");
-		ecode = 1;
+
+	/*
+	 * Bulkfree is 2-stage: a pass stages unreferenced blocks
+	 * (ALLOCATED -> POSSIBLY-FREE) and the NEXT pass frees them
+	 * (POSSIBLY-FREE -> FREE).  Run passes until nothing new is
+	 * staged (bounded) so a single command fully reclaims space —
+	 * this is what makes a periodic cron job effective.
+	 */
+	for (i = 0; i < 8; ++i) {
+		bfi.count_staged = 0;
+		bfi.count_freed = 0;
+		res = ioctl(fd, HAMMER2IOC_BULKFREE_SCAN, &bfi);
+		if (res) {
+			perror("ioctl");
+			ecode = 1;
+			break;
+		}
+		if (VerboseOpt)
+			printf("hammer2 bulkfree \"%s\" pass %d: staged %lld "
+			    "bytes, freed %lld bytes\n", sel_path, i + 1,
+			    (long long)bfi.count_staged,
+			    (long long)bfi.count_freed);
+		if (bfi.count_staged == 0)
+			break;
 	}
+	close(fd);
+
 	return ecode;
 }

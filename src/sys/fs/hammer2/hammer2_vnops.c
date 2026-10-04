@@ -40,6 +40,7 @@
 #include <sys/syslimits.h>
 #include <sys/dirent.h>
 #include <sys/fcntl.h>
+#include <sys/lockf.h>
 #include <sys/namei.h>
 #include <sys/uio.h>
 #include <sys/unistd.h>
@@ -194,6 +195,10 @@ hammer2_fsync(void *v)
 	 * entirely in the hammer2_inode structure may not trigger a
 	 * buffer read until the flush so the fsync can wind up also
 	 * doing scattered reads.
+	 *
+	 * NOTE: a_offlo/a_offhi are not honored (whole-file flush);
+	 * chain-based writeback cannot flush a byte range in
+	 * isolation.  FFS without WAPBL does the same.
 	 */
 	if (vp->v_type == VBLK)
 		error1 = spec_fsync(v);
@@ -431,6 +436,7 @@ hammer2_setattr(void *v)
 	hammer2_inode_t *ip = VTOI(vp);
 	uint64_t ctime;
 	int error = 0;
+	int kflags = 0;
 
 	/*
 	 * Normally disallow setattr if there is no space, unless we
@@ -456,11 +462,12 @@ hammer2_setattr(void *v)
 	hammer2_inode_lock(ip, 0);
 
 	if (vap->va_flags != (u_long)VNOVAL) {
-		if (vap->va_flags & ~(SF_APPEND | SF_IMMUTABLE |
-		    UF_APPEND | UF_IMMUTABLE | UF_NODUMP)) {
-			error = EOPNOTSUPP;
-			goto done;
-		}
+		/*
+		 * chflags(2): store any flag bits (FFS parity); the
+		 * policy/privilege gate is kauth below. Only
+		 * IMMUTABLE/APPEND are enforced by hammer2 VOPs
+		 * themselves; the rest ride along in meta.uflags.
+		 */
 		if (ip->pmp->rdonly) {
 			error = EROFS;
 			goto done;
@@ -477,6 +484,7 @@ hammer2_setattr(void *v)
 			ip->meta.uflags = vap->va_flags;
 			ip->meta.ctime = ctime;
 			hammer2_spin_unex(&ip->cluster_spin);
+			kflags |= NOTE_ATTRIB;
 		}
 		if (ip->meta.uflags & (IMMUTABLE | APPEND))
 			goto done;
@@ -495,6 +503,7 @@ hammer2_setattr(void *v)
 		error = hammer2_chown(vp, vap->va_uid, vap->va_gid, cred);
 		if (error)
 			goto done;
+		kflags |= NOTE_ATTRIB;
 	}
 
 	if (vap->va_size != (u_quad_t)VNOVAL && ip->meta.size != vap->va_size) {
@@ -526,6 +535,7 @@ hammer2_setattr(void *v)
 			hammer2_inode_modify(ip);
 			ip->meta.ctime = ctime;
 			ip->meta.mtime = ctime;
+			kflags |= NOTE_ATTRIB;
 			break;
 		default:
 			error = EINVAL;
@@ -555,6 +565,7 @@ hammer2_setattr(void *v)
 		if (vap->va_birthtime.tv_sec != (time_t)VNOVAL)
 			ip->meta.btime =
 			    hammer2_timespec_to_time(&vap->va_birthtime);
+		kflags |= NOTE_ATTRIB;
 	}
 
 	if (vap->va_mode != (mode_t)VNOVAL) {
@@ -574,7 +585,7 @@ done:
 	 * cause havoc.
 	 *
 	 * If an extend occured that changed the DIRECTDATA state, we must
-	 * call inode_chain_sync now in order to prepare the inode's indirect
+	 * call daemon_inode_sync now in order to prepare the inode's indirect
 	 * block table.
 	 *
 	 * WARNING! This means we are making an adjustment to the inode's
@@ -587,6 +598,7 @@ done:
 
 	hammer2_inode_unlock(ip);
 	hammer2_trans_done(ip->pmp, HAMMER2_TRANS_SIDEQ);
+	hammer2_knote(vp, kflags);
 
 	return (error);
 }
@@ -938,6 +950,13 @@ hammer2_write_file(hammer2_inode_t *ip, struct uio *uio, int ioflag,
 	/* UIO write loop. */
 	while (uio->uio_resid > 0) {
 		/*
+		 * Upstream calls bwillwrite() here to apply buffer-cache
+		 * backpressure; NetBSD's equivalent is built into the
+		 * buffer cache itself (getnewbuf waits on needbuffer_cv
+		 * and launders dirty buffers when the high-water mark is
+		 * hit), so no explicit call is needed here.
+		 */
+		/*
 		 * This nominally tells us how much we can cluster and
 		 * what the logical buffer size needs to be.  Currently
 		 * we don't try to cluster the write and just handle one
@@ -1080,6 +1099,10 @@ hammer2_write_file(hammer2_inode_t *ip, struct uio *uio, int ioflag,
 	hammer2_trans_assert_strategy(ip->pmp);
 	hammer2_mtx_unlock(&ip->truncate_lock);
 
+	if (error == 0)
+		hammer2_knote(vp, NOTE_WRITE |
+		    (new_eof > old_eof ? NOTE_EXTEND : 0));
+
 	return (error);
 }
 
@@ -1114,6 +1137,14 @@ hammer2_write(void *v)
 	default:
 		break;
 	}
+
+	/*
+	 * (Backpressure hammer2_pfs_memory_wait deliberately lives in
+	 * hammer2_strategy_write instead: it must execute WITHOUT the
+	 * vnode lock held, or the sync-restart loop inside
+	 * hammer2_vfs_sync_pmp() (vn_lock LK_NOWAIT) can livelock
+	 * against a waiting frontend — upstream hooks this pre-VOP.)
+	 */
 
 	/*
 	 * The transaction interlocks against flush initiations
@@ -1233,54 +1264,6 @@ hammer2_extend_file(hammer2_inode_t *ip, hammer2_key_t nsize)
 	hammer2_mtx_ex(&ip->lock);
 }
 
-static int
-hammer2_bmap_impl(void *v)
-{
-	struct vop_bmap_args /* {
-		struct vnode *a_vp;
-		daddr_t a_bn;
-		struct vnode **a_vpp;
-		daddr_t *a_bnp;
-		int *a_runp;
-	} */ *ap = v;
-	hammer2_xop_bmap_t *xop;
-	hammer2_inode_t *ip = VTOI(ap->a_vp);
-	hammer2_dev_t *hmp = ip->pmp->pfs_hmps[0];
-	hammer2_volume_t *vol;
-	int error;
-
-	if (ap->a_bnp == NULL)
-		return (0);
-	if (ap->a_runp != NULL)
-		*ap->a_runp = 0; /* unsupported */
-
-	xop = hammer2_xop_alloc(ip, 0);
-	xop->lbn = ap->a_bn;
-	hammer2_xop_start(&xop->head, &hammer2_bmap_desc);
-	error = hammer2_xop_collect(&xop->head, 0);
-	error = hammer2_error_to_errno(error);
-	if (error) {
-		if (error == ENOENT)
-			error = 0; /* sparse */
-		if (ap->a_vpp)
-			*ap->a_vpp = NULL;
-		*ap->a_bnp = -1;
-	} else {
-		KKASSERT(xop->offset != HAMMER2_OFF_MASK);
-		if (ap->a_vpp) {
-			vol = hammer2_get_volume(hmp, xop->offset);
-			KKASSERT(vol);
-			KKASSERT(vol->dev);
-			KKASSERT(vol->dev->devvp);
-			*ap->a_vpp = vol->dev->devvp;
-		}
-		*ap->a_bnp = xop->offset / DEV_BSIZE; /* XXX radix bits */
-	}
-	hammer2_xop_retire(&xop->head, HAMMER2_XOPMASK_VOP);
-
-	return (error);
-}
-
 /*
  * HAMMER2 needs to force VFS to invoke logical vnode strategy
  * (not device vnode strategy).
@@ -1295,14 +1278,6 @@ hammer2_bmap(void *v)
 		daddr_t *a_bnp;
 		int *a_runp;
 	} */ *ap = v;
-	hammer2_inode_t *ip = VTOI(ap->a_vp);
-
-	/*
-	 * XXX struct vop_bmap_args in NetBSD doesn't have ap->a_cmd to
-	 * distinct VOP_BMAP for seek from others.
-	 */
-	if (ip->in_seek)
-		return (hammer2_bmap_impl(ap));
 
 	if (ap->a_vpp != NULL)
 		*ap->a_vpp = ap->a_vp;
@@ -1373,6 +1348,20 @@ hammer2_lookup(void *v)
 
 	/* NetBSD needs "." and ".." handling. */
 	if (flags & ISDOTDOT) {
+		/*
+		 * At the PFS mount root, iparent holds the super-root
+		 * inode number, which is outside this PFS.  MI
+		 * namei(9) never reaches here (VV_ROOT is intercepted
+		 * earlier), but guard direct VOP_LOOKUP consumers
+		 * (future nfsd etc.): return ourself instead.
+		 */
+		if (dip == dip->pmp->iroot) {
+			vref(dvp);
+			*ap->a_vpp = dvp;
+			cache_enter(dvp, dvp, cnp->cn_nameptr,
+			    cnp->cn_namelen, flags);
+			return (0);
+		}
 		/* NetBSD requires unlocked vnode. */
 		error = VFS_VGET(dip->pmp->mp, dip->meta.iparent, LK_NONE, &vp);
 		if (error)
@@ -1562,6 +1551,10 @@ hammer2_mknod(void *v)
 	hammer2_inode_unlock(dip);
 	hammer2_trans_done(dip->pmp, HAMMER2_TRANS_SIDEQ);
 
+	/* mknod: dvp NOTE_WRITE | NOTE_LINK (upstream:1999). */
+	if (error == 0)
+		hammer2_knote(dvp, NOTE_WRITE | NOTE_LINK);
+
 	vp = *ap->a_vpp;
 	if (error) {
 		if (vp)
@@ -1656,6 +1649,9 @@ hammer2_mkdir(void *v)
 	hammer2_inode_unlock(dip);
 	hammer2_trans_done(dip->pmp, HAMMER2_TRANS_SIDEQ);
 
+	if (error == 0)
+		hammer2_knote(dvp, NOTE_WRITE | NOTE_LINK);
+
 	vp = *ap->a_vpp;
 	if (error) {
 		if (vp)
@@ -1744,6 +1740,9 @@ hammer2_create(void *v)
 	}
 	hammer2_inode_unlock(dip);
 	hammer2_trans_done(dip->pmp, HAMMER2_TRANS_SIDEQ);
+
+	if (error == 0)
+		hammer2_knote(dvp, NOTE_WRITE | NOTE_LINK);
 
 	vp = *ap->a_vpp;
 	if (error) {
@@ -1842,6 +1841,7 @@ hammer2_rmdir(void *v)
 	if (error == 0) {
 		cache_purge(dvp);
 		cache_purge(vp);
+		hammer2_knote(dvp, NOTE_WRITE);
 	}
 
 	vput(vp);
@@ -1923,6 +1923,9 @@ hammer2_remove(void *v)
 	}
 	hammer2_inode_unlock(dip);
 	hammer2_trans_done(dip->pmp, HAMMER2_TRANS_SIDEQ);
+
+	if (error == 0)
+		hammer2_knote(dvp, NOTE_WRITE);
 
 	if (dvp == vp)
 		vrele(vp);
@@ -2227,6 +2230,11 @@ done:
 
 	if (error == 0)
 		genfs_rename_cache_purge(fdvp, fvp, tdvp, tvp);
+	if (error == 0) {
+		hammer2_knote(fdvp, NOTE_WRITE);
+		hammer2_knote(tdvp, NOTE_WRITE);
+		hammer2_knote(fvp, NOTE_RENAME);
+	}
 
 	if (fdvp != tdvp)
 		vput(fdvp);
@@ -2328,6 +2336,11 @@ hammer2_link(void *v)
 	hammer2_inode_unlock(tdip);
 
 	hammer2_trans_done(ip->pmp, HAMMER2_TRANS_SIDEQ);
+
+	if (error == 0) {
+		hammer2_knote(vp, NOTE_LINK);
+		hammer2_knote(dvp, NOTE_WRITE);
+	}
 
 	return (error);
 }
@@ -2433,6 +2446,9 @@ hammer2_symlink(void *v)
 	hammer2_inode_unlock(dip);
 	hammer2_trans_done(dip->pmp, HAMMER2_TRANS_SIDEQ);
 
+	if (error == 0)
+		hammer2_knote(dvp, NOTE_WRITE);
+
 	vp = *ap->a_vpp;
 	if (error) {
 		if (vp)
@@ -2493,14 +2509,17 @@ hammer2_ioctl(void *v)
 	int error;
 
 	/*
-	 * XXX2 The ioctl implementation is expected to lock vp here,
-	 * but fs sync from ioctl causes deadlock loop.
+	 * NetBSD's MI vn_ioctl() calls VOP_IOCTL without vnode lock or
+	 * reference: the file descriptor caller holds a reference on vp
+	 * for the duration, so vp cannot be reclaimed underneath us.
+	 * We intentionally do NOT vn_lock(vp): the heavyweight ioctls
+	 * (bulkfree sync, snapshot, growfs) run their own transactions
+	 * and locking here would deadlock against them.
 	 */
-	error = 0; /* vn_lock(vp, LK_EXCLUSIVE); */
+	error = 0;
 	if (error == 0) {
 		error = hammer2_ioctl_impl(vp, ap->a_command, ap->a_data,
 		    ap->a_fflag, ap->a_cred);
-		/* VOP_UNLOCK(vp); */
 	} else {
 		error = EBADF;
 	}
@@ -2520,6 +2539,21 @@ hammer2_print(void *v)
 	printf("\n");
 
 	return (0);
+}
+
+static int
+hammer2_advlock(void *v)
+{
+	struct vop_advlock_args /* {
+		struct vnode	*a_vp;
+		void		*a_id;
+		int		a_op;
+		struct flock	*a_fl;
+		int		a_flags;
+	} */ *ap = v;
+	hammer2_inode_t *ip = VTOI(ap->a_vp);
+
+	return lf_advlock(ap, &ip->lockf, ip->meta.size);
 }
 
 static int
@@ -2657,10 +2691,25 @@ static const struct vnodeopv_entry_desc hammer2_vnodeop_entries[] = {
 	{ &vop_print_desc, hammer2_print },		/* print */
 	{ &vop_islocked_desc, genfs_islocked },		/* islocked */
 	{ &vop_pathconf_desc, hammer2_pathconf },	/* pathconf */
-	{ &vop_advlock_desc, genfs_einval },		/* advlock */
+	{ &vop_advlock_desc, hammer2_advlock },		/* advlock */
 	{ &vop_bwrite_desc, vn_bwrite },		/* bwrite */
 	{ &vop_getpages_desc, genfs_getpages },		/* getpages */
 	{ &vop_putpages_desc, genfs_putpages },		/* putpages */
+	/*
+	 * Explicitly EOPNOTSUPP for inspectability (upstream HAMMER2
+	 * has no on-media extended attributes or ACLs either; tmpfs
+	 * omits these rows and relies on the default slot failing).
+	 */
+	{ &vop_whiteout_desc, genfs_eopnotsupp },	/* whiteout */
+	{ &vop_openextattr_desc, genfs_eopnotsupp },	/* openextattr */
+	{ &vop_closeextattr_desc, genfs_eopnotsupp },	/* closeextattr */
+	{ &vop_getextattr_desc, genfs_eopnotsupp },	/* getextattr */
+	{ &vop_setextattr_desc, genfs_eopnotsupp },	/* setextattr */
+	{ &vop_listextattr_desc, genfs_eopnotsupp },	/* listextattr */
+	{ &vop_deleteextattr_desc, genfs_eopnotsupp },	/* deleteextattr */
+	{ &vop_getacl_desc, genfs_eopnotsupp },		/* getacl */
+	{ &vop_setacl_desc, genfs_eopnotsupp },		/* setacl */
+	{ &vop_aclcheck_desc, genfs_eopnotsupp },	/* aclcheck */
 	{ NULL, NULL }
 };
 const struct vnodeopv_desc hammer2_vnodeop_opv_desc =

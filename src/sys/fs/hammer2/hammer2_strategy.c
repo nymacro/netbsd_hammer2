@@ -361,13 +361,29 @@ hammer2_strategy_write(struct vop_strategy_args *ap)
 	hammer2_xop_strategy_t *xop;
 	hammer2_inode_t *ip = VTOI(ap->a_vp);
 	hammer2_pfs_t *pmp = ip->pmp;
+	struct vnode *vp = ap->a_vp;
 	struct buf *bp = ap->a_bp;
 	hammer2_key_t lbase;
 
 	lbase = (hammer2_key_t)bp->b_lblkno * hammer2_get_logical();
 	KKASSERT(((int)lbase & HAMMER2_PBUFMASK) == 0);
 
+	/*
+	 * Backpressure: stall, with hysteresis, if an excessive number
+	 * of dirty chains or dirty inodes has built up (upstream hooks
+	 * this in vfs_modifying before the VOP takes locks; this port
+	 * places it at the strategy entry, which normally runs without
+	 * the vnode lock held).  An IO_SYNC bwrite, however, executes
+	 * VOP_STRATEGY inline in the writer, which still holds vp
+	 * exclusively — in that case skip the wait: waiting with the
+	 * vp lock held livelocks hammer2_vfs_sync_pmp()'s restart
+	 * loop against its vn_lock(LK_NOWAIT).
+	 */
+	if (VOP_ISLOCKED(vp) == 0)
+		hammer2_pfs_memory_wait(pmp);
+
 	atomic_set_int(&ip->flags, HAMMER2_INODE_DIRTYDATA);
+	hammer2_lwinprog_ref(pmp);
 	hammer2_trans_assert_strategy(pmp);
 	hammer2_trans_init(pmp, HAMMER2_TRANS_BUFCACHE);
 
@@ -376,6 +392,7 @@ hammer2_strategy_write(struct vop_strategy_args *ap)
 	xop->bp = bp;
 	xop->lbase = lbase;
 	hammer2_xop_start(&xop->head, &hammer2_strategy_write_desc);
+	hammer2_lwinprog_wait(pmp, hammer2_flush_pipe);
 	hammer2_xop_retire(&xop->head, HAMMER2_XOPMASK_VOP);
 
 	return (0);
@@ -415,21 +432,23 @@ hammer2_xop_strategy_write(hammer2_xop_t *arg, void *scratch, int clindex)
 		bp->b_error = 0;
 		biodone(bp);
 	} else {
-		hprintf("error %08x at blkno %016llx/%016llx\n",
+		hprintf("error %08x at blkno %016llx/%016llx",
 		    error, (long long)bp->b_lblkno, (long long)bp->b_blkno);
 		bp->b_error = EIO;
 		biodone(bp);
 	}
 	hammer2_trans_assert_strategy(ip->pmp);
+	hammer2_lwinprog_drop(ip->pmp);
 	hammer2_trans_done(ip->pmp, HAMMER2_TRANS_BUFCACHE);
 }
 
 /*
- * Wait for pending I/O to complete.
+ * Wait for pending I/O to complete
  */
 void
 hammer2_bioq_sync(hammer2_pfs_t *pmp)
 {
+	hammer2_lwinprog_wait(pmp, 0);
 }
 
 /*

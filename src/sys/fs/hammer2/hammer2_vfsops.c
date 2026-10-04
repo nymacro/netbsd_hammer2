@@ -87,6 +87,9 @@ hammer2_lk_t hammer2_mntlk;
 /* sysctl */
 static int hammer2_supported_version = HAMMER2_VOL_VERSION_DEFAULT;
 int hammer2_dedup_enable = 1;
+int hammer2_flush_pipe = 100;
+int hammer2_limit_dirty_chains;
+int hammer2_limit_dirty_inodes;
 int hammer2_count_inode_allocated;
 int hammer2_count_chain_allocated;
 int hammer2_count_chain_modified;
@@ -115,6 +118,9 @@ int malloc_leak_m_temp;
 #define HAMMER2_SYSCTL_LIMIT_SCAN_DEPTH		9
 #define HAMMER2_SYSCTL_LIMIT_SAVED_CHAINS	10
 #define HAMMER2_SYSCTL_ALWAYS_COMPRESS		11
+#define HAMMER2_SYSCTL_FLUSH_PIPE		12
+#define HAMMER2_SYSCTL_LIMIT_DIRTY_CHAINS	13
+#define HAMMER2_SYSCTL_LIMIT_DIRTY_INODES	14
 
 SYSCTL_SETUP(hammer2_sysctl_create, "hammer2 sysctl")
 {
@@ -234,6 +240,33 @@ SYSCTL_SETUP(hammer2_sysctl_create, "hammer2 sysctl")
 	if (error)
 		goto fail;
 
+	error = sysctl_createv(clog, 0, NULL, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE,
+	    CTLTYPE_INT, "flush_pipe",
+	    SYSCTL_DESCR("Logical write in-progress limit (backpressure)"),
+	    NULL, 0, &hammer2_flush_pipe, 0,
+	    CTL_VFS, x, HAMMER2_SYSCTL_FLUSH_PIPE, CTL_EOL);
+	if (error)
+		goto fail;
+
+	error = sysctl_createv(clog, 0, NULL, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE,
+	    CTLTYPE_INT, "limit_dirty_chains",
+	    SYSCTL_DESCR("Stall at this many dirty chains (backpressure)"),
+	    NULL, 0, &hammer2_limit_dirty_chains, 0,
+	    CTL_VFS, x, HAMMER2_SYSCTL_LIMIT_DIRTY_CHAINS, CTL_EOL);
+	if (error)
+		goto fail;
+
+	error = sysctl_createv(clog, 0, NULL, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE,
+	    CTLTYPE_INT, "limit_dirty_inodes",
+	    SYSCTL_DESCR("Stall at this many dirty inodes (backpressure)"),
+	    NULL, 0, &hammer2_limit_dirty_inodes, 0,
+	    CTL_VFS, x, HAMMER2_SYSCTL_LIMIT_DIRTY_INODES, CTL_EOL);
+	if (error)
+		goto fail;
+
 	return;
 fail:
 	hprintf("sysctl_createv failed with error %d\n", error);
@@ -281,8 +314,6 @@ hammer2_start(struct mount *mp, int flags)
 static void
 hammer2_init(void)
 {
-	long hammer2_limit_dirty_chains; /* originally sysctl */
-
 	hammer2_assert_clean();
 
 	hammer2_dio_limit = buf_nbuf() * 2;
@@ -312,6 +343,11 @@ hammer2_init(void)
 	if (hammer2_limit_dirty_chains < 1000)
 		hammer2_limit_dirty_chains = 1000;
 	hammer2_limit_saved_chains = hammer2_limit_dirty_chains * 5;
+	hammer2_limit_dirty_inodes = desiredvnodes / 25;
+	if (hammer2_limit_dirty_inodes < 100)
+		hammer2_limit_dirty_inodes = 100;
+	if (hammer2_limit_dirty_inodes > HAMMER2_LIMIT_DIRTY_INODES)
+		hammer2_limit_dirty_inodes = HAMMER2_LIMIT_DIRTY_INODES;
 }
 
 static void
@@ -691,6 +727,28 @@ hammer2_mount(struct mount *mp, const char *path, void *data, size_t *data_len)
 		error = 0;
 		pmp = MPTOPMP(mp);
 		cluster = &pmp->iroot->cluster;
+
+		/*
+		 * Changing r/w -> r/o: the MI has suspended the mount
+		 * before calling us (vfs_mount(9) MNT_UPDATE), so no
+		 * frontend VOPs are in flight against this PFS.  Fully
+		 * sync the PFS before flipping rdonly — freemap updates
+		 * lag one flush behind the topology, so three passes
+		 * (same argument as hammer2_unmount).
+		 */
+		if (pmp->rdonly == 0 && (mp->mnt_iflag & IMNT_WANTRDONLY)) {
+			error = hammer2_vfs_sync_pmp(pmp, MNT_WAIT);
+			if (error == 0)
+				hammer2_vfs_sync_pmp(pmp, MNT_WAIT);
+			if (error == 0)
+				hammer2_vfs_sync_pmp(pmp, MNT_WAIT);
+			if (error == 0) {
+				hprintf("read-only remount, sync complete\n");
+			} else {
+				hprintf("read-only remount failed to sync\n");
+				return (error);
+			}
+		}
 		for (i = 0; i < cluster->nchains; ++i) {
 			if (cluster->array[i].chain == NULL)
 				continue;
@@ -1086,7 +1144,7 @@ next_hmp:
 		 * inode is locked -> hammer2_inode_chain() -> lock chain
 		 */
 		hammer2_update_pmps(hmp);
-		hammer2_bulkfree_init(hmp);
+		hmp->bulkfree_quit = 0;	/* hmp is fresh, clear the teardown marker */
 	} else {
 		/* hmp->devvp_list is already constructed. */
 		hammer2_cleanup_devvp(&devvpl);
@@ -1181,6 +1239,14 @@ next_hmp:
 	mp->mnt_stat.f_namemax = HAMMER2_INODE_MAXNAME;
 	mp->mnt_flag |= MNT_LOCAL;
 	mp->mnt_iflag |= IMNT_MPSAFE;
+	/*
+	 * Advertise read-write to read-only downgrade support to the
+	 * MI layer (vfs_syscalls.c refuses MNT_UPDATE-downgrade without
+	 * this, returning EOPNOTSUPP); the downgrade runs a full sync
+	 * under the mount-suspend cover in the MNT_UPDATE path above.
+	 */
+	if (!rdonly)
+		mp->mnt_iflag |= IMNT_CAN_RWTORO;
 	mp->mnt_dev_bshift = DEV_BSHIFT;
 	mp->mnt_fs_bshift = HAMMER2_PBUFRADIX;
 
@@ -1255,7 +1321,7 @@ hammer2_mountroot(void)
 	struct hammer2_mount_info args;
 	struct mount *mp;
 	char devstr[MNAMELEN];
-	char part = 'a' + (minor(rootdev) % MAXPARTITIONS);
+	char part = 0; /* 0 = none (wedge root devices) */
 	size_t size;
 	int error;
 
@@ -1274,10 +1340,21 @@ hammer2_mountroot(void)
 	 * MNT_ROOTFS tells hammer2_mount() that fspec is a kernel string
 	 * and that the device vnode is rootvp (no /dev exists to namei(9)
 	 * yet).
+	 *
+	 * dk(4) wedge device minors are the unit number, not a
+	 * disklabel partition, so only append the partition letter for
+	 * non-wedge disks.
 	 */
-	snprintf(devstr, sizeof(devstr), "%s%c@%s",
-	    device_xname(root_device), part,
-	    root_pfs_label[0] ? root_pfs_label : "DATA");
+	if (device_is_a(root_device, "dk") == 0)
+		part = 'a' + (minor(rootdev) % MAXPARTITIONS);
+	if (part)
+		snprintf(devstr, sizeof(devstr), "%s%c@%s",
+		    device_xname(root_device), part,
+		    root_pfs_label[0] ? root_pfs_label : "DATA");
+	else
+		snprintf(devstr, sizeof(devstr), "%s@%s",
+		    device_xname(root_device),
+		    root_pfs_label[0] ? root_pfs_label : "DATA");
 	hprintf("mountroot: devstr=%s\n", devstr);
 	hprintf("DBG-MR devstr=%s label=%s\n", devstr, root_pfs_label);
 	memset(&args, 0, sizeof(args));
@@ -1478,7 +1555,12 @@ again:
 		return;
 	}
 
-	hammer2_bulkfree_uninit(hmp);
+	/*
+	 * Mark the device as being torn down so an in-progress bulkfree
+	 * scan (from the bulkfree ioctl) aborts instead of scanning media
+	 * that is disappearing under it.  The mount lock is held.
+	 */
+	hmp->bulkfree_quit = 1;
 	hammer2_pfsfree_scan(hmp, 0);
 
 	/*
@@ -1536,9 +1618,15 @@ again:
 	if (hmp->fchain.flags & HAMMER2_CHAIN_UPDATE)
 		atomic_clear_int(&hmp->fchain.flags, HAMMER2_CHAIN_UPDATE);
 
-#ifdef HAMMER2_INVARIANTS
-	hammer2_dump_chain(&hmp->vchain, 0, 0, -1, 'v');
-	hammer2_dump_chain(&hmp->fchain, 0, 0, -1, 'f');
+#if 0 /* kept for future debug (upstream 40e5c5625b: dumps disabled on unmount) */
+	{
+		int dumpcnt;
+
+		dumpcnt = 50;
+		hammer2_dump_chain(&hmp->vchain, 0, 0, &dumpcnt, 'v', (u_int)-1);
+		dumpcnt = 50;
+		hammer2_dump_chain(&hmp->fchain, 0, 0, &dumpcnt, 'f', (u_int)-1);
+	}
 #endif
 	/*
 	 * Final drop of embedded volume/freemap root chain to clean up
@@ -1871,8 +1959,17 @@ hammer2_remount(hammer2_dev_t *hmp, struct mount *mp)
 	hammer2_pfs_t *pmp = MPTOPMP(mp);
 	int error;
 
-	if (pmp->rdonly == 0 && (mp->mnt_flag & MNT_RDONLY)) {
-		/* won't reach here, NetBSD doesn't support downgrades */
+	if (pmp->rdonly == 0 && (mp->mnt_iflag & IMNT_WANTRDONLY)) {
+		/*
+		 * Changing from r/w to r/o (the mount is suspended and
+		 * the PFS has been fully synced by the update-mount
+		 * caller).  Write enforcement is at the VOP layer.
+		 *
+		 * The device vnodes stay opened r/w: this matches both
+		 * upstream HAMMER2 and NetBSD FFS behavior on rw->ro
+		 * downgrades (FFS keeps devvp opened FREAD|FWRITE too;
+		 * the mode is only closed at unmount).
+		 */
 		pmp->rdonly = 1;
 	} else if (pmp->rdonly == 1 && (mp->mnt_iflag & IMNT_WANTRDWR)) {
 		if (hmp->rdonly) {
@@ -2172,9 +2269,12 @@ restart:
 		 * looping too hard, try to unclog the frontend
 		 * dependency and wait a bit before restarting.
 		 *
-		 * NOTE: The frontend could be stuck in h2memw, though
-		 *	 it isn't supposed to be holding vnode locks
-		 *	 in that case.
+		 * NOTE: A frontend waiting in hammer2_pfs_memory_wait()
+		 *	 must NOT hold any vnode lock (this port invokes
+		 *	 the wait at the strategy-write entry and at
+		 *	 pre-lock ioctl points only).  Otherwise this
+		 *	 vn_lock(LK_NOWAIT) restart loop can livelock
+		 *	 against that frontend.
 		 */
 		if (dorestart & 2)
 			tsleep(&dorestart, 0, "h2syndel", 2);
@@ -2203,30 +2303,157 @@ restart:
 	}
 	debug_hprintf("FILESYSTEM SYNC STAGE 2 DONE\n");
 
-	/*
-	 * Auto-bulkfree: all deleted/superseded blocks keep their freemap
-	 * bits until a bulkfree pass reclaims them.  If allocator space is
-	 * running low, wake the device's bulkfree thread.  Without this,
-	 * COW churn (every modified block version) eventually exhausts the
-	 * volume even though most of the space is reclaimable.
-	 */
-	if (pmp->mp && !pmp->rdonly) {
-		hammer2_cluster_t *cluster = &pmp->iroot->cluster;
-		hammer2_chain_t *rchain;
-		int ci;
-
-		for (ci = 0; ci < cluster->nchains; ++ci) {
-			rchain = cluster->array[ci].chain;
-			if (rchain == NULL)
-				continue;
-			hammer2_bulkfree_wake(rchain->hmp);
-		}
-	}
-
 	error = 0; /* XXX */
 	hammer2_trans_done(pmp, HAMMER2_TRANS_ISFLUSH);
 
 	return (error);
+}
+
+/*
+ * Backpressure subsystem (adapted from upstream hammer2_vfsops.c).
+ *
+ * It is possible for an excessive number of dirty chains or dirty
+ * inodes to build up.  We stall the front end, with hysteresis, until
+ * the level drops.  Upstream relies on its VFS_MODIFY hook firing
+ * for every modifying operation; this port calls the wait directly
+ * at the front-end intake points (VOP_WRITE entry, destroy ioctl)
+ * before any transactions or locks are taken.
+ *
+ * Upstream triggers the syncer thread from the wait loop.  NetBSD
+ * has no trigger_syncer(9)-style kick, so the first stalled waiter
+ * runs one lazy sync of the PFS itself (callers hold no hammer2
+ * locks or transactions when invoking us), and other processes'
+ * regular syncs retire the counts and wake us up.
+ */
+void
+hammer2_pfs_memory_inc(hammer2_pfs_t *pmp)
+{
+	if (pmp)
+		atomic_add_int(&pmp->inmem_dirty_chains, 1);
+}
+
+void
+hammer2_pfs_memory_wakeup(hammer2_pfs_t *pmp, int count)
+{
+	uint32_t waiting;
+	int dirty;
+
+	if (pmp) {
+		waiting = atomic_fetchadd_int(&pmp->inmem_dirty_chains, count);
+		/* don't need --waiting to test flag */
+		dirty = (int)(pmp->inmem_dirty_chains & HAMMER2_DIRTYCHAIN_MASK);
+
+		if ((waiting & HAMMER2_DIRTYCHAIN_WAITING) &&
+		    dirty <= hammer2_limit_dirty_chains * 2 / 3 &&
+		    pmp->sideq_count <= hammer2_limit_dirty_inodes * 2 / 3) {
+			atomic_clear_int(&pmp->inmem_dirty_chains,
+			    HAMMER2_DIRTYCHAIN_WAITING);
+			wakeup(&pmp->inmem_dirty_chains);
+		}
+	}
+}
+
+void
+hammer2_pfs_memory_wait(hammer2_pfs_t *pmp)
+{
+	int waiting;
+	int kicked;
+	int error;
+
+	if (pmp == NULL || pmp->mp == NULL)
+		return;
+	if (pmp->rdonly)
+		return;
+
+	kicked = 0;
+
+	for (;;) {
+		waiting = (int)(pmp->inmem_dirty_chains &
+		    HAMMER2_DIRTYCHAIN_MASK);
+		cpu_ccfence();
+
+		/*
+		 * Stall at the limit waiting for the counts to drop.
+		 * This code will typically be woken up once the count
+		 * drops below 2/3 the limit, or in one second.
+		 */
+		if (waiting < hammer2_limit_dirty_chains &&
+		    pmp->sideq_count < hammer2_limit_dirty_inodes)
+			break;
+
+		/* Run one lazy sync ourselves kicking the stall off. */
+		if (kicked == 0) {
+			kicked = 1;
+			hammer2_vfs_sync_pmp(pmp, MNT_LAZY);
+			continue;
+		}
+
+		/* Interlocked re-test, sleep, and retry. */
+		atomic_set_int(&pmp->inmem_dirty_chains,
+		    HAMMER2_DIRTYCHAIN_WAITING);
+		waiting = (int)(pmp->inmem_dirty_chains &
+		    HAMMER2_DIRTYCHAIN_MASK);
+		if (waiting < hammer2_limit_dirty_chains &&
+		    pmp->sideq_count < hammer2_limit_dirty_inodes)
+			break;
+		error = tsleep(&pmp->inmem_dirty_chains, PCATCH,
+		    "h2memw", hz);
+		if (error == ERESTART)
+			break;
+	}
+}
+
+/*
+ * This handles hysteresis on regular file flushes, controlling the
+ * write pipe of in-flight logical writes.
+ */
+void
+hammer2_lwinprog_ref(hammer2_pfs_t *pmp)
+{
+	atomic_add_int(&pmp->count_lwinprog, 1);
+}
+
+void
+hammer2_lwinprog_drop(hammer2_pfs_t *pmp)
+{
+	int lwinprog;
+
+	lwinprog = atomic_fetchadd_int(&pmp->count_lwinprog, -1);
+	if ((lwinprog & HAMMER2_LWINPROG_WAITING) &&
+	    (lwinprog & HAMMER2_LWINPROG_MASK) <= hammer2_flush_pipe * 2 / 3) {
+		atomic_clear_int(&pmp->count_lwinprog,
+		    HAMMER2_LWINPROG_WAITING);
+		wakeup(&pmp->count_lwinprog);
+	}
+	if ((lwinprog & HAMMER2_LWINPROG_WAITING0) &&
+	    (lwinprog & HAMMER2_LWINPROG_MASK) <= 0) {
+		atomic_clear_int(&pmp->count_lwinprog,
+		    HAMMER2_LWINPROG_WAITING0);
+		wakeup(&pmp->count_lwinprog);
+	}
+}
+
+void
+hammer2_lwinprog_wait(hammer2_pfs_t *pmp, int flush_pipe)
+{
+	int lwinprog;
+	int lwflag = (flush_pipe) ? HAMMER2_LWINPROG_WAITING :
+	    HAMMER2_LWINPROG_WAITING0;
+	int error;
+
+	for (;;) {
+		lwinprog = pmp->count_lwinprog;
+		cpu_ccfence();
+		if ((lwinprog & HAMMER2_LWINPROG_MASK) <= flush_pipe)
+			break;
+		atomic_set_int(&pmp->count_lwinprog, lwflag);
+		lwinprog = pmp->count_lwinprog;
+		if ((lwinprog & HAMMER2_LWINPROG_MASK) <= flush_pipe)
+			break;
+		error = tsleep(&pmp->count_lwinprog, PCATCH, "h2wpipe", hz);
+		if (error == ERESTART)
+			break;
+	}
 }
 
 static const struct genfs_ops hammer2_genfsops;
@@ -2393,14 +2620,21 @@ hammer2_statvfs(struct mount *mp, struct statvfs *sbp)
 	hammer2_dev_t *hmp;
 	hammer2_blockref_t bref;
 	kauth_cred_t cred = curlwp->l_cred;
-	struct statvfs tmp;
-	uint64_t adj;
-	int i;
+	uint64_t c_blocks, c_bfree, c_bavail, c_files, c_ffree, adj;
+	uint64_t m_blocks, m_bfree, m_bavail, m_files, m_ffree;
+	int i, nset;
 
 	KKASSERT(mp->mnt_stat.f_iosize > 0);
 	KKASSERT(mp->mnt_stat.f_bsize > 0);
 
-	bzero(&tmp, sizeof(tmp));
+	/*
+	 * Multi-chain PFSes are mirrors of the same media: report the
+	 * min() across chains (a max() or last-wins would lie if one
+	 * fork is behind).  sbp is always filled in, even when no
+	 * chain is currently attached to the cluster.
+	 */
+	m_blocks = m_bfree = m_bavail = m_files = m_ffree = 0;
+	nset = 0;
 
 	for (i = 0; i < pmp->iroot->cluster.nchains; ++i) {
 		hmp = pmp->pfs_hmps[i];
@@ -2411,38 +2645,54 @@ hammer2_statvfs(struct mount *mp, struct statvfs *sbp)
 		else
 			bzero(&bref, sizeof(bref));
 
-		tmp.f_files = bref.embed.stats.inode_count;
-		tmp.f_ffree = 0;
-		tmp.f_blocks = hmp->voldata.allocator_size /
+		c_ffree = 0;
+		c_files = bref.embed.stats.inode_count;
+		c_blocks = hmp->voldata.allocator_size /
 		    mp->mnt_stat.f_bsize;
-		tmp.f_bfree = hmp->voldata.allocator_free /
+		c_bfree = hmp->voldata.allocator_free /
 		    mp->mnt_stat.f_bsize;
-		tmp.f_bavail = tmp.f_bfree;
+		c_bavail = c_bfree;
 
 		if (cred && cred->cr_uid != 0) {
 			/* 5% */
 			adj = hmp->free_reserved / mp->mnt_stat.f_bsize;
-			tmp.f_blocks -= adj;
-			tmp.f_bfree -= adj;
-			tmp.f_bavail -= adj;
+			c_blocks -= adj;
+			c_bfree -= adj;
+			c_bavail -= adj;
 		}
 
-		mp->mnt_stat.f_blocks = tmp.f_blocks;
-		mp->mnt_stat.f_bfree = tmp.f_bfree;
-		mp->mnt_stat.f_bavail = tmp.f_bavail;
-		mp->mnt_stat.f_files = tmp.f_files;
-		mp->mnt_stat.f_ffree = tmp.f_ffree;
-
-		*sbp = mp->mnt_stat;
-		sbp->f_iosize = mp->mnt_stat.f_iosize;
-		sbp->f_bsize = mp->mnt_stat.f_bsize;
-
-		sbp->f_frsize = sbp->f_bsize;
-		sbp->f_bresvd = 0;
-		sbp->f_favail = 0;
-		sbp->f_fresvd = 0;
-		copy_statvfs_info(sbp, mp);
+		if (nset == 0) {
+			m_blocks = c_blocks;
+			m_bavail = c_bavail;
+			m_bfree = c_bfree;
+			m_files = c_files;
+			m_ffree = c_ffree;
+		} else {
+			m_blocks = MIN(m_blocks, c_blocks);
+			m_bavail = MIN(m_bavail, c_bavail);
+			m_bfree = MIN(m_bfree, c_bfree);
+			m_files = MIN(m_files, c_files);
+			m_ffree = MIN(m_ffree, c_ffree);
+		}
+		++nset;
 	}
+
+	mp->mnt_stat.f_blocks = m_blocks;
+	mp->mnt_stat.f_bfree = m_bfree;
+	mp->mnt_stat.f_bavail = m_bavail;
+	mp->mnt_stat.f_files = m_files;
+	mp->mnt_stat.f_ffree = m_ffree;
+
+	*sbp = mp->mnt_stat;
+	sbp->f_iosize = mp->mnt_stat.f_iosize;
+	sbp->f_bsize = mp->mnt_stat.f_bsize;
+
+	sbp->f_frsize = sbp->f_bsize;
+	sbp->f_bresvd = 0;
+	sbp->f_favail = sbp->f_ffree;
+	sbp->f_fresvd = 0;
+	copy_statvfs_info(sbp, mp);
+
 	return (0);
 }
 

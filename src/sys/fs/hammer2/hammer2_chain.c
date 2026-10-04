@@ -505,6 +505,7 @@ hammer2_chain_lastdrop(hammer2_chain_t *chain, int depth)
 		if (chain->flags & HAMMER2_CHAIN_MODIFIED) {
 			atomic_clear_int(&chain->flags, HAMMER2_CHAIN_MODIFIED);
 			atomic_add_int(&hammer2_count_chain_modified, -1);
+			hammer2_pfs_memory_wakeup(chain->pmp, -1);
 		}
 		/* spinlock still held */
 	}
@@ -1281,6 +1282,7 @@ hammer2_chain_modify(hammer2_chain_t *chain, hammer2_tid_t mtid,
 		/* Must set modified bit. */
 		atomic_add_int(&hammer2_count_chain_modified, 1);
 		atomic_set_int(&chain->flags, HAMMER2_CHAIN_MODIFIED);
+		hammer2_pfs_memory_inc(chain->pmp);
 		setmodified = 1;
 
 		/*
@@ -1400,6 +1402,7 @@ hammer2_chain_modify(hammer2_chain_t *chain, hammer2_tid_t mtid,
 				    HAMMER2_CHAIN_MODIFIED);
 				atomic_add_int(&hammer2_count_chain_modified,
 				    -1);
+				hammer2_pfs_memory_wakeup(chain->pmp, -1);
 				hammer2_freemap_adjust(hmp, &chain->bref,
 				    HAMMER2_FREEMAP_DORECOVER);
 				atomic_set_int(&chain->flags,
@@ -1450,6 +1453,7 @@ hammer2_chain_modify(hammer2_chain_t *chain, hammer2_tid_t mtid,
 		if (setmodified) {
 			atomic_clear_int(&chain->flags, HAMMER2_CHAIN_MODIFIED);
 			atomic_add_int(&hammer2_count_chain_modified, -1);
+			hammer2_pfs_memory_wakeup(chain->pmp, -1);
 		}
 		if (setupdate)
 			atomic_clear_int(&chain->flags, HAMMER2_CHAIN_UPDATE);
@@ -4906,13 +4910,18 @@ hammer2_chain_dirent_test(const hammer2_chain_t *chain, const char *name,
 }
 
 void
-hammer2_dump_chain(hammer2_chain_t *chain, int tab, int bi, int depth, char pfx)
+hammer2_dump_chain(hammer2_chain_t *chain, int tab, int bi, int *countp,
+    char pfx, u_int flags)
 {
 	hammer2_chain_t *scan;
 	int i;
 
-	KKASSERT(depth == -1 || depth >= 0);
-	if (depth != -1 && depth-- == 0)
+	--*countp;
+	if (*countp == 0) {
+		printf("%*.*s...\n", tab, tab, "");
+		return;
+	}
+	if (*countp < 0)
 		return;
 
 	printf("%*.*s%c-chain %s.%-3d %016llx %016llx/%d mir %016llx mod "
@@ -4934,7 +4943,10 @@ hammer2_dump_chain(hammer2_chain_t *chain, int tab, int bi, int depth, char pfx)
 		printf(" {\n");
 		i = 0;
 		RB_FOREACH(scan, hammer2_chain_tree, &chain->core.rbtree) {
-			hammer2_dump_chain(scan, tab + 4, i, depth, 'a');
+			if ((scan->flags & flags) || flags == (u_int)-1) {
+			hammer2_dump_chain(scan, tab + 4, i, countp,
+				    'a', flags);
+			}
 			i++;
 		}
 		if (chain->bref.type == HAMMER2_BREF_TYPE_INODE && chain->data)

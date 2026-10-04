@@ -93,6 +93,7 @@ struct hammer2_depend;
 struct hammer2_inode;
 struct hammer2_dev;
 struct hammer2_pfs;
+struct lockf;
 union hammer2_xop;
 
 typedef struct hammer2_io hammer2_io_t;
@@ -463,7 +464,7 @@ struct hammer2_inode {
 	uint8_t			comp_heuristic;
 	int			ipdep_idx;
 	int			vhold;
-	int			in_seek;	/* FIOSEEKXXX */
+	struct lockf		*lockf;		/* byte-level lock list */
 };
 
 /*
@@ -843,14 +844,7 @@ struct hammer2_dev {
 	hammer2_lk_t		vollk;		/* lockmgr lock */
 	hammer2_lk_t		bulklk;		/* bulkfree operation lock */
 	hammer2_lk_t		bflk;		/* bulk-free manual function lock */
-	kmutex_t		bulkfree_mtx;	/* auto bulkfree thread */
-	kcondvar_t		bulkfree_cv;
-	struct lwp		*bulkfree_lwp;
-	int			bulkfree_wanted;
-	int			bulkfree_running;
-	int			bulkfree_quit;
-	int			bulkfree_backoff;
-	int			bulkfree_ticks_last;
+	int			bulkfree_quit;	/* unmount teardown in progress */
 	int			freemap_relaxed;
 	hammer2_off_t		free_reserved;	/* nominal free reserved */
 	hammer2_off_t		heur_freemap[HAMMER2_FREEMAP_HEUR_SIZE];
@@ -908,11 +902,26 @@ struct hammer2_pfs {
 	/* note: inumhash not applicable to spmp */
 	hammer2_inum_hash_t	inumhash[HAMMER2_INUMHASH_SIZE];
 	char			*fspec;		/* NetBSD: for MNT_GETARGS */
+
+	/*
+	 * Backpressure (upstream vfsops.c): number of dirty chains
+	 * on this PFS, plus waiter flag bits for tsleep(9)-style
+	 * sleeps, and the logical-write-in-progress count used to
+	 * throttle the write pipe.
+	 */
+	uint32_t		inmem_dirty_chains;
+	int			count_lwinprog;	/* logical write in prog */
 };
 
 #define HAMMER2_PMPF_SPMP	0x00000001
 #define HAMMER2_PMPF_EMERG	0x00000002
 #define HAMMER2_PMPF_WAITING	0x10000000
+
+#define HAMMER2_DIRTYCHAIN_WAITING	0x80000000
+#define HAMMER2_DIRTYCHAIN_MASK		0x7FFFFFFF
+#define HAMMER2_LWINPROG_WAITING		0x40000000
+#define HAMMER2_LWINPROG_WAITING0	0x80000000
+#define HAMMER2_LWINPROG_MASK		0x3FFFFFFF
 
 #define HAMMER2_CHECK_NULL	0x00000001
 
@@ -924,6 +933,9 @@ extern struct hammer2_pfslist hammer2_pfslist;
 extern hammer2_lk_t hammer2_mntlk;
 
 extern int hammer2_dedup_enable;
+extern int hammer2_flush_pipe;
+extern int hammer2_limit_dirty_chains;
+extern int hammer2_limit_dirty_inodes;
 extern int hammer2_count_inode_allocated;
 extern int hammer2_count_chain_allocated;
 extern int hammer2_count_chain_modified;
@@ -936,6 +948,15 @@ extern int hammer2_always_compress;
 
 extern hammer2_xop_desc_t hammer2_ipcluster_desc;
 extern hammer2_xop_desc_t hammer2_readdir_desc;
+
+/* hammer2_vfsops.c (backpressure) */
+void hammer2_pfs_memory_wait(hammer2_pfs_t *);
+void hammer2_pfs_memory_wakeup(hammer2_pfs_t *, int);
+void hammer2_pfs_memory_inc(hammer2_pfs_t *);
+void hammer2_lwinprog_ref(hammer2_pfs_t *);
+void hammer2_lwinprog_drop(hammer2_pfs_t *);
+void hammer2_lwinprog_wait(hammer2_pfs_t *, int);
+
 extern hammer2_xop_desc_t hammer2_nresolve_desc;
 extern hammer2_xop_desc_t hammer2_unlink_desc;
 extern hammer2_xop_desc_t hammer2_nrename_desc;
@@ -970,12 +991,9 @@ int hammer2_xop_feed(hammer2_xop_head_t *, hammer2_chain_t *, int, int);
 int hammer2_xop_collect(hammer2_xop_head_t *, int);
 
 /* hammer2_bulkfree.c */
-void hammer2_bulkfree_init(hammer2_dev_t *);
-void hammer2_bulkfree_uninit(hammer2_dev_t *);
 int hammer2_bulkfree_pass(hammer2_dev_t *, hammer2_chain_t *,
     struct hammer2_ioc_bulkfree *);
 int hammer2_bulkfree_dev_scan(hammer2_dev_t *, struct hammer2_ioc_bulkfree *);
-void hammer2_bulkfree_wake(hammer2_dev_t *);
 
 /* hammer2_chain.c */
 int hammer2_chain_cmp(const hammer2_chain_t *, const hammer2_chain_t *);
@@ -1019,7 +1037,7 @@ int hammer2_chain_inode_find(hammer2_pfs_t *, hammer2_key_t, int, int,
 hammer2_chain_t *hammer2_chain_bulksnap(hammer2_dev_t *);
 void hammer2_chain_bulkdrop(hammer2_chain_t *);
 int hammer2_chain_dirent_test(const hammer2_chain_t *, const char *, size_t);
-void hammer2_dump_chain(hammer2_chain_t *, int, int, int, char);
+void hammer2_dump_chain(hammer2_chain_t *, int, int, int *, char, u_int);
 
 RB_PROTOTYPE(hammer2_chain_tree, hammer2_chain, rbnode, hammer2_chain_cmp);
 RB_PROTOTYPE_SCAN(hammer2_chain_tree, hammer2_chain, rbnode);
@@ -1302,6 +1320,18 @@ hammer2_assert_inode_meta(const hammer2_inode_t *ip)
 {
 	KASSERTMSG(ip, "NULL ip");
 	KASSERTMSG(ip->meta.type, "type 0");
+}
+
+/*
+ * kqueue notification (upstream hammer2.h).  NetBSD's mechanism is the
+ * VN_KNOTE(9) inline (sys/vnode.h), guarded by the vnode's kevent
+ * interest check.
+ */
+static __inline void
+hammer2_knote(struct vnode *vp, int flags)
+{
+	if (vp && flags)
+		VN_KNOTE(vp, flags);
 }
 
 uint32_t iscsi_crc32(const void *, size_t);

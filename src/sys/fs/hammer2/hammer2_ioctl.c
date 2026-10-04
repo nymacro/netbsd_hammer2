@@ -660,17 +660,19 @@ hammer2_ioctl_inode_set(hammer2_inode_t *ip, void *data)
  * Recursively dump chains of a given inode.
  */
 static int
-hammer2_ioctl_debug_dump(hammer2_inode_t *ip, unsigned int flags __unused)
+hammer2_ioctl_debug_dump(hammer2_inode_t *ip, unsigned int flags)
 {
 #ifdef HAMMER2_INVARIANTS
 	hammer2_chain_t *chain;
 	int i;
+	int count;
 
 	for (i = 0; i < ip->cluster.nchains; ++i) {
 		chain = ip->cluster.array[i].chain;
 		if (chain) {
 			hprintf("cluster #%d\n", i);
-			hammer2_dump_chain(chain, 0, 0, -1, 'i');
+			count = 100000;
+			hammer2_dump_chain(chain, 0, 0, &count, 'i', flags);
 		}
 	}
 
@@ -780,6 +782,7 @@ hammer2_ioctl_destroy(hammer2_inode_t *ip, void *data)
 			error = EINVAL;
 			break;
 		}
+		hammer2_pfs_memory_wait(pmp);
 		hammer2_trans_init(pmp, 0);
 		hammer2_inode_lock(ip, 0);
 
@@ -806,6 +809,7 @@ hammer2_ioctl_destroy(hammer2_inode_t *ip, void *data)
 			error = EINVAL;
 			break;
 		}
+		hammer2_pfs_memory_wait(pmp);
 		hammer2_trans_init(pmp, 0);
 
 		xop = hammer2_xop_alloc(pmp->iroot, HAMMER2_XOP_MODIFYING);
@@ -1042,6 +1046,23 @@ hammer2_ioctl_impl(struct vnode *vp, unsigned long com, void *data,
 	hammer2_inode_t *ip = VTOI(vp);
 	int error;
 
+	/*
+	 * Privilege gate for administrative ioctls (upstream uses
+	 * DragonFly's caps_priv_check; NetBSD's equivalent is kauth).
+	 * Gated against "may update mounts" — the same authority mount(8)
+	 * and quotactl-class mutations require (precedent: lfs(4) uses
+	 * KAUTH_SYSTEM_MOUNT for fs mutations).  Informational ioctls
+	 * below simply overwrite the error; the administrative ones
+	 * honor it.
+	 *
+	 * Note: BULKFREE_SCAN is unprivileged upstream, but requires
+	 * privilege here — it synchronously syncs all PFSes on the
+	 * media (DoS vector); the cron-driven `hammer2 cleanup` runs
+	 * as root anyway.
+	 */
+	error = kauth_authorize_system(cred, KAUTH_SYSTEM_MOUNT,
+	    KAUTH_REQ_SYSTEM_MOUNT_UPDATE, NULL, NULL, NULL);
+
 	switch (com) {
 	case HAMMER2IOC_VERSION_GET:
 		error = hammer2_ioctl_version_get(ip, data);
@@ -1050,58 +1071,70 @@ hammer2_ioctl_impl(struct vnode *vp, unsigned long com, void *data,
 		error = hammer2_ioctl_pfs_get(ip, data);
 		break;
 	case HAMMER2IOC_PFS_LOOKUP:
-		error = hammer2_ioctl_pfs_lookup(ip, data);
+		if (error == 0)
+			error = hammer2_ioctl_pfs_lookup(ip, data);
 		break;
 	case HAMMER2IOC_PFS_CREATE:
-		error = hammer2_ioctl_pfs_create(ip, data);
+		if (error == 0)
+			error = hammer2_ioctl_pfs_create(ip, data);
 		break;
 	case HAMMER2IOC_PFS_DELETE:
-		error = hammer2_ioctl_pfs_delete(ip, data);
+		if (error == 0)
+			error = hammer2_ioctl_pfs_delete(ip, data);
 		break;
 	case HAMMER2IOC_PFS_SNAPSHOT:
-		error = hammer2_ioctl_pfs_snapshot(ip, data);
+		if (error == 0)
+			error = hammer2_ioctl_pfs_snapshot(ip, data);
 		break;
 	case HAMMER2IOC_INODE_GET:
 		error = hammer2_ioctl_inode_get(ip, data);
 		break;
 	case HAMMER2IOC_INODE_SET:
-		error = hammer2_ioctl_inode_set(ip, data);
+		if (error == 0)
+			error = hammer2_ioctl_inode_set(ip, data);
 		break;
 	case HAMMER2IOC_DEBUG_DUMP:
 		error = hammer2_ioctl_debug_dump(ip, *(unsigned int *)data);
 		break;
 	case HAMMER2IOC_EMERG_MODE:
-		error = hammer2_ioctl_emerg_mode(ip, *(unsigned int *)data);
+		if (error == 0)
+			error = hammer2_ioctl_emerg_mode(ip, *(unsigned int *)data);
 		break;
 	case HAMMER2IOC_BULKFREE_SCAN:
-		error = hammer2_ioctl_bulkfree_scan(ip, data);
+		if (error == 0)
+			error = hammer2_ioctl_bulkfree_scan(ip, data);
 		break;
 	case HAMMER2IOC_DESTROY:
-		error = hammer2_ioctl_destroy(ip, data);
+		if (error == 0)
+			error = hammer2_ioctl_destroy(ip, data);
 		break;
 	case HAMMER2IOC_GROWFS:
-		error = hammer2_ioctl_growfs(ip, data);
+		if (error == 0)
+			error = hammer2_ioctl_growfs(ip, data);
 		break;
 	case HAMMER2IOC_VOLUME_LIST:
-		error = hammer2_ioctl_volume_list(ip, data);
+		if (error == 0)
+			error = hammer2_ioctl_volume_list(ip, data);
 		break;
 	case HAMMER2IOC_VOLUME_LIST2:
-		error = hammer2_ioctl_volume_list2(ip, data);
+		if (error == 0)
+			error = hammer2_ioctl_volume_list2(ip, data);
 		break;
 	case FIOSEEKDATA:
 	case FIOSEEKHOLE:
-		KKASSERT(ip->in_seek == 0);
-		ip->in_seek = 1;
-		error = EOPNOTSUPP;
-		KKASSERT(ip->in_seek == 1);
-		ip->in_seek = 0;
+		/*
+		 * Upstream stubs this out too (#if 0'ed vn_bmap_seekhole
+		 * call).  NetBSD has no in-kernel SEEK_DATA/SEEK_HOLE
+		 * consumer (lseek does not issue it) and this port has no
+		 * device-backed bmap path, so there is nothing to wire.
+		 */
+		if (error == 0)
+			error = EOPNOTSUPP;
 		break;
 	default:
 		error = EOPNOTSUPP;
 		break;
 	}
-
-	KKASSERT(ip->in_seek == 0);
 
 	return (error);
 }

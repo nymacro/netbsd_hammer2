@@ -835,6 +835,7 @@ hammer2_chain_load_data(hammer2_chain_t *chain)
 	hammer2_blockref_t *bref;
 	char *bdata;
 	int error;
+	long inp_wait_ticks;
 
 	/*
 	 * Degenerate case, data already present, or chain has no media
@@ -853,11 +854,20 @@ hammer2_chain_load_data(hammer2_chain_t *chain)
 	 * DragonFly uses tsleep_interlock(9) here without taking mutex.
 	 */
 	hammer2_lk_ex(&chain->inp_lock);
+	inp_wait_ticks = 0;
 again:
 	if (chain->flags & HAMMER2_CHAIN_IOINPROG) {
 		atomic_set_int(&chain->flags, HAMMER2_CHAIN_IOSIGNAL);
 		hammer2_lkc_sleep(&chain->inp_cv, &chain->inp_lock, "h2ch_inp",
-		    0);
+		    hz);
+		inp_wait_ticks += hz;
+		if (inp_wait_ticks >= 30 * hz) {
+			hprintf("chain %p bref %016llx IOINPROG stuck for "
+			    "%ds, flags %08x\n", chain,
+			    (long long)chain->bref.data_off,
+			    (int)(inp_wait_ticks / hz), chain->flags);
+			inp_wait_ticks = 0;
+		}
 		goto again;
 	}
 	atomic_set_int(&chain->flags, HAMMER2_CHAIN_IOINPROG);

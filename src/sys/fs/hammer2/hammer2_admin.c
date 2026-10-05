@@ -250,15 +250,24 @@ hammer2_xop_testset_ipdep(hammer2_inode_t *ip)
 	hammer2_pfs_t *pmp = ip->pmp;
 	hammer2_lk_t *mtx;
 	hammer2_lkc_t *cv;
+	int xop_ipdep_wait_secs;
 
 	mtx = &pmp->xop_lock[ip->ipdep_idx];
 	cv = &pmp->xop_cv[ip->ipdep_idx];
 
 	hammer2_lk_ex(mtx);
+	xop_ipdep_wait_secs = 0;
 again:
 	if (xop_testset_ipdep(ip, ip->ipdep_idx)) {
 		pmp->flags |= HAMMER2_PMPF_WAITING;
-		hammer2_lkc_sleep(cv, mtx, "h2pmp_xop", 0);
+		hammer2_lkc_sleep(cv, mtx, "h2pmp_xop", hz);
+		++xop_ipdep_wait_secs;
+		if (xop_ipdep_wait_secs >= 30) {
+			hprintf("pmp %p ipdep wait stuck for %ds, "
+			    "ip->flags %08x pmp->flags %08x\n", pmp,
+			    xop_ipdep_wait_secs, ip->flags, pmp->flags);
+			xop_ipdep_wait_secs = 0;
+		}
 		goto again;
 	}
 	hammer2_lk_unlock(mtx);

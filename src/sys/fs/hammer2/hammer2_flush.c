@@ -95,6 +95,7 @@ hammer2_trans_init(hammer2_pfs_t *pmp, uint32_t flags)
 {
 	uint32_t oflags, nflags;
 	int dowait;
+	int trans_wait_secs = 0;
 
 	hammer2_lk_ex(&pmp->trans_lock);
 	for (;;) {
@@ -136,7 +137,14 @@ hammer2_trans_init(hammer2_pfs_t *pmp, uint32_t flags)
 			if (dowait == 0)
 				break;
 			hammer2_lkc_sleep(&pmp->trans_cv, &pmp->trans_lock,
-			    "h2pmp_tr", 0);
+			    "h2pmp_tr", hz);
+			++trans_wait_secs;
+			if (trans_wait_secs >= 30) {
+				hprintf("pmp %p trans wait stuck for %ds, "
+				    "trans.flags %08x\n", pmp,
+				    trans_wait_secs, pmp->trans.flags);
+				trans_wait_secs = 0;
+			}
 			/* retry */
 		} else {
 			cpu_pause();

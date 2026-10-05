@@ -183,8 +183,10 @@ hammer2_io_getblk(hammer2_dev_t *hmp, int btype, hammer2_off_t lbase, int lsize,
 	hammer2_mtx_ex(&hmp->iohash_lock);
 	if (op == HAMMER2_DOP_READQ) {
 		dio = hammer2_io_alloc(hmp, lbase, btype, 0);
-		if (dio == NULL)
+		if (dio == NULL) {
+			hammer2_mtx_unlock(&hmp->iohash_lock);
 			return (NULL);
+		}
 		op = HAMMER2_DOP_READ;
 	} else {
 		dio = hammer2_io_alloc(hmp, lbase, btype, 1);

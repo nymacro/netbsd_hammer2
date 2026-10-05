@@ -2535,6 +2535,10 @@ hammer2_print(void *v)
 	} */ *ap = v;
 	hammer2_inode_t *ip = VTOI(ap->a_vp);
 
+	if (ip == NULL) {
+		printf("tag VT_HAMMER2, no inode (v_data NULL)\n");
+		return (0);
+	}
 	printf("tag VT_HAMMER2, ino %016llx", (long long)ip->meta.inum);
 	printf("\n");
 

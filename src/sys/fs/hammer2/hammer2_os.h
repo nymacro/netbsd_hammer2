@@ -131,9 +131,13 @@ hammer2_lkc_destroy(hammer2_lkc_t *c)
 
 static __inline void
 hammer2_lkc_sleep(hammer2_lkc_t *c, hammer2_lk_t *p, const char *s,
-    int timo __unused)
+    int timo)
 {
-	cv_wait(c, p);
+	/*
+	 * timo == 0 sleeps forever (cv_timedwait semantics);
+	 * nonzero bounds each sleep so callers can report wedges.
+	 */
+	cv_timedwait(c, p, timo);
 }
 
 static __inline void

@@ -2004,8 +2004,10 @@ hammer2_vfs_sync_pmp(hammer2_pfs_t *pmp, int waitfor __unused)
 	hammer2_inode_t *ip;
 	hammer2_depend_t *depend, *depend_next;
 	struct vnode *vp;
+	int vp_held;
 	uint32_t pass2;
 	int error, dorestart, ndrop;
+	int syndel_loops;
 
 	/*
 	 * Move all inodes on sideq to syncq.  This will clear sideq.
@@ -2027,6 +2029,7 @@ hammer2_vfs_sync_pmp(hammer2_pfs_t *pmp, int waitfor __unused)
 	 */
 	hammer2_trans_init(pmp, HAMMER2_TRANS_ISFLUSH);
 	dorestart = 0;
+	syndel_loops = 0;
 
 	/*
 	 * Move inodes from depq to syncq, releasing the related
@@ -2122,6 +2125,7 @@ restart:
 		 * the whole SIDEQ back to SYNCQ when we restart.
 		 */
 		vp = ip->vp; /* NULL after vflush() */
+		vp_held = 0;
 		if (vp && vrefcnt(vp) > 0) {
 			vref(vp); /* requires vrefcnt(vp) > 0 */
 			if (vn_lock(vp, LK_EXCLUSIVE | LK_NOWAIT)) {
@@ -2150,11 +2154,21 @@ restart:
 				hammer2_spin_ex(&pmp->list_spin);
 				continue;
 			}
+			vp_held = 1;
 		}
 
 		/*
 		 * Relock the inode, and we inherit a ref from the above.
 		 * We will check for a race after we acquire the vnode.
+		 *
+		 * NOTE: If the vnode is unreferenced (inactivated, sitting
+		 *	 on the LRU) we cannot legally vref/vput it here —
+		 *	 vp stays set but vp_held stays 0 and all vnode-
+		 *	 level work below is skipped (buffer writeback is
+		 *	 the bufdaemon's job anyway; the chain flush below
+		 *	 still synchronizes the inode to media).  vput of
+		 *	 an unreferenced vnode underflows v_usecount and
+		 *	 panics "vrelel: bad ref count" in the syncer.
 		 */
 		/* XXX2 DragonFly takes inode lock before vget */
 		hammer2_mtx_ex(&ip->lock);
@@ -2168,19 +2182,22 @@ restart:
 		if (ip->flags & HAMMER2_INODE_SIDEQ) {
 			hammer2_mtx_unlock(&ip->lock);
 			hammer2_inode_drop(ip);
-			if (vp)
+			if (vp_held) {
 				vput(vp);
+				vp_held = 0;
+			}
+			vp = NULL;
 			dorestart |= 1;
 			hammer2_spin_ex(&pmp->list_spin);
 			continue;
 		}
 
 		/*
-		 * Ok we have the inode exclusively locked and if vp is
-		 * not NULL that will also be exclusively locked.  Do the
-		 * meat of the flush.
+		 * Ok we have the inode exclusively locked and if vp_held
+		 * the vnode is also exclusively locked and referenced.
+		 * Do the meat of the flush.
 		 */
-		if (vp) {
+		if (vp_held) {
 			hammer2_mtx_unlock(&ip->lock); /* XXX iplock */
 			if (vp->v_type == VBLK)
 				error = 0;
@@ -2233,7 +2250,7 @@ restart:
 		else
 			hammer2_inode_chain_flush(ip,
 			    HAMMER2_XOP_INODE_STOP | HAMMER2_XOP_FSSYNC);
-		if (vp) {
+		if (vp_held) {
 			if ((ip->flags & (HAMMER2_INODE_MODIFIED |
 			    HAMMER2_INODE_RESIZED |
 			    HAMMER2_INODE_DIRTYDATA)) == 0) {
@@ -2246,9 +2263,22 @@ restart:
 			}
 			ndrop = ip->vhold;
 			vput(vp);
+			vp_held = 0;
 			hammer2_mtx_unlock(&ip->lock); /* XXX iplock */
 			hammer2_inode_vdrop(ip, ndrop);
 			hammer2_mtx_ex(&ip->lock);
+			vp = NULL; /* safety */
+		} else if (vp) {
+			/*
+			 * Unreferenced vnode: no vput (would underflow).
+			 * The chain flush above already synchronized the
+			 * inode to media; re-add to the sideq when still
+			 * dirty so buffers are revisited on a later pass.
+			 */
+			if (ip->flags & (HAMMER2_INODE_MODIFIED |
+			    HAMMER2_INODE_RESIZED |
+			    HAMMER2_INODE_DIRTYDATA))
+				hammer2_inode_delayed_sideq(ip);
 			vp = NULL; /* safety */
 		}
 		atomic_clear_int(&ip->flags, HAMMER2_INODE_SYNCQ_PASS2);
@@ -2276,8 +2306,18 @@ restart:
 		 *	 vn_lock(LK_NOWAIT) restart loop can livelock
 		 *	 against that frontend.
 		 */
-		if (dorestart & 2)
+		if (dorestart & 2) {
 			tsleep(&dorestart, 0, "h2syndel", 2);
+			++syndel_loops;
+			if (syndel_loops >= 15 * 30) {
+				hprintf("pmp %p sync restart livelock for "
+				    "%ds: trans.flags %08x sideq %d\n",
+				    pmp, syndel_loops / 15,
+				    pmp->trans.flags,
+				    (int)pmp->sideq_count);
+				syndel_loops = 0;
+			}
+		}
 		debug_hprintf("FILESYSTEM SYNC STAGE 1 RESTART\n");
 		dorestart = 1;
 		goto restart;
@@ -2359,6 +2399,7 @@ hammer2_pfs_memory_wait(hammer2_pfs_t *pmp)
 	int waiting;
 	int kicked;
 	int error;
+	int mem_wait_loops;
 
 	if (pmp == NULL || pmp->mp == NULL)
 		return;
@@ -2366,6 +2407,7 @@ hammer2_pfs_memory_wait(hammer2_pfs_t *pmp)
 		return;
 
 	kicked = 0;
+	mem_wait_loops = 0;
 
 	for (;;) {
 		waiting = (int)(pmp->inmem_dirty_chains &
@@ -2398,6 +2440,16 @@ hammer2_pfs_memory_wait(hammer2_pfs_t *pmp)
 			break;
 		error = tsleep(&pmp->inmem_dirty_chains, PCATCH,
 		    "h2memw", hz);
+		++mem_wait_loops;
+		if (mem_wait_loops >= 30) {
+			hprintf("pmp %p memory_wait stuck for %ds: "
+			    "dirty_chains %d/%d sideq %d/%d\n", pmp,
+			    mem_wait_loops, waiting,
+			    hammer2_limit_dirty_chains,
+			    (int)pmp->sideq_count,
+			    hammer2_limit_dirty_inodes);
+			mem_wait_loops = 0;
+		}
 		if (error == ERESTART)
 			break;
 	}
@@ -2440,7 +2492,9 @@ hammer2_lwinprog_wait(hammer2_pfs_t *pmp, int flush_pipe)
 	int lwflag = (flush_pipe) ? HAMMER2_LWINPROG_WAITING :
 	    HAMMER2_LWINPROG_WAITING0;
 	int error;
+	int lwin_wait_loops;
 
+	lwin_wait_loops = 0;
 	for (;;) {
 		lwinprog = pmp->count_lwinprog;
 		cpu_ccfence();
@@ -2451,6 +2505,15 @@ hammer2_lwinprog_wait(hammer2_pfs_t *pmp, int flush_pipe)
 		if ((lwinprog & HAMMER2_LWINPROG_MASK) <= flush_pipe)
 			break;
 		error = tsleep(&pmp->count_lwinprog, PCATCH, "h2wpipe", hz);
+		++lwin_wait_loops;
+		if (lwin_wait_loops >= 30) {
+			hprintf("pmp %p lwinprog_wait stuck for %ds: "
+			    "count_lwinprog %d flush_pipe %d\n", pmp,
+			    lwin_wait_loops,
+			    (int)(pmp->count_lwinprog &
+			    HAMMER2_LWINPROG_MASK), flush_pipe);
+			lwin_wait_loops = 0;
+		}
 		if (error == ERESTART)
 			break;
 	}

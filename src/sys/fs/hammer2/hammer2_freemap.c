@@ -37,6 +37,8 @@
 
 #include "hammer2.h"
 
+#define FREEMAP_DEBUG	0
+
 struct hammer2_fiterate {
 	hammer2_off_t	bpref;
 	hammer2_off_t	bnext;
@@ -147,7 +149,10 @@ hammer2_freemap_reserve(hammer2_chain_t *chain, int radix)
 		break;
 	}
 	bref->data_off = off | radix;
-
+#if FREEMAP_DEBUG
+	kprintf("FREEMAP BLOCK TYPE %d %016jx/%d DATA_OFF=%016jx\n",
+		bref->type, bref->key, bref->keybits, bref->data_off);
+#endif
 	return (0);
 }
 
@@ -282,11 +287,19 @@ hammer2_freemap_try_alloc(hammer2_chain_t **parentp, hammer2_blockref_t *bref,
 		 * the auxillary freemap tracking information in
 		 * the bref.check.freemap structure.
 		 */
+#if 0
+		kprintf("freemap create L1 @ %016jx bpref %016jx\n",
+			key, iter->bpref);
+#endif
 		error = hammer2_chain_create(parentp, &chain, NULL, hmp->spmp,
 		    HAMMER2_METH_DEFAULT, key, HAMMER2_FREEMAP_LEVEL1_RADIX,
 		    HAMMER2_BREF_TYPE_FREEMAP_LEAF, HAMMER2_FREEMAP_LEVELN_PSIZE,
 		    mtid, 0, 0);
 		KKASSERT(error == 0);
+		if (hammer2_debug & 0x0040) {
+			hprintf("fixup create chain %p %016jx:%d\n",
+				chain, chain->bref.key, chain->bref.keybits);
+		}
 		if (error == 0) {
 			/*
 			 * An error should not be possible here because freemap
@@ -458,6 +471,11 @@ skip_scan:
 		 */
 		if (bref->type == HAMMER2_BREF_TYPE_DATA)
 			hammer2_io_dedup_set(hmp, bref);
+#if 0
+		kprintf("alloc cp=%p %016jx %016jx using %016jx\n",
+			chain,
+			bref->key, bref->data_off, chain->bref.data_off);
+#endif
 	} else if (error == HAMMER2_ERROR_ENOSPC) {
 		/*
 		 * Return EAGAIN with next iteration in iter->bnext, or
@@ -642,6 +660,12 @@ success:
 		while ((pbmmask & bmmask) == 0)
 			pbmmask <<= pbmradix;
 
+#if 0
+		kprintf("%016jx mask %016jx %016jx %016jx (%zd/%zd)\n",
+			*basep + offset, bmap->bitmapq[i],
+			pbmmask, bmmask, size, psize);
+#endif
+
 		if ((bmap->bitmapq[i] & pbmmask) == 0) {
 			hammer2_io_newnz(hmp, class >> 8,
 			    (*basep + (offset & ~HAMMER2_PBUFMASK)) |
@@ -650,6 +674,26 @@ success:
 			hammer2_io_putblk(&dio);
 		}
 	}
+
+#if 0
+	/*
+	 * When initializing a new inode segment also attempt to initialize
+	 * an adjacent segment.  Be careful not to index beyond the array
+	 * bounds.
+	 *
+	 * We do this to try to localize inode accesses to improve
+	 * directory scan rates.  XXX doesn't improve scan rates.
+	 */
+	if (size == HAMMER2_INODE_BYTES) {
+		if (n & 1) {
+			if (bmap[-1].radix == 0 && bmap[-1].avail)
+				bmap[-1].radix = radix;
+		} else {
+			if (bmap[1].radix == 0 && bmap[1].avail)
+				bmap[1].radix = radix;
+		}
+	}
+#endif
 
 	/*
 	 * Calculate the bitmap-granular change in bgsize for the volume
@@ -828,6 +872,7 @@ hammer2_freemap_adjust(hammer2_dev_t *hmp, hammer2_blockref_t *bref, int how)
 	uint16_t class;
 	int error, radix, start, count, modified = 0;
 	size_t bgsize = 0;
+	size_t bytes;
 
 	KKASSERT(how == HAMMER2_FREEMAP_DORECOVER);
 
@@ -835,6 +880,10 @@ hammer2_freemap_adjust(hammer2_dev_t *hmp, hammer2_blockref_t *bref, int how)
 	mtid = hammer2_trans_sub(hmp->spmp);
 
 	radix = (int)data_off & HAMMER2_OFF_MASK_RADIX;
+	if (radix)
+		bytes = (size_t)1 << radix;
+	else
+		bytes = 0;
 	KKASSERT(radix != 0);
 	KKASSERT(radix <= HAMMER2_RADIX_MAX);
 
@@ -912,10 +961,15 @@ hammer2_freemap_adjust(hammer2_dev_t *hmp, hammer2_blockref_t *bref, int how)
 	 * Fixup the bitmap.  Partial blocks cannot be fully freed unless
 	 * a bulk scan is able to roll them up.
 	 */
-	if (radix < HAMMER2_FREEMAP_BLOCK_RADIX)
+	if (radix < HAMMER2_FREEMAP_BLOCK_RADIX) {
 		count = 1;
-	else
+#if 0
+		if (how == HAMMER2_FREEMAP_DOREALFREE)
+			how = HAMMER2_FREEMAP_DOMAYFREE;
+#endif
+	} else {
 		count = 1 << (radix - HAMMER2_FREEMAP_BLOCK_RADIX);
+	}
 
 	/*
 	 * [re]load the bmap and bitmap pointers.  Each bmap entry covers
@@ -950,6 +1004,60 @@ again:
 				if (bmap->class == 0)
 					bmap->class = class;
 				*bitmap |= bmmask11;
+				if (hammer2_debug & 0x0040) {
+					hprintf("hammer2_freemap_adjust: "
+						"fixup type=%02x "
+						"block=%016jx/%zd\n",
+						bref->type, data_off, bytes);
+				}
+			} else {
+				/*
+				kprintf("hammer2_freemap_adjust:  good "
+					"type=%02x block=%016jx/%zd\n",
+					bref->type, data_off, bytes);
+				*/
+#if 0
+			/*
+			 * XXX this stuff doesn't work, avail is miscalculated and
+			 * code 10 means something else now.
+			 */
+			} else if ((*bitmap & bmmask11) == bmmask11) {
+				/*
+				 * Mayfree/Realfree request and bitmap is currently
+				 * marked as being fully allocated.
+				 */
+				if (!modified) {
+					hammer2_chain_modify(chain, 0);
+					modified = 1;
+					goto again;
+				}
+				if (how == HAMMER2_FREEMAP_DOREALFREE)
+					*bitmap &= ~bmmask11;
+				else
+					*bitmap = (*bitmap & ~bmmask11) | bmmask10;
+			} else if ((*bitmap & bmmask11) == bmmask10) {
+				/*
+				 * Mayfree/Realfree request and bitmap is currently
+				 * marked as being possibly freeable.
+				 */
+				if (how == HAMMER2_FREEMAP_DOREALFREE) {
+					if (!modified) {
+						hammer2_chain_modify(chain, 0);
+						modified = 1;
+						goto again;
+					}
+					*bitmap &= ~bmmask11;
+				}
+			} else {
+				/*
+				 * 01 - Not implemented, currently illegal state
+				 * 00 - Not allocated at all, illegal free.
+				 */
+				panic("hammer2_freemap_adjust: "
+					      "Illegal state %08x(%08x)",
+					      *bitmap, *bitmap & bmmask11);
+			}
+#endif
 			}
 		}
 		--count;
@@ -957,6 +1065,28 @@ again:
 		//bmmask10 <<= 2;
 		bmmask11 <<= 2;
 	}
+#if 0
+#if HAMMER2_BMAP_ELEMENTS != 8
+#error "hammer2_freemap.c: HAMMER2_BMAP_ELEMENTS expected to be 8"
+#endif
+	if (how == HAMMER2_FREEMAP_DOREALFREE && modified) {
+		bmap->avail += 1 << radix;
+		KKASSERT(bmap->avail <= HAMMER2_SEGSIZE);
+		if (bmap->avail == HAMMER2_SEGSIZE &&
+		    bmap->bitmapq[0] == 0 &&
+		    bmap->bitmapq[1] == 0 &&
+		    bmap->bitmapq[2] == 0 &&
+		    bmap->bitmapq[3] == 0 &&
+		    bmap->bitmapq[4] == 0 &&
+		    bmap->bitmapq[5] == 0 &&
+		    bmap->bitmapq[6] == 0 &&
+		    bmap->bitmapq[7] == 0) {
+			key = H2FMBASE(data_off, HAMMER2_FREEMAP_LEVEL0_RADIX);
+			kprintf("Freeseg %016jx\n", (intmax_t)key);
+			bmap->class = 0;
+		}
+	}
+#endif
 
 	/*
 	 * chain->bref.check.freemap.bigmask (XXX)

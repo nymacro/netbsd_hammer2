@@ -48,6 +48,9 @@
  * against a read-only mounted device, but FreeBSD does not.
  * Align with FreeBSD behavior.
  */
+//static int hammer2_ioctl_inode_comp_set(hammer2_inode_t *ip, void *data);
+//static int hammer2_ioctl_inode_comp_rec_set(hammer2_inode_t *ip, void *data);
+//static int hammer2_ioctl_inode_comp_rec_set2(hammer2_inode_t *ip, void *data);
 static int
 hammer2_is_rdonly(const struct mount *mp)
 {
@@ -65,13 +68,14 @@ hammer2_is_rdonly(const struct mount *mp)
 static int
 hammer2_ioctl_version_get(hammer2_inode_t *ip, void *data)
 {
-	hammer2_ioc_version_t *v = data;
-	hammer2_dev_t *hmp = ip->pmp->pfs_hmps[0];
+	hammer2_ioc_version_t *versionp = data; /* NetBSD: not "version", shadows a global */
+	hammer2_dev_t *hmp;
 
-	if (hmp == NULL)
-		return (EINVAL);
-
-	v->version = hmp->voldata.version;
+	hmp = ip->pmp->pfs_hmps[0];
+	if (hmp)
+		versionp->version = hmp->voldata.version;
+	else
+		versionp->version = -1;
 
 	return (0);
 }
@@ -458,6 +462,9 @@ hammer2_ioctl_pfs_snapshot(hammer2_inode_t *ip, void *data)
 	hammer2_inode_data_t *wipdata;
 	hammer2_tid_t mtid, starting_inum;
 	int error;
+#if 0
+	uuid_t opfs_clid;
+#endif
 
 	pmp = ip->pmp;
 	ip = pmp->iroot;
@@ -534,6 +541,17 @@ hammer2_ioctl_pfs_snapshot(hammer2_inode_t *ip, void *data)
 		nchain->bref.embed.stats = chain->bref.embed.stats;
 
 		_uuidgen(&nip->meta.pfs_fsid);
+#if 0
+		/*
+		 * Give the snapshot its own private cluster id.  As a
+		 * snapshot no further synchronization with the original
+		 * cluster will be done.
+		 */
+		if (chain->flags & HAMMER2_CHAIN_PFSBOUNDARY)
+			nip->meta.pfs_clid = opfs_clid;
+		else
+			_uuidgen(&nip->meta.pfs_clid);
+#endif
 		_uuidgen(&nip->meta.pfs_clid);
 		nchain->bref.flags |= HAMMER2_BREF_FLAG_PFSROOT;
 
@@ -1125,8 +1143,14 @@ hammer2_ioctl_impl(struct vnode *vp, unsigned long com, void *data,
 		 * consumer (lseek does not issue it) and this port has no
 		 * device-backed bmap path, so there is nothing to wire.
 		 */
-		if (error == 0)
+		if (error == 0) {
 			error = EOPNOTSUPP;
+#if 0
+			/* doesn't work correctly yet */
+			error = vn_bmap_seekhole(ip->vp, com, (off_t *)data,
+			    cred);
+#endif
+		}
 		break;
 	default:
 		error = EOPNOTSUPP;

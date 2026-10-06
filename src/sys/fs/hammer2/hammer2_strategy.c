@@ -499,7 +499,7 @@ hammer2_assign_physical(hammer2_inode_t *ip, hammer2_chain_t **parentp,
 	    chain->bref.type != HAMMER2_BREF_TYPE_INODE)
 		hpanic("assign physical deleted %s chain %016llx/%d inum "
 		    "%016llx lbase %016llx",
-		    hammer2_breftype_to_str(chain->bref.type),
+		    hammer2_bref_type_str(chain->bref.type),
 		    (long long)chain->bref.key, chain->bref.keybits,
 		    (long long)ip->meta.inum, (long long)lbase);
 
@@ -980,6 +980,8 @@ hammer2_write_bp(hammer2_chain_t *chain, char *data, int ioflag, int pblksize,
 
 	KKASSERT(chain->flags & HAMMER2_CHAIN_MODIFIED);
 
+	/* hammer2_trans_init(parent->hmp->spmp, HAMMER2_TRANS_BUFCACHE); */
+
 	switch (chain->bref.type) {
 	case HAMMER2_BREF_TYPE_INODE:
 		wipdata = &chain->data->ipdata;
@@ -1084,6 +1086,9 @@ hammer2_dedup_record(hammer2_chain_t *chain, hammer2_io_t *dio,
 		 * needs to be fixed so the check code is already present
 		 * when dedup_lookup is called)
 		 */
+#if 0
+		crc = (uint64_t)(uint32_t)chain->bref.check.iscsi32.value;
+#endif
 		crc = XXH64(data, chain->bytes, XXH_HAMMER2_SEED);
 		break;
 	case HAMMER2_CHECK_XXHASH64:
@@ -1095,6 +1100,11 @@ hammer2_dedup_record(hammer2_chain_t *chain, hammer2_io_t *dio,
 		 * needs to be fixed so the check code is already present
 		 * when dedup_lookup is called)
 		 */
+#if 0
+		crc = ((uint64_t *)chain->bref.check.sha192.data)[0] ^
+		      ((uint64_t *)chain->bref.check.sha192.data)[1] ^
+		      ((uint64_t *)chain->bref.check.sha192.data)[2];
+#endif
 		crc = XXH64(data, chain->bytes, XXH_HAMMER2_SEED);
 		break;
 	default:
@@ -1140,6 +1150,26 @@ hammer2_dedup_record(hammer2_chain_t *chain, hammer2_io_t *dio,
 	hammer2_mtx_ex(&dio->lock);
 	dio->dedup_valid |= mask; /* DragonFly uses atomic_set_64 */
 	hammer2_mtx_unlock(&dio->lock);
+
+#if 0
+	/*
+	 * XXX removed. MODIFIED is an integral part of the flush code,
+	 * lets not just clear it
+	 */
+	/*
+	 * Once we record the dedup the chain must be marked clean to
+	 * prevent reuse of the underlying block.   Remember that this
+	 * write occurs when the buffer cache is flushed (i.e. on sync(),
+	 * fsync(), filesystem periodic sync, or when the kernel needs to
+	 * flush a buffer), and not whenever the user write()s.
+	 */
+	if (chain->flags & HAMMER2_CHAIN_MODIFIED) {
+		atomic_clear_int(&chain->flags, HAMMER2_CHAIN_MODIFIED);
+		atomic_add_long(&hammer2_count_modified_chains, -1);
+		if (chain->pmp)
+			hammer2_pfs_memory_wakeup(chain->pmp, -1);
+	}
+#endif
 }
 
 static hammer2_off_t

@@ -66,6 +66,8 @@ main(int ac, char **av)
 	 * Parse arguments.
 	 */
 	while ((ch = getopt(ac, av, "L:b:r:V:s:d")) != -1) {
+		int i;
+
 		switch(ch) {
 		case 'b':
 			opt.BootAreaSize = getsize(optarg,
@@ -90,6 +92,13 @@ main(int ac, char **av)
 			label_specified = 1;
 			if (strcasecmp(optarg, "none") == 0) {
 				break;
+			}
+			for (i = 0; i < opt.NLabels; i++) {
+				if (strcasecmp(opt.Label[i], optarg) == 0) {
+					errx(1, "duplicate label \"%s\"; "
+					    "note \"LOCAL\" is auto-created",
+					    optarg);
+				}
 			}
 			if (opt.NLabels >= MAXLABELS) {
 				errx(1, "Limit of %d local labels",
@@ -131,8 +140,15 @@ main(int ac, char **av)
 	/*
 	 * Check default label type.
 	 */
-	if (!label_specified)
-		opt.DefaultLabelType = HAMMER2_LABEL_DATA;
+	if (!label_specified) {
+		char c = av[0][strlen(av[0]) - 1];
+		if (c == 'a')
+			opt.DefaultLabelType = HAMMER2_LABEL_BOOT;
+		else if (c == 'd')
+			opt.DefaultLabelType = HAMMER2_LABEL_ROOT;
+		else
+			opt.DefaultLabelType = HAMMER2_LABEL_DATA;
+	}
 
 	/*
 	 * Create Hammer2 filesystem.

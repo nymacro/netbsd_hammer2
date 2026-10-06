@@ -187,3 +187,129 @@ failed:
 	close(fd);
 	return res;
 }
+
+#if 0
+
+int
+cmd_setcomp_recursive(char* option_string, char* comp_string, char* file_string)
+{
+	int ecode = 0;
+	int set_files;
+	int comp_method;
+
+	if (strcmp(option_string, "-r") == 0) {
+		set_files = 0;
+	} else if (strcmp(option_string, "-rf") == 0) {
+		set_files = 1;
+	} else {
+		printf("setcomp: Unrecognized option.\n");
+		exit(1);
+	}
+	if (strcmp(comp_string, "0") == 0) {
+		printf("Will turn off compression on directory/file %s\n", file_string);
+		comp_method = HAMMER2_COMP_NONE;
+	} else if (strcmp(comp_string, "1") == 0) {
+		printf("Will set zero-checking compression on directory/file %s.\n", file_string);
+		comp_method = HAMMER2_COMP_AUTOZERO;
+	} else if (strcmp(comp_string, "2") == 0) {
+		printf("Will set LZ4 compression on directory/file %s.\n", file_string);
+		comp_method = HAMMER2_COMP_LZ4;
+	} else if (strcmp(comp_string, "3") == 0) {
+		printf("Will set ZLIB (slowest) compression on directory/file %s.\n", file_string);
+		comp_method = HAMMER2_COMP_ZLIB;
+	}
+	else {
+		printf("Unknown compression method.\n");
+		return 1;
+	}
+	int fd = hammer2_ioctl_handle(file_string);
+	hammer2_ioc_inode_t inode;
+	int res = ioctl(fd, HAMMER2IOC_INODE_GET, &inode);
+	if (res < 0) {
+		fprintf(stderr, "ERROR before setting the mode: %s\n", strerror(errno));
+		return 3;
+	}
+	if (inode.ip_data.type != HAMMER2_OBJTYPE_DIRECTORY) {
+		printf("setcomp: the specified object is not a directory, nothing changed.\n");
+		return 1;
+	}
+	printf("Attention: recursive compression mode setting demanded, this may take a while...\n");
+	ecode = setcomp_recursive_call(file_string, comp_method, set_files);
+	inode.ip_data.comp_algo = comp_method;
+	res = ioctl(fd, HAMMER2IOC_INODE_SET, &inode);
+	if (res < 0) {
+		if (errno != EINVAL) {
+			fprintf(stderr, "ERROR after trying to set the mode: %s\n", strerror(errno));
+			return 3;
+		}
+	}
+	close(fd);
+	return ecode;
+}
+
+int
+setcomp_recursive_call(char *directory, int comp_method, int set_files)
+{
+	int ecode = 0;
+	DIR *dir;
+	if ((dir = opendir (directory)) == NULL) {
+        fprintf(stderr, "ERROR while trying to set the mode recursively: %s\n",
+			strerror(errno));
+		return 3;
+    }
+    struct dirent *dent;
+    int length;
+    length = strlen(directory);
+    char name[HAMMER2_INODE_MAXNAME];
+    strcpy(name, directory);
+    name[length] = '/';
+    ++length;
+    errno = 0;
+    dent = readdir(dir);
+    while (dent != NULL && ecode == 0) {
+		if ((strcmp(dent->d_name, ".") != 0) &&
+		 (strcmp(dent->d_name, "..") != 0)) {
+			strncpy(name + length, dent->d_name, HAMMER2_INODE_MAXNAME -
+				length);
+			int fd = hammer2_ioctl_handle(name);
+			hammer2_ioc_inode_t inode;
+			int res = ioctl(fd, HAMMER2IOC_INODE_GET, &inode);
+			if (res < 0) {
+				fprintf(stderr, "ERROR during recursion: %s\n",
+					strerror(errno));
+				return 3;
+			}
+			if (inode.ip_data.type == HAMMER2_OBJTYPE_DIRECTORY) {
+				ecode = setcomp_recursive_call(name, comp_method, set_files);
+				inode.ip_data.comp_algo = comp_method;
+				res = ioctl(fd, HAMMER2IOC_INODE_SET, &inode);
+			}
+			else {
+				if (set_files == 1 && inode.ip_data.type ==
+						HAMMER2_OBJTYPE_REGFILE) {
+					inode.ip_data.comp_algo = comp_method;
+					res = ioctl(fd, HAMMER2IOC_INODE_SET, &inode);
+				}
+			}
+			if (res < 0) {
+				if (errno != EINVAL) {
+					fprintf(stderr, "ERROR during recursion after trying"
+						"to set the mode: %s\n",
+						strerror(errno));
+					return 3;
+				}
+			}
+			close(fd);
+		}
+		errno = 0; //we must set errno to 0 before readdir()
+		dent = readdir(dir);
+	}
+	closedir(dir);
+	if (errno != 0) {
+		fprintf(stderr, "ERROR during iteration: %s\n", strerror(errno));
+		return 3;
+    }
+    return ecode;
+}
+
+#endif

@@ -392,7 +392,7 @@ hammer2_signal_check(void)
 }
 
 const char *
-hammer2_breftype_to_str(uint8_t type)
+hammer2_bref_type_str(uint8_t type)
 {
 	switch (type) {
 	case HAMMER2_BREF_TYPE_EMPTY:
@@ -419,6 +419,51 @@ hammer2_breftype_to_str(uint8_t type)
 		return ("unknown");
 	}
 }
+
+const char *
+hammer2_error_str(int error)
+{
+	if (error & HAMMER2_ERROR_EIO)
+		return("I/O Error");
+	if (error & HAMMER2_ERROR_CHECK)
+		return("Check Error");
+	if (error & HAMMER2_ERROR_INCOMPLETE)
+		return("Cluster Quorum Error");
+	if (error & HAMMER2_ERROR_DEPTH)
+		return("Chain Depth Error");
+	if (error & HAMMER2_ERROR_BADBREF)
+		return("Bad Blockref Error");
+	if (error & HAMMER2_ERROR_ENOSPC)
+		return("No Space on Device");
+	if (error & HAMMER2_ERROR_ENOENT)
+		return("Entry Not Found");
+	if (error & HAMMER2_ERROR_ENOTEMPTY)
+		return("Directory Not Empty");
+	if (error & HAMMER2_ERROR_EAGAIN)
+		return("EAGAIN");
+	if (error & HAMMER2_ERROR_ENOTDIR)
+		return("Not a Directory");
+	if (error & HAMMER2_ERROR_EISDIR)
+		return("Is a Directory");
+	if (error & HAMMER2_ERROR_EINPROGRESS)
+		return("Operation in Progress");
+	if (error & HAMMER2_ERROR_ABORTED)
+		return("Operation Aborted");
+	if (error & HAMMER2_ERROR_EOF)
+		return("Operation Complete");
+	if (error & HAMMER2_ERROR_EINVAL)
+		return("Invalid Operation");
+	if (error & HAMMER2_ERROR_EEXIST)
+		return("Object Exists");
+	if (error & HAMMER2_ERROR_EDEADLK)
+		return("Deadlock Detected");
+	if (error & HAMMER2_ERROR_ESRCH)
+		return("Object Not Found");
+	if (error & HAMMER2_ERROR_ETIMEDOUT)
+		return("Timeout");
+	return("Unknown Error");
+}
+
 
 uid_t
 hammer2_inode_to_uid(const hammer2_inode_t *ip)

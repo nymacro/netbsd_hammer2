@@ -87,6 +87,9 @@ hammer2_lk_t hammer2_mntlk;
 
 /* sysctl */
 static int hammer2_supported_version = HAMMER2_VOL_VERSION_DEFAULT;
+int hammer2_debug;
+long hammer2_process_icrc32;
+long hammer2_process_xxhash64;
 int hammer2_dedup_enable = 1;
 int hammer2_flush_pipe = 100;
 int hammer2_limit_dirty_chains;
@@ -122,6 +125,8 @@ int malloc_leak_m_temp;
 #define HAMMER2_SYSCTL_FLUSH_PIPE		12
 #define HAMMER2_SYSCTL_LIMIT_DIRTY_CHAINS	13
 #define HAMMER2_SYSCTL_LIMIT_DIRTY_INODES	14
+#define HAMMER2_SYSCTL_PROCESS_ICRC32		15
+#define HAMMER2_SYSCTL_PROCESS_XXHASH64		16
 
 SYSCTL_SETUP(hammer2_sysctl_create, "hammer2 sysctl")
 {
@@ -265,6 +270,24 @@ SYSCTL_SETUP(hammer2_sysctl_create, "hammer2 sysctl")
 	    SYSCTL_DESCR("Stall at this many dirty inodes (backpressure)"),
 	    NULL, 0, &hammer2_limit_dirty_inodes, 0,
 	    CTL_VFS, x, HAMMER2_SYSCTL_LIMIT_DIRTY_INODES, CTL_EOL);
+	if (error)
+		goto fail;
+
+	error = sysctl_createv(clog, 0, NULL, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READONLY,
+	    CTLTYPE_LONG, "process_icrc32",
+	    SYSCTL_DESCR("Number of bytes processed with ICRC32 check"),
+	    NULL, 0, &hammer2_process_icrc32, 0,
+	    CTL_VFS, x, HAMMER2_SYSCTL_PROCESS_ICRC32, CTL_EOL);
+	if (error)
+		goto fail;
+
+	error = sysctl_createv(clog, 0, NULL, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READONLY,
+	    CTLTYPE_LONG, "process_xxhash64",
+	    SYSCTL_DESCR("Number of bytes processed with XXHASH64 check"),
+	    NULL, 0, &hammer2_process_xxhash64, 0,
+	    CTL_VFS, x, HAMMER2_SYSCTL_PROCESS_XXHASH64, CTL_EOL);
 	if (error)
 		goto fail;
 
@@ -1564,6 +1587,21 @@ again:
 	hammer2_pfsfree_scan(hmp, 0);
 
 	/*
+	 * Cycle the volume data lock as a safety (probably not needed any
+	 * more).  To ensure everything is out we need to flush at least
+	 * three times.  (1) The running of the sideq can dirty the
+	 * filesystem, (2) A normal flush can dirty the freemap, and
+	 * (3) ensure that the freemap is fully synchronized.
+	 *
+	 * The next mount's recovery scan can clean everything up but we want
+	 * to leave the filesystem in a 100% clean state on a normal unmount.
+	 */
+#if 0
+	hammer2_voldata_lock(hmp);
+	hammer2_voldata_unlock(hmp);
+#endif
+
+	/*
 	 * Flush whatever is left.  Unmounted but modified PFS's might still
 	 * have some dirty chains on them.
 	 */
@@ -2028,6 +2066,7 @@ hammer2_vfs_sync_pmp(hammer2_pfs_t *pmp, int waitfor __unused)
 	 * inode_depend() are atomic with the spin-lock.
 	 */
 	hammer2_trans_init(pmp, HAMMER2_TRANS_ISFLUSH);
+	debug_hprintf("FILESYSTEM SYNC BOUNDARY\n");
 	dorestart = 0;
 	syndel_loops = 0;
 
@@ -2339,9 +2378,12 @@ restart:
 			}
 		}
 		debug_hprintf("FILESYSTEM SYNC STAGE 1 RESTART\n");
+		/*tsleep(&dorestart, 0, "h2STG1-R", hz*20);*/
 		dorestart = 1;
 		goto restart;
 	}
+	debug_hprintf("FILESYSTEM SYNC STAGE 2 BEGIN\n");
+	/*tsleep(&dorestart, 0, "h2STG2", hz*20);*/
 
 	/*
 	 * We have to flush the PFS root last, even if it does not appear to

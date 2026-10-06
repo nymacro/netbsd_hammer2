@@ -305,8 +305,10 @@ hammer2_getattr(void *v)
 	vap->va_fileid = ip->meta.inum;
 	vap->va_mode = ip->meta.mode & ~S_IFMT;
 	vap->va_nlink = ip->meta.nlinks;
+	/*hammer2_inode_lock(ip, HAMMER2_RESOLVE_SHARED);*/
 	vap->va_uid = hammer2_inode_to_uid(ip);
 	vap->va_gid = hammer2_inode_to_gid(ip);
+	/*hammer2_inode_unlock(ip);*/
 	vap->va_rdev = (ip->meta.type == HAMMER2_OBJTYPE_CDEV ||
 	    ip->meta.type == HAMMER2_OBJTYPE_BDEV) ?
 	    makedev(ip->meta.rmajor, ip->meta.rminor) : NODEV;
@@ -1785,12 +1787,13 @@ hammer2_rmdir(void *v)
 		vput(vp);
 		return (EROFS);
 	}
-
-	/* DragonFly has this disabled, see 568c02c60c. */
+#if 0
+	/* allow removals, except user to also bulkfree */
 	if (hammer2_vfs_enospace(dip, 0, cnp->cn_cred) > 1) {
 		vput(vp);
 		return (ENOSPC);
 	}
+#endif
 
 	hammer2_trans_init(dip->pmp, 0);
 	hammer2_inode_lock(dip, 0);
@@ -1886,8 +1889,8 @@ hammer2_remove(void *v)
 			vput(vp);
 		return (EROFS);
 	}
-
-	/* DragonFly has this disabled, see 568c02c60c. */
+#if 0
+	/* allow removals, except user to also bulkfree */
 	if (hammer2_vfs_enospace(dip, 0, cnp->cn_cred) > 1) {
 		if (dvp == vp)
 			vrele(vp);
@@ -1895,6 +1898,7 @@ hammer2_remove(void *v)
 			vput(vp);
 		return (ENOSPC);
 	}
+#endif
 
 	hammer2_trans_init(dip->pmp, 0);
 	hammer2_inode_lock(dip, 0);

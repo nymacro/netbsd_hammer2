@@ -151,6 +151,18 @@ typedef struct hammer2_inoq_head hammer2_inoq_head_t;
  * Note that DragonFly uses atomic + interlock for refs, atomic for
  * dedup_xxx, whereas other BSD's protect them with dio lock.
  */
+/* #define HAMMER2_IO_DEBUG */
+
+#ifdef HAMMER2_IO_DEBUG
+#define HAMMER2_IO_DEBUG_ARGS	, const char *file, int line
+#define HAMMER2_IO_DEBUG_CALL	, file, line
+#define HAMMER2_IO_DEBUG_COUNT	2048
+#define HAMMER2_IO_DEBUG_MASK	(HAMMER2_IO_DEBUG_COUNT - 1)
+#else
+#define HAMMER2_IO_DEBUG_ARGS
+#define HAMMER2_IO_DEBUG_CALL
+#endif
+
 struct hammer2_io {
 	struct hammer2_io	*next;
 	hammer2_mtx_t		lock;
@@ -165,8 +177,19 @@ struct hammer2_io {
 	int			btype;
 	int			ticks;
 	int			error;
+#ifdef HAMMER2_IO_DEBUG
+	int			debug_index;
+#else
+	int			unused01;
+#endif
 	uint64_t		dedup_valid;	/* valid for dedup operation */
 	uint64_t		dedup_alloc;	/* allocated / de-dupable */
+#ifdef HAMMER2_IO_DEBUG
+	const char		*debug_file[HAMMER2_IO_DEBUG_COUNT];
+	void			*debug_td[HAMMER2_IO_DEBUG_COUNT];
+	int			debug_line[HAMMER2_IO_DEBUG_COUNT];
+	uint64_t		debug_refs[HAMMER2_IO_DEBUG_COUNT];
+#endif
 };
 
 struct hammer2_io_hash {
@@ -312,6 +335,8 @@ struct hammer2_chain {
  */
 #define HAMMER2_ERROR_EIO		0x00000001	/* device I/O error */
 #define HAMMER2_ERROR_CHECK		0x00000002	/* check code error */
+#define HAMMER2_ERROR_INCOMPLETE	0x00000004	/* incomplete cluster */
+#define HAMMER2_ERROR_DEPTH		0x00000008	/* tmp depth limit */
 #define HAMMER2_ERROR_BADBREF		0x00000010	/* illegal bref */
 #define HAMMER2_ERROR_ENOSPC		0x00000020	/* allocation failure */
 #define HAMMER2_ERROR_ENOENT		0x00000040	/* entry not found */
@@ -319,10 +344,14 @@ struct hammer2_chain {
 #define HAMMER2_ERROR_EAGAIN		0x00000100	/* retry */
 #define HAMMER2_ERROR_ENOTDIR		0x00000200	/* not directory */
 #define HAMMER2_ERROR_EISDIR		0x00000400	/* is directory */
+#define HAMMER2_ERROR_EINPROGRESS	0x00000800	/* already running */
 #define HAMMER2_ERROR_ABORTED		0x00001000	/* aborted operation */
 #define HAMMER2_ERROR_EOF		0x00002000	/* end of scan */
 #define HAMMER2_ERROR_EINVAL		0x00004000	/* catch-all */
 #define HAMMER2_ERROR_EEXIST		0x00008000	/* entry exists */
+#define HAMMER2_ERROR_EDEADLK		0x00010000
+#define HAMMER2_ERROR_ESRCH		0x00020000
+#define HAMMER2_ERROR_ETIMEDOUT		0x00040000
 #define HAMMER2_ERROR_EOPNOTSUPP	0x10000000	/* unsupported */
 
 /*
@@ -934,6 +963,9 @@ extern struct hammer2_pfslist hammer2_pfslist;
 extern hammer2_lk_t hammer2_mntlk;
 
 extern int hammer2_dedup_enable;
+extern int hammer2_debug;
+extern long hammer2_process_icrc32;
+extern long hammer2_process_xxhash64;
 extern int hammer2_flush_pipe;
 extern int hammer2_limit_dirty_chains;
 extern int hammer2_limit_dirty_inodes;
@@ -1106,20 +1138,43 @@ int hammer2_checkpath(const hammer2_inode_t *, hammer2_inode_t *);
 /* hammer2_io.c */
 void hammer2_io_hash_init(hammer2_dev_t *);
 void hammer2_io_hash_destroy(hammer2_dev_t *);
-hammer2_io_t *hammer2_io_getblk(hammer2_dev_t *, int, hammer2_off_t, int, int);
-void hammer2_io_putblk(hammer2_io_t **);
+int _hammer2_io_bread(hammer2_dev_t *, int, hammer2_off_t, int,
+    hammer2_io_t ** HAMMER2_IO_DEBUG_ARGS);
+hammer2_io_t *_hammer2_io_getblk(hammer2_dev_t *, int, hammer2_off_t, int,
+    int HAMMER2_IO_DEBUG_ARGS);
+hammer2_io_t *_hammer2_io_getquick(hammer2_dev_t *, off_t,
+    int HAMMER2_IO_DEBUG_ARGS);
+void _hammer2_io_putblk(hammer2_io_t ** HAMMER2_IO_DEBUG_ARGS);
+int _hammer2_io_bwrite(hammer2_io_t ** HAMMER2_IO_DEBUG_ARGS);
+void _hammer2_io_bawrite(hammer2_io_t ** HAMMER2_IO_DEBUG_ARGS);
+void _hammer2_io_bdwrite(hammer2_io_t ** HAMMER2_IO_DEBUG_ARGS);
+void _hammer2_io_brelse(hammer2_io_t ** HAMMER2_IO_DEBUG_ARGS);
+void _hammer2_io_bqrelse(hammer2_io_t ** HAMMER2_IO_DEBUG_ARGS);
+
+#define hammer2_io_getblk(hmp, btype, lbase, lsize, op)			\
+	_hammer2_io_getblk((hmp), (btype), (lbase), (lsize), (op))
+#define hammer2_io_getquick(hmp, lbase, lsize)				\
+	_hammer2_io_getquick((hmp), (lbase), (lsize))
+#define hammer2_io_putblk(diop)						\
+	_hammer2_io_putblk(diop)
+#define hammer2_io_bwrite(diop)						\
+	_hammer2_io_bwrite((diop))
+#define hammer2_io_bawrite(diop)					\
+	_hammer2_io_bawrite((diop))
+#define hammer2_io_bdwrite(diop)					\
+	_hammer2_io_bdwrite((diop))
+#define hammer2_io_brelse(diop)						\
+	_hammer2_io_brelse((diop))
+#define hammer2_io_bqrelse(diop)					\
+	_hammer2_io_bqrelse((diop))
+#define hammer2_io_bread(hmp, btype, lbase, lsize, diop)		\
+	_hammer2_io_bread((hmp), (btype), (lbase), (lsize), (diop))
+
 void hammer2_io_hash_cleanup_all(hammer2_dev_t *);
 char *hammer2_io_data(hammer2_io_t *, hammer2_off_t);
 int hammer2_io_new(hammer2_dev_t *, int, hammer2_off_t, int, hammer2_io_t **);
 int hammer2_io_newnz(hammer2_dev_t *, int, hammer2_off_t, int, hammer2_io_t **);
-int hammer2_io_bread(hammer2_dev_t *, int, hammer2_off_t, int, hammer2_io_t **);
-hammer2_io_t *hammer2_io_getquick(hammer2_dev_t *, off_t, int);
-void hammer2_io_bawrite(hammer2_io_t **);
-void hammer2_io_bdwrite(hammer2_io_t **);
-int hammer2_io_bwrite(hammer2_io_t **);
 void hammer2_io_setdirty(hammer2_io_t *);
-void hammer2_io_brelse(hammer2_io_t **);
-void hammer2_io_bqrelse(hammer2_io_t **);
 uint64_t hammer2_dedup_mask(hammer2_io_t *, hammer2_off_t, u_int);
 void hammer2_io_dedup_set(hammer2_dev_t *, hammer2_blockref_t *);
 void hammer2_io_dedup_delete(hammer2_dev_t *, uint8_t, hammer2_off_t,
@@ -1166,7 +1221,8 @@ void hammer2_update_time(uint64_t *);
 void hammer2_inc_iostat(hammer2_iostat_t *, int, size_t);
 void hammer2_print_iostat(const hammer2_iostat_t *, const char *);
 int hammer2_signal_check(void);
-const char *hammer2_breftype_to_str(uint8_t);
+const char *hammer2_bref_type_str(uint8_t);
+const char *hammer2_error_str(int error);
 uid_t hammer2_inode_to_uid(const hammer2_inode_t *);
 gid_t hammer2_inode_to_gid(const hammer2_inode_t *);
 int hammer2_getnewfsid(struct mount *);
@@ -1282,11 +1338,16 @@ hammer2_errno_to_error(int error)
 	}
 }
 
+#define hammer2_xop_gdata(xop)	_hammer2_xop_gdata((xop), __FILE__, __LINE__)
+
 static __inline const hammer2_media_data_t *
-hammer2_xop_gdata(hammer2_xop_head_t *xop)
+_hammer2_xop_gdata(hammer2_xop_head_t *xop, const char *file, int line)
 {
 	hammer2_chain_t *focus = xop->cluster.focus;
 	const void *data;
+
+	(void)file;
+	(void)line;
 
 	if (focus->dio) {
 		hammer2_mtx_sh(&focus->diolk);
@@ -1301,9 +1362,14 @@ hammer2_xop_gdata(hammer2_xop_head_t *xop)
 	return (data);
 }
 
+#define hammer2_xop_pdata(xop)	_hammer2_xop_pdata((xop), __FILE__, __LINE__)
+
 static __inline void
-hammer2_xop_pdata(hammer2_xop_head_t *xop)
+_hammer2_xop_pdata(hammer2_xop_head_t *xop, const char *file, int line)
 {
+	(void)file;
+	(void)line;
+
 	if (xop->focus_dio)
 		hammer2_io_putblk(&xop->focus_dio);
 }

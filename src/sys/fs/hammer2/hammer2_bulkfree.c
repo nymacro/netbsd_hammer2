@@ -873,6 +873,20 @@ h2_bulkfree_callback(hammer2_bulkfree_info_t *cbinfo, hammer2_blockref_t *bref)
 	 * NOTE: bmap->class does not have to match class.  Classification
 	 *	 is relaxed when free space is low, so some mixing can occur.
 	 */
+#if 0
+	/*
+	 * XXX removed
+	 */
+	if (bmap->class != class) {
+		kprintf("hammer2_bulkfree_scan: illegal mixed class "
+			"%016jx %016jx/%d (%04x vs %04x)\n",
+			(intmax_t)bref->data_off,
+			(intmax_t)bref->key,
+			bref->keybits,
+			class, bmap->class);
+	}
+#endif
+
 	/*
 	 * Just record the highest byte-granular offset for now.  Do not
 	 * match against allocations which are in multiples of whole blocks.
@@ -1204,6 +1218,10 @@ h2_bulkfree_sync_adjust(hammer2_bulkfree_info_t *cbinfo, hammer2_off_t data_off,
 
 	if (bindex < 0) {
 		/* Completely empty, reset entire segment. */
+#if 0
+		kprintf("hammer2: cleanseg %016jx.%04x (%d)\n",
+			alloc_base, live->class, live->avail);
+#endif
 		live->avail = HAMMER2_FREEMAP_LEVEL0_SIZE;
 		live->class = 0;
 		live->linear = 0;
@@ -1249,6 +1267,23 @@ h2_bulkfree_sync_adjust(hammer2_bulkfree_info_t *cbinfo, hammer2_off_t data_off,
 		/* Completely full, effectively disable the linear iterator. */
 		live->linear = HAMMER2_SEGSIZE;
 	}
+
+#if 0
+	if (bmap->class) {
+		kprintf("%016jx %04d.%04x (avail=%7d) "
+			"%08x %08x %08x %08x %08x %08x %08x %08x\n",
+			(intmax_t)data_off,
+			(int)((data_off &
+			       HAMMER2_FREEMAP_LEVEL1_MASK) >>
+			      HAMMER2_FREEMAP_LEVEL0_RADIX),
+			bmap->class,
+			bmap->avail,
+			bmap->bitmap[0], bmap->bitmap[1],
+			bmap->bitmap[2], bmap->bitmap[3],
+			bmap->bitmap[4], bmap->bitmap[5],
+			bmap->bitmap[6], bmap->bitmap[7]);
+	}
+#endif
 }
 
 /*

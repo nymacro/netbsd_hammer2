@@ -48,6 +48,7 @@
 #include <sys/pool.h>
 #include <sys/vnode.h>
 #include <sys/atomic.h>
+#include <sys/stdarg.h>
 
 #include "hammer2_compat.h"
 
@@ -69,6 +70,39 @@
 #else
 #define debug_hprintf(X, ...)	do {} while (0)
 #endif
+
+/*
+ * Rate-limited printf, DragonFly kern/subr_prf.c krateprintf() equivalent
+ * (freq = max messages per second, 0 = unlimited).
+ */
+struct krate {
+	int	freq;		/* reporting frequency */
+	int	count;		/* messages this second */
+	long	last;		/* time_uptime of current second */
+};
+
+static __inline int
+krateprintf(struct krate *kr, const char *ctlstr, ...)
+{
+	va_list va;
+	int did;
+
+	if (kr->freq == 0 || kr->last != time_uptime ||
+	    kr->count < kr->freq) {
+		if (kr->last != time_uptime) {
+			kr->last = time_uptime;
+			kr->count = 0;
+		}
+		kr->count++;
+		va_start(va, ctlstr);
+		vprintf(ctlstr, va);
+		va_end(va);
+		did = 1;
+	} else {
+		did = 0;
+	}
+	return (did);
+}
 
 /* hammer2_lk is lockmgr(9) in DragonFly. */
 typedef kmutex_t hammer2_lk_t;

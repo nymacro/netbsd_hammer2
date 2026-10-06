@@ -50,7 +50,7 @@ static hammer2_chain_t *hammer2_combined_find(hammer2_chain_t *,
     hammer2_blockref_t **);
 static hammer2_chain_t *hammer2_chain_lastdrop(hammer2_chain_t *, int);
 static void hammer2_chain_load_data(hammer2_chain_t *);
-static int hammer2_chain_testcheck(const hammer2_chain_t *, void *);
+static int hammer2_chain_testcheck(hammer2_chain_t *, void *);
 
 /*
  * Basic RBTree for chains.
@@ -79,6 +79,10 @@ hammer2_chain_cmp(const hammer2_chain_t *chain1, const hammer2_chain_t *chain2)
 RB_GENERATE(hammer2_chain_tree, hammer2_chain, rbnode, hammer2_chain_cmp);
 RB_GENERATE_SCAN(hammer2_chain_tree, hammer2_chain, rbnode);
 
+static struct krate krate_h2chk = { .freq = 5 };
+static struct krate krate_h2me = { .freq = 1 };
+static struct krate krate_h2em = { .freq = 1 };
+
 /*
  * Assert that a chain has no media data associated with it.
  */
@@ -91,7 +95,7 @@ hammer2_chain_assert_no_data(const hammer2_chain_t *chain)
 	    chain->bref.type != HAMMER2_BREF_TYPE_FREEMAP &&
 	    chain->data)
 		hpanic("%s chain %016llx/%d still has data",
-		    hammer2_breftype_to_str(chain->bref.type),
+		    hammer2_bref_type_str(chain->bref.type),
 		    (long long)chain->bref.key, chain->bref.keybits);
 }
 
@@ -680,7 +684,7 @@ hammer2_chain_drop_data(hammer2_chain_t *chain)
 		default:
 			if (chain->data != NULL)
 				hpanic("%s chain %016llx/%d data not NULL",
-				    hammer2_breftype_to_str(chain->bref.type),
+				    hammer2_bref_type_str(chain->bref.type),
 				    (long long)chain->bref.key,
 				    chain->bref.keybits);
 			KKASSERT(chain->data == NULL);
@@ -817,6 +821,12 @@ hammer2_chain_lock(hammer2_chain_t *chain, int how)
 			return (0);
 		if (chain->bref.type == HAMMER2_BREF_TYPE_DATA)
 			return (0);
+#if 0
+		if (chain->bref.type == HAMMER2_BREF_TYPE_FREEMAP_NODE)
+			return (0);
+		if (chain->bref.type == HAMMER2_BREF_TYPE_FREEMAP_LEAF)
+			return (0);
+#endif
 		/* fall through */
 	case HAMMER2_RESOLVE_ALWAYS:
 	default:
@@ -901,7 +911,7 @@ again:
 		    chain->bytes, &chain->dio);
 	if (error) {
 		hprintf("%s blockref I/O error %d at %016llx\n",
-		    hammer2_breftype_to_str(bref->type), error,
+		    hammer2_bref_type_str(bref->type), error,
 		    (long long)bref->data_off);
 		chain->error = HAMMER2_ERROR_EIO;
 		hammer2_io_bqrelse(&chain->dio);
@@ -1481,6 +1491,15 @@ hammer2_chain_modify(hammer2_chain_t *chain, hammer2_tid_t mtid,
 					error = 0;
 					chain->bref.flags |=
 					    HAMMER2_BREF_FLAG_EMERG_MIP;
+
+					krateprintf(&krate_h2em,
+					    "hammer2: Emergency Mode WARNING: "
+					    "Operation will likely corrupt "
+					    "related snapshot: "
+					    "%016jx.%02x key=%016jx\n",
+					    chain->bref.data_off,
+					    chain->bref.type,
+					    chain->bref.key);
 				} else if (error == 0) {
 					chain->bref.flags &=
 					    ~HAMMER2_BREF_FLAG_EMERG_MIP;
@@ -1489,7 +1508,7 @@ hammer2_chain_modify(hammer2_chain_t *chain, hammer2_tid_t mtid,
 			if (dedup_off)
 				debug_hprintf("%s %s chain %016llx %016llx/%d\n",
 				    "dedup",
-				    hammer2_breftype_to_str(chain->bref.type),
+				    hammer2_bref_type_str(chain->bref.type),
 				    (long long)chain->bref.data_off,
 				    (long long)chain->bref.key,
 				    chain->bref.keybits);
@@ -1619,7 +1638,7 @@ hammer2_chain_modify(hammer2_chain_t *chain, hammer2_tid_t mtid,
 		 */
 		if (error) {
 			hprintf("%s blockref I/O error %d at %016llx\n",
-			    hammer2_breftype_to_str(chain->bref.type), error,
+			    hammer2_bref_type_str(chain->bref.type), error,
 			    (long long)chain->bref.data_off);
 			chain->error = HAMMER2_ERROR_EIO;
 			hammer2_io_brelse(&dio);
@@ -1641,7 +1660,7 @@ hammer2_chain_modify(hammer2_chain_t *chain, hammer2_tid_t mtid,
 			 * we don't have any data to COW with!
 			 */
 			hpanic("no CoW data for %s chain %016llx/%d",
-			    hammer2_breftype_to_str(chain->bref.type),
+			    hammer2_bref_type_str(chain->bref.type),
 			    (long long)chain->bref.key, chain->bref.keybits);
 		}
 
@@ -1743,6 +1762,10 @@ hammer2_chain_find(hammer2_chain_t *parent, hammer2_key_t *key_nextp,
 	RB_SCAN(hammer2_chain_tree, &parent->core.rbtree,
 	    hammer2_chain_find_cmp, hammer2_chain_find_callback, &info);
 	*key_nextp = info.key_next;
+#if 0
+	kprintf("chain_find %p %016jx:%016jx next=%016jx\n",
+		parent, key_beg, key_end, *key_nextp);
+#endif
 
 	return (info.best);
 }
@@ -1873,6 +1896,7 @@ hammer2_chain_get(hammer2_chain_t *parent, int generation,
 	    HAMMER2_CHAIN_INSERT_SPIN | HAMMER2_CHAIN_INSERT_RACE, generation);
 	if (error) {
 		KKASSERT((chain->flags & HAMMER2_CHAIN_ONRBTREE) == 0);
+		/*kprintf("chain %p get race\n", chain);*/
 		hammer2_chain_unlock(chain);
 		hammer2_chain_drop(chain);
 		chain = NULL;
@@ -2385,7 +2409,7 @@ again:
 	 */
 	if (chain->flags & HAMMER2_CHAIN_DELETED) {
 		hprintf("skip deleted %s chain %016llx/%d\n",
-		    hammer2_breftype_to_str(chain->bref.type),
+		    hammer2_bref_type_str(chain->bref.type),
 		    (long long)chain->bref.key, chain->bref.keybits);
 		hammer2_chain_unlock(chain);
 		hammer2_chain_drop(chain);
@@ -2969,7 +2993,7 @@ again:
 skip:
 	if (chain->flags & HAMMER2_CHAIN_DELETED)
 		hprintf("inserting deleted %s chain %016llx/%d\n",
-		    hammer2_breftype_to_str(chain->bref.type),
+		    hammer2_bref_type_str(chain->bref.type),
 		    (long long)chain->bref.key, chain->bref.keybits);
 
 	/* Link the chain into its parent. */
@@ -3350,12 +3374,13 @@ hammer2_chain_create_indirect(hammer2_chain_t *parent, hammer2_key_t create_key,
 	*errorp = hammer2_chain_modify(parent, mtid, 0, 0);
 	if (*errorp) {
 		hprintf("%s chain %016llx/%d modify error %08x\n",
-		    hammer2_breftype_to_str(parent->bref.type),
+		    hammer2_bref_type_str(parent->bref.type),
 		    (long long)parent->bref.key, parent->bref.keybits, *errorp);
 		return (NULL);
 	}
 	KKASSERT((parent->flags & HAMMER2_CHAIN_INITIAL) == 0);
 
+	/*hammer2_chain_modify(&parent, HAMMER2_MODIFY_OPTDATA);*/
 	base = hammer2_chain_base_and_count(parent, &count);
 
 	/*
@@ -3471,7 +3496,7 @@ hammer2_chain_create_indirect(hammer2_chain_t *parent, hammer2_key_t create_key,
 	*errorp = hammer2_chain_modify(ichain, mtid, 0, 0);
 	if (*errorp) {
 		hprintf("%s chain %016llx/%d modify error %08x\n",
-		    hammer2_breftype_to_str(ichain->bref.type),
+		    hammer2_bref_type_str(ichain->bref.type),
 		    (long long)ichain->bref.key, ichain->bref.keybits, *errorp);
 		hammer2_chain_unlock(ichain);
 		hammer2_chain_drop(ichain);
@@ -3729,16 +3754,14 @@ hammer2_chain_indirect_maintenance(hammer2_chain_t *parent,
 	 */
 	error = hammer2_chain_modify(parent, 0, 0, 0);
 	if (error) {
-		hprintf("%s chain %016llx/%d modify error %08x\n",
-		    hammer2_breftype_to_str(parent->bref.type),
-		    (long long)parent->bref.key, parent->bref.keybits, error);
+		krateprintf(&krate_h2me, "hammer2: indirect_maint: %s\n",
+			    hammer2_error_str(error));
 		return (0);
 	}
 	error = hammer2_chain_modify(chain, chain->bref.modify_tid, 0, 0);
 	if (error) {
-		hprintf("%s chain %016llx/%d modify error %08x\n",
-		    hammer2_breftype_to_str(chain->bref.type),
-		    (long long)chain->bref.key, chain->bref.keybits, error);
+		krateprintf(&krate_h2me, "hammer2: indirect_maint: %s\n",
+			    hammer2_error_str(error));
 		return (0);
 	}
 
@@ -4094,7 +4117,7 @@ hammer2_chain_indkey_dir(hammer2_chain_t *parent, hammer2_key_t *keyp,
 		if (nkeybits < bref->keybits) {
 			if (bref->keybits > 64)
 				hpanic("bad %s blockref %016llx/%d",
-				    hammer2_breftype_to_str(bref->type),
+				    hammer2_bref_type_str(bref->type),
 				    (long long)bref->key, bref->keybits);
 			nkeybits = bref->keybits;
 		}
@@ -4465,9 +4488,9 @@ hammer2_base_delete(hammer2_chain_t *parent, hammer2_blockref_t *base,
 	    scan->keybits != elm->keybits))
 		hpanic("delete %s elm %016llx/%d from %s base %016llx/%d "
 		    "not found at %d/%d",
-		    hammer2_breftype_to_str(elm->type),
+		    hammer2_bref_type_str(elm->type),
 		    (long long)elm->key, elm->keybits,
-		    hammer2_breftype_to_str(base->type),
+		    hammer2_bref_type_str(base->type),
 		    (long long)base->key, base->keybits, i, count);
 
 	/*
@@ -4620,9 +4643,9 @@ hammer2_base_insert(hammer2_chain_t *parent, hammer2_blockref_t *base,
 	if (i != count && (base[i].key < elm->key || xkey >= base[i].key))
 		hpanic("insert %s elm %016llx/%d to %s base %016llx/%d "
 		    "overlapping at %d/%d",
-		    hammer2_breftype_to_str(elm->type),
+		    hammer2_bref_type_str(elm->type),
 		    (long long)elm->key, elm->keybits,
-		    hammer2_breftype_to_str(base->type),
+		    hammer2_bref_type_str(base->type),
 		    (long long)base->key, base->keybits, i, count);
 
 	/* Try to find an empty slot before or after. */
@@ -4730,11 +4753,107 @@ hammer2_chain_setcheck(hammer2_chain_t *chain, void *bdata)
 /*
  * Returns non-zero on success, 0 on failure.
  */
-static int
-hammer2_chain_testcheck(const hammer2_chain_t *chain, void *bdata)
+/*
+ * Characterize a failed check code and try to trace back to the inode.
+ */
+static void
+hammer2_characterize_failed_chain(hammer2_chain_t *chain, uint64_t check,
+				  int bits, void *bdata)
 {
-	static int count = 0;
-	int r = 0;
+	hammer2_chain_t *lchain;
+	hammer2_chain_t *ochain;
+	int did;
+
+	did = krateprintf(&krate_h2chk,
+		"chain %016jx.%02x (%s) meth=%02x CHECK FAIL "
+		"(flags=%08x, bref/data ",
+		chain->bref.data_off,
+		chain->bref.type,
+		hammer2_bref_type_str(chain->bref.type),
+		chain->bref.methods,
+		chain->flags);
+	if (did == 0)
+		return;
+
+	if (bits == 32) {
+		hprintf("%08x/%08x)\n",
+			chain->bref.check.iscsi32.value,
+			(uint32_t)check);
+	} else {
+		hprintf("%016llx/%016llx)\n",
+			(unsigned long long)chain->bref.check.xxhash64.value,
+			(unsigned long long)check);
+	}
+
+	/*
+	 * In-kernel memory information
+	 */
+	hprintf("   chain %p bdata %p dio %p bp %p ",
+		chain,
+		bdata,
+		chain->dio,
+		(chain->dio ? chain->dio->bp : NULL));
+
+	if (chain->dio) {
+		hprintf("bp_blkno %lld,%d bdata %p/%p",
+			(long long)chain->dio->bp->b_blkno,
+			chain->dio->bp->b_bufsize,
+			bdata,
+			chain->dio->bp->b_data);
+	}
+	hprintf("\n");
+
+	/*
+	 * Run up the chains to try to find the governing inode so we
+	 * can report it.
+	 *
+	 * XXX This error reporting is not really MPSAFE
+	 */
+	ochain = chain;
+	lchain = chain;
+	while (chain && chain->bref.type != HAMMER2_BREF_TYPE_INODE) {
+		lchain = chain;
+		chain = chain->parent;
+	}
+
+	if (chain && chain->bref.type == HAMMER2_BREF_TYPE_INODE &&
+	    ((chain->bref.flags & HAMMER2_BREF_FLAG_PFSROOT) == 0 ||
+	     (lchain->bref.key & HAMMER2_DIRHASH_VISIBLE))) {
+		hprintf("   Resides at/in inode %ld\n",
+			(long)chain->bref.key);
+	} else if (chain && chain->bref.type == HAMMER2_BREF_TYPE_INODE) {
+		hprintf("   Resides in inode index - CRITICAL!!!\n");
+	} else {
+		hprintf("   Resides in root index - CRITICAL!!!\n");
+	}
+	if (ochain->hmp) {
+		const char *pfsname = "UNKNOWN";
+		int i;
+
+		if (ochain->pmp) {
+			for (i = 0; i < HAMMER2_MAXCLUSTER; ++i) {
+				if (ochain->pmp->pfs_hmps[i] == ochain->hmp &&
+				    ochain->pmp->pfs_names[i]) {
+					pfsname = ochain->pmp->pfs_names[i];
+					break;
+				}
+			}
+		}
+		hprintf("   In pfs %s on device %s\n",
+			pfsname,
+			ochain->hmp->volumes[0].dev != NULL &&
+			ochain->hmp->volumes[0].dev->path != NULL ?
+			    ochain->hmp->volumes[0].dev->path : "?");
+	}
+	//print_backtrace(-1);
+}
+
+static int
+hammer2_chain_testcheck(hammer2_chain_t *chain, void *bdata)
+{
+	uint32_t check32;
+	uint64_t check64;
+	int r;
 
 	if (chain->flags & HAMMER2_CHAIN_NOTTESTED)
 		return (1);
@@ -4747,12 +4866,22 @@ hammer2_chain_testcheck(const hammer2_chain_t *chain, void *bdata)
 		r = 1;
 		break;
 	case HAMMER2_CHECK_ISCSI32:
-		r = chain->bref.check.iscsi32.value ==
-		    hammer2_icrc32(bdata, chain->bytes);
+		check32 = hammer2_icrc32(bdata, chain->bytes);
+		r = (chain->bref.check.iscsi32.value == check32);
+		if (r == 0) {
+			hammer2_characterize_failed_chain(chain, check32,
+							  32, bdata);
+		}
+		hammer2_process_icrc32 += chain->bytes;
 		break;
 	case HAMMER2_CHECK_XXHASH64:
-		r = chain->bref.check.xxhash64.value ==
-		    XXH64(bdata, chain->bytes, XXH_HAMMER2_SEED);
+		check64 = XXH64(bdata, chain->bytes, XXH_HAMMER2_SEED);
+		r = (chain->bref.check.xxhash64.value == check64);
+		if (r == 0) {
+			hammer2_characterize_failed_chain(chain, check64,
+							  64, bdata);
+		}
+		hammer2_process_xxhash64 += chain->bytes;
 		break;
 	case HAMMER2_CHECK_SHA192:
 		{
@@ -4765,30 +4894,55 @@ hammer2_chain_testcheck(const hammer2_chain_t *chain, void *bdata)
 		SHA256_Update(&hash_ctx, bdata, chain->bytes);
 		SHA256_Final(u.digest, &hash_ctx);
 		u.digest64[2] ^= u.digest64[3];
-		r = bcmp(u.digest, chain->bref.check.sha192.data,
-		    sizeof(chain->bref.check.sha192.data)) == 0;
+			if (bcmp(u.digest,
+				 chain->bref.check.sha192.data,
+			         sizeof(chain->bref.check.sha192.data)) == 0) {
+				r = 1;
+			} else {
+				r = 0;
+				krateprintf(&krate_h2chk,
+					"chain %016jx.%02x meth=%02x "
+					"CHECK FAIL\n",
+					chain->bref.data_off,
+					chain->bref.type,
+					chain->bref.methods);
+			}
 		}
 		break;
 	case HAMMER2_CHECK_FREEMAP:
-		r = chain->bref.check.freemap.icrc32 ==
-		    hammer2_icrc32(bdata, chain->bytes);
+		r = (chain->bref.check.freemap.icrc32 ==
+		     hammer2_icrc32(bdata, chain->bytes));
+		if (r == 0) {
+			int did;
+
+			did = krateprintf(&krate_h2chk,
+					  "chain %016llx.%02x meth=%02x "
+					  "CHECK FAIL\n",
+					  (unsigned long long)chain->bref.data_off,
+					  chain->bref.type,
+					  chain->bref.methods);
+			if (did) {
+			hprintf("freemap.icrc %08x icrc32 %08x (%d)\n",
+					chain->bref.check.freemap.icrc32,
+					hammer2_icrc32(bdata, chain->bytes),
+					chain->bytes);
+			if (chain->dio) {
+					hprintf("dio %p buf %llx,%d "
+						"bdata %p/%p\n",
+						chain->dio,
+						(long long)chain->dio->bp->b_blkno,
+						chain->dio->bp->b_bufsize,
+						bdata,
+						chain->dio->bp->b_data);
+			}
+			}
+		}
 		break;
 	default:
-		hpanic("bad check type %02x", chain->bref.methods);
+		hprintf("unknown check type %02x\n",
+			chain->bref.methods);
+		r = 1;
 		break;
-	}
-
-	if (r == 0 && count < 1000) {
-		hprintf("failed: chain %s %016llx %016llx/%d meth %02x "
-		    "mir %016llx mod %016llx flags %08x\n",
-		    hammer2_breftype_to_str(chain->bref.type),
-		    (long long)chain->bref.data_off, (long long)chain->bref.key,
-		    chain->bref.keybits, chain->bref.methods,
-		    (long long)chain->bref.mirror_tid,
-		    (long long)chain->bref.modify_tid, chain->flags);
-		count++;
-		if (count >= 1000)
-			hprintf("gave up\n");
 	}
 
 	return (r);
@@ -4978,7 +5132,7 @@ hammer2_dump_chain(hammer2_chain_t *chain, int tab, int bi, int *countp,
 	printf("%*.*s%c-chain %s.%-3d %016llx %016llx/%d mir %016llx mod "
 	    "%016llx\n",
 	    tab, tab, "", pfx,
-	    hammer2_breftype_to_str(chain->bref.type), bi,
+	    hammer2_bref_type_str(chain->bref.type), bi,
 	    (long long)chain->bref.data_off,
 	    (long long)chain->bref.key, chain->bref.keybits,
 	    (long long)chain->bref.mirror_tid,

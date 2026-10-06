@@ -167,12 +167,33 @@ hammer2_bread(hammer2_dev_t *hmp, hammer2_io_t *dio, daddr_t lblkno)
 }
 
 /*
- * Acquire the requested dio.
- * If DIO_GOOD is set the buffer already exists and is good to go.
+ * Acquire the requested dio.  If DIO_GOOD is not set we must instantiate
+ * a buffer.  If set the buffer already exists and is good to go.
  */
+#ifdef HAMMER2_IO_DEBUG
+
+static __inline void
+DIO_RECORD(hammer2_io_t *dio HAMMER2_IO_DEBUG_ARGS)
+{
+	int i;
+
+	i = atomic_fetchadd_int(&dio->debug_index, 1) & HAMMER2_IO_DEBUG_MASK;
+
+	dio->debug_file[i] = file;
+	dio->debug_line[i] = line;
+	dio->debug_refs[i] = dio->refs;
+	dio->debug_td[i] = curthread;
+}
+
+#else
+
+#define DIO_RECORD(dio)
+
+#endif
+
 hammer2_io_t *
-hammer2_io_getblk(hammer2_dev_t *hmp, int btype, hammer2_off_t lbase, int lsize,
-    int op)
+_hammer2_io_getblk(hammer2_dev_t *hmp, int btype, hammer2_off_t lbase,
+    int lsize, int op HAMMER2_IO_DEBUG_ARGS)
 {
 	hammer2_io_t *dio;
 	daddr_t lblkno;
@@ -208,6 +229,7 @@ hammer2_io_getblk(hammer2_dev_t *hmp, int btype, hammer2_off_t lbase, int lsize,
 			break;
 		}
 		hammer2_mtx_unlock(&dio->lock);
+		DIO_RECORD(dio HAMMER2_IO_DEBUG_CALL);
 		return (dio);
 	}
 
@@ -261,6 +283,7 @@ hammer2_io_getblk(hammer2_dev_t *hmp, int btype, hammer2_off_t lbase, int lsize,
 	hammer2_mtx_unlock(&dio->lock);
 
 	/* XXX error handling */
+	DIO_RECORD(dio HAMMER2_IO_DEBUG_CALL);
 
 	return (dio);
 }
@@ -270,7 +293,7 @@ hammer2_io_getblk(hammer2_dev_t *hmp, int btype, hammer2_off_t lbase, int lsize,
  * On the 1->0 transition we clear DIO_GOOD and dispose of dio->bp.
  */
 void
-hammer2_io_putblk(hammer2_io_t **diop)
+_hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 {
 	hammer2_dev_t *hmp;
 	hammer2_io_t *dio;
@@ -280,6 +303,8 @@ hammer2_io_putblk(hammer2_io_t **diop)
 
 	dio = *diop;
 	*diop = NULL;
+	hmp = dio->hmp;
+	DIO_RECORD(dio HAMMER2_IO_DEBUG_CALL);
 
 	hammer2_mtx_ex(&dio->lock);
 	if ((dio->refs & HAMMER2_DIO_MASK) == 0) {
@@ -304,7 +329,6 @@ hammer2_io_putblk(hammer2_io_t **diop)
 	}
 
 	/* Lastdrop (1->0 transition) case. */
-	hmp = dio->hmp;
 	bp = dio->bp;
 	dio->bp = NULL;
 
@@ -402,35 +426,40 @@ hammer2_io_newnz(hammer2_dev_t *hmp, int btype, hammer2_off_t lbase, int lsize,
 }
 
 int
-hammer2_io_bread(hammer2_dev_t *hmp, int btype, hammer2_off_t lbase, int lsize,
-    hammer2_io_t **diop)
+_hammer2_io_bread(hammer2_dev_t *hmp, int btype, hammer2_off_t lbase, int lsize,
+    hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 {
 	*diop = hammer2_io_getblk(hmp, btype, lbase, lsize, HAMMER2_DOP_READ);
 	return ((*diop)->error);
 }
 
 hammer2_io_t *
-hammer2_io_getquick(hammer2_dev_t *hmp, off_t lbase, int lsize)
+_hammer2_io_getquick(hammer2_dev_t *hmp, off_t lbase,
+		     int lsize HAMMER2_IO_DEBUG_ARGS)
 {
-	return (hammer2_io_getblk(hmp, 0, lbase, lsize, HAMMER2_DOP_READQ));
+	hammer2_io_t *dio;
+
+	dio = _hammer2_io_getblk(hmp, 0, lbase, lsize,
+				 HAMMER2_DOP_READQ HAMMER2_IO_DEBUG_CALL);
+	return (dio);
 }
 
 void
-hammer2_io_bawrite(hammer2_io_t **diop)
+_hammer2_io_bawrite(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 {
 	atomic_set_32(&(*diop)->refs, HAMMER2_DIO_DIRTY | HAMMER2_DIO_FLUSH);
 	hammer2_io_putblk(diop);
 }
 
 void
-hammer2_io_bdwrite(hammer2_io_t **diop)
+_hammer2_io_bdwrite(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 {
 	atomic_set_32(&(*diop)->refs, HAMMER2_DIO_DIRTY);
 	hammer2_io_putblk(diop);
 }
 
 int
-hammer2_io_bwrite(hammer2_io_t **diop)
+_hammer2_io_bwrite(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 {
 	atomic_set_32(&(*diop)->refs, HAMMER2_DIO_DIRTY | HAMMER2_DIO_FLUSH);
 	hammer2_io_putblk(diop);
@@ -445,13 +474,13 @@ hammer2_io_setdirty(hammer2_io_t *dio)
 }
 
 void
-hammer2_io_brelse(hammer2_io_t **diop)
+_hammer2_io_brelse(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 {
 	hammer2_io_putblk(diop);
 }
 
 void
-hammer2_io_bqrelse(hammer2_io_t **diop)
+_hammer2_io_bqrelse(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 {
 	hammer2_io_putblk(diop);
 }

@@ -75,6 +75,33 @@
 
 #include "hammer2_subs.h"
 
+#define HAMMER2_DEFAULT_DIR	"/etc/hammer2"
+#define HAMMER2_PATH_REMOTE	HAMMER2_DEFAULT_DIR "/remote"
+#ifndef UDEV_DEVICE_PATH
+#define UDEV_DEVICE_PATH	"/dev/udev"
+#endif
+
+#if 0
+struct hammer2_idmap {
+	struct hammer2_idmap *next;
+	uint32_t ran_beg;	/* inclusive */
+	uint32_t ran_end;	/* inclusive */
+};
+
+typedef struct hammer2_idmap hammer2_idmap_t;
+
+/*
+ * UDP broadcast structure (must be endian neutral)
+ */
+struct hammer2_udppkt {
+	char	key[8];		/* HAMMER2.01 */
+	char	gen[8];
+	char	label[64];
+};
+
+typedef struct hammer2_udppkt hammer2_udppkt_t;
+#endif
+
 extern int VerboseOpt;
 extern int QuietOpt;
 extern int RecurseOpt;
@@ -108,6 +135,9 @@ int cmd_volume_list2(int ac, char **av);
 int cmd_setcomp(const char *comp_str, char **paths);
 int cmd_setcheck(const char *comp_str, char **paths);
 int cmd_bulkfree(const char *dir_path);
+#if 0
+int cmd_bulkfree_async(const char *dir_path);
+#endif
 int cmd_cleanup(const char *dir_path);
 int cmd_recover(const char *devpath, const char *filename,
 			const char *destdir, int strict, int isafile);

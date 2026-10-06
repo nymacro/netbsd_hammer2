@@ -39,6 +39,8 @@
 
 #include <miscfs/genfs/genfs.h>
 
+#define INODE_DEBUG	0
+
 static void hammer2_inode_repoint(hammer2_inode_t *, hammer2_cluster_t *);
 static void hammer2_inode_repoint_one(hammer2_inode_t *, hammer2_cluster_t *,
     int);
@@ -885,6 +887,11 @@ hammer2_inode_create_pfs(hammer2_pfs_t *spmp, const char *name, size_t name_len,
 	KKASSERT(name_len < HAMMER2_INODE_MAXNAME);
 	hammer2_xop_start(&xop->head, &hammer2_inode_create_desc);
 	error = hammer2_xop_collect(&xop->head, 0);
+#if INODE_DEBUG
+	kprintf("CREATE INODE %*.*s\n",
+		(int)name_len, (int)name_len, name);
+#endif
+
 	if (error) {
 		*errorp = error;
 		goto done;
@@ -933,6 +940,8 @@ hammer2_inode_create_normal(hammer2_inode_t *pip, struct vattr *vap,
 	KKASSERT(dip != NULL);
 
 	*errorp = 0;
+
+	/*hammer2_inode_lock(dip, 0);*/
 
 	pip_gid = pip->meta.gid;
 	pip_comp_algo = pip->meta.comp_algo;
@@ -1027,6 +1036,10 @@ hammer2_inode_create_normal(hammer2_inode_t *pip, struct vattr *vap,
 	 */
 	hammer2_xop_start(&xop->head, &hammer2_inode_create_det_desc);
 	error = hammer2_xop_collect(&xop->head, 0);
+#if INODE_DEBUG
+	kprintf("create inode type %d error %d\n", nip->meta.type, error);
+#endif
+
 	if (error) {
 		*errorp = error;
 		goto done;
@@ -1039,6 +1052,7 @@ hammer2_inode_create_normal(hammer2_inode_t *pip, struct vattr *vap,
 	hammer2_inode_repoint(nip, &xop->head.cluster);
 done:
 	hammer2_xop_retire(&xop->head, HAMMER2_XOPMASK_VOP);
+	/*hammer2_inode_unlock(dip);*/
 
 	return (nip);
 }

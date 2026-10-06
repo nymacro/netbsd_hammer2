@@ -153,6 +153,31 @@ hammer2_trans_init(hammer2_pfs_t *pmp, uint32_t flags)
 		/* retry */
 	}
 	hammer2_lk_unlock(&pmp->trans_lock);
+#if 0
+	/*
+	 * When entering a FLUSH transaction with COPYQ set, wait for the
+	 * transaction count to drop to 1 (our flush transaction only)
+	 * before proceeding.
+	 *
+	 * This waits for all non-flush transactions to complete and blocks
+	 * new non-flush transactions from starting until COPYQ is cleared.
+	 * (the flush will then proceed after clearing COPYQ).  This should
+	 * be a very short stall on modifying operations.
+	 */
+	while ((flags & HAMMER2_TRANS_ISFLUSH) &&
+	       (flags & HAMMER2_TRANS_COPYQ)) {
+		oflags = pmp->trans.flags;
+		cpu_ccfence();
+		if ((oflags & HAMMER2_TRANS_MASK) == 1)
+			break;
+		nflags = oflags | HAMMER2_TRANS_WAITING;
+		tsleep_interlock(&pmp->trans.sync_wait, 0);
+		if (atomic_cmpset_int(&pmp->trans.flags, oflags, nflags)) {
+			tsleep(&pmp->trans.sync_wait, PINTERLOCKED,
+			       "h2trans2", hz);
+		}
+	}
+#endif
 }
 
 /*
@@ -212,6 +237,21 @@ void
 hammer2_trans_done(hammer2_pfs_t *pmp, uint32_t flags)
 {
 	uint32_t oflags, nflags;
+
+#if 0
+	/*
+	 * Modifying ops on the front-end can cause dirty inodes to
+	 * build up in the sideq.  We don't flush these on inactive/reclaim
+	 * due to potential deadlocks, so we have to deal with them from
+	 * inside other nominal modifying front-end transactions.
+	 */
+	if ((flags & HAMMER2_TRANS_SIDEQ) &&
+	    pmp->sideq_count > hammer2_limit_dirty_inodes / 2 &&
+	    pmp->sideq_count > (pmp->inum_count >> 3) &&
+	    pmp->mp) {
+		speedup_syncer(pmp->mp);
+	}
+#endif
 
 	/*
 	 * Clean-up the transaction.  Wakeup any waiters when finishing
@@ -610,6 +650,18 @@ hammer2_flush_core(hammer2_flush_info_t *info, hammer2_chain_t *chain,
 		atomic_add_int(&hammer2_count_chain_modified, -1);
 		hammer2_pfs_memory_wakeup(chain->pmp, -1);
 
+#if 0
+		if ((chain->flags & HAMMER2_CHAIN_UPDATE) == 0 &&
+		    chain != &hmp->vchain &&
+		    chain != &hmp->fchain) {
+			/*
+			 * Set UPDATE bit indicating that the parent block
+			 * table requires updating.
+			 */
+			atomic_set_int(&chain->flags, HAMMER2_CHAIN_UPDATE);
+		}
+#endif
+
 		/*
 		 * Issue the flush.  This is indirect via the DIO.
 		 *
@@ -624,7 +676,7 @@ hammer2_flush_core(hammer2_flush_info_t *info, hammer2_chain_t *chain,
 		 */
 		if (chain->bref.type != HAMMER2_BREF_TYPE_DATA)
 			debug_hprintf("flush %s chain %016llx %016llx/%d\n",
-			    hammer2_breftype_to_str(chain->bref.type),
+			    hammer2_bref_type_str(chain->bref.type),
 			    (long long)chain->bref.data_off,
 			    (long long)chain->bref.key, chain->bref.keybits);
 
@@ -780,9 +832,26 @@ hammer2_flush_core(hammer2_flush_info_t *info, hammer2_chain_t *chain,
 		 * from dedup candidacy and attempt to invalidation that
 		 * potentially dirty portion of the I/O buffer.
 		 */
-		if (chain->flags & HAMMER2_CHAIN_DESTROY)
+		if (chain->flags & HAMMER2_CHAIN_DESTROY) {
 			hammer2_io_dedup_delete(hmp, chain->bref.type,
 			    chain->bref.data_off, chain->bytes);
+#if 0
+			hammer2_io_t *dio;
+			if (chain->dio) {
+				hammer2_io_inval(chain->dio,
+						 chain->bref.data_off,
+						 chain->bytes);
+			} else if ((dio = hammer2_io_getquick(hmp,
+						  chain->bref.data_off,
+						  chain->bytes,
+						  1)) != NULL) {
+				hammer2_io_inval(dio,
+						 chain->bref.data_off,
+						 chain->bytes);
+				hammer2_io_putblk(&dio);
+			}
+#endif
+		}
 	}
 
 	/*
@@ -890,7 +959,7 @@ hammer2_flush_core(hammer2_flush_info_t *info, hammer2_chain_t *chain,
 		if (save_error) {
 			info->error |= save_error;
 			hprintf("%s parent %016llx/%d error %08x\n",
-			    hammer2_breftype_to_str(parent->bref.type),
+			    hammer2_bref_type_str(parent->bref.type),
 			    (long long)parent->bref.key, parent->bref.keybits,
 			    save_error);
 			atomic_set_int(&chain->flags, HAMMER2_CHAIN_UPDATE);
@@ -1143,6 +1212,19 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch, int clindex)
 				hammer2_spin_unex(&pmp->blockset_spin);
 			}
 		}
+#if 0
+		/*
+		 * Propogate upwards but only cross an inode boundary
+		 * for inodes associated with the current filesystem
+		 * sync.
+		 */
+		if ((xop->head.flags & HAMMER2_XOP_PARENTONFLUSH) ||
+		    chain->bref.type != HAMMER2_BREF_TYPE_INODE) {
+			parent = chain->parent;
+			if (parent)
+				hammer2_chain_setflush(parent);
+		}
+#endif
 		if (chain->flags & HAMMER2_CHAIN_PFSBOUNDARY)
 			ispfsroot = 1;
 		hammer2_chain_unlock(chain);

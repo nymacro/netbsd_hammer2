@@ -565,6 +565,25 @@ hammer2_io_hash_cleanup(hammer2_dev_t *hmp, int dio_limit)
 		diop = &hash->base;
 		while ((dio = *diop) != NULL) {
 			if ((dio->refs & HAMMER2_DIO_MASK) != 0) {
+				/*
+				 * Leak probe: a referenced dio that still
+				 * holds its buffer with a stale access time
+				 * is a leak candidate (its bp stays BC_BUSY
+				 * + DELWRI forever and wedges vflushbuf in
+				 * an unbreakable dirty-retry spin).
+				 */
+				if (dio->bp != NULL && dio->ticks != 0 &&
+				    getticks() - dio->ticks > 60 * hz) {
+					hprintf("LEAK? dio %p pbase %016llx "
+					    "refs %x dirty %d bp %p age %ds\n",
+					    dio, (long long)dio->pbase,
+					    (int)(dio->refs & HAMMER2_DIO_MASK),
+					    (dio->refs & HAMMER2_DIO_DIRTY) != 0,
+					    dio->bp,
+					    (int)((getticks() - dio->ticks)
+					    / hz));
+					dio->ticks = getticks(); /* rate-limit */
+				}
 				diop = &dio->next;
 				continue;
 			}

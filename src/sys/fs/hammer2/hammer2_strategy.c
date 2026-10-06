@@ -1067,7 +1067,15 @@ hammer2_dedup_record(hammer2_chain_t *chain, hammer2_io_t *dio,
 		if (dio == NULL)
 			return;
 	}
-	hammer2_mtx_assert_unlocked(&dio->lock);
+	/*
+	 * NOTE: No hammer2_mtx_assert_unlocked(&dio->lock) here: the
+	 * NetBSD rwlock API cannot express "not held by self", and
+	 * rw_lock_held() is a global check — a concurrent LWP's
+	 * hammer2_io_getblk/bread legitimately holds dio->lock for the
+	 * duration of a device read, which made this assert fire as a
+	 * false-positive SMP panic.  Upstream has no such assert either;
+	 * the mtx_ex/mtx_unlock pair below is the real serialization.
+	 */
 
 	switch (HAMMER2_DEC_CHECK(chain->bref.methods)) {
 	case HAMMER2_CHECK_ISCSI32:
@@ -1169,7 +1177,8 @@ hammer2_dedup_lookup(hammer2_dev_t *hmp, char **datap, int pblksize)
 		if (dio) {
 			dtmp = hammer2_io_data(dio, off),
 			mask = hammer2_dedup_mask(dio, off, pblksize);
-			hammer2_mtx_assert_unlocked(&dio->lock);
+			/* No assert_unlocked: global rw_lock_held race, see
+			 * hammer2_dedup_record. */
 			hammer2_mtx_ex(&dio->lock);
 			if ((dio->dedup_alloc & mask) == mask &&
 			    (dio->dedup_valid & mask) == mask &&

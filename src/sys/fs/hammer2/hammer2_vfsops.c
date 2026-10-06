@@ -2547,7 +2547,11 @@ hammer2_loadvnode(struct mount *mp, struct vnode *vp,
 	 */
 	ip = hammer2_inode_lookup(pmp, inum);
 	KASSERTMSG(ip, "inode lookup failed for inum %llu", (long long)inum);
-	hammer2_mtx_assert_unlocked(&ip->lock);
+	/*
+	 * No hammer2_mtx_assert_unlocked(&ip->lock): rw_lock_held() is a
+	 * global check (can't express "not held by self"), and another
+	 * LWP legitimately holding the inode lock here is not an error.
+	 */
 	hammer2_assert_inode_meta(ip);
 
 	/* Initialize vnode with this inode. */

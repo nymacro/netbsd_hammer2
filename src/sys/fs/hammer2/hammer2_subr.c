@@ -41,6 +41,9 @@
 #include <sys/dirent.h>
 #include <sys/signalvar.h>
 
+/*
+ * Return the directory entry type for an inode.
+ */
 int
 hammer2_get_dtype(uint8_t type)
 {
@@ -69,6 +72,9 @@ hammer2_get_dtype(uint8_t type)
 	/* not reached */
 }
 
+/*
+ * Return the directory entry type for an inode
+ */
 int
 hammer2_get_vtype(uint8_t type)
 {
@@ -122,7 +128,7 @@ hammer2_get_obj_type(uint8_t vtype)
 }
 
 /*
- * Convert a HAMMER2 64-bit time to a timespec.
+ * Convert a hammer2 64-bit time to a timespec.
  */
 void
 hammer2_time_to_timespec(uint64_t xtime, struct timespec *ts)
@@ -211,7 +217,7 @@ hammer2_dirhash(const char *aname, size_t len)
 	/*
 	 * Set bit 15.  This allows readdir to strip bit 63 so a positive
 	 * 64-bit cookie/offset can always be returned, and still guarantee
-	 * that the values 0x0000-0x7FFF are available for artificial entries
+	 * that the values 0x0000-0x7FFF are available for artificial entries.
 	 * ('.' and '..').
 	 */
 	key |= 0x8000U;
@@ -375,7 +381,9 @@ hammer2_print_iostat(const hammer2_iostat_t *ios, const char *msg)
 }
 
 /*
- * Check for pending signal to allow interruption.
+ * Check for pending signal to allow interruption.  This function will
+ * return immediately if the calling thread is a kernel thread and not
+ * a user thread.
  */
 int
 hammer2_signal_check(void)

@@ -34,6 +34,12 @@
  * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  */
+/*
+ * Kernel Filesystem interface
+ *
+ * NOTE! local ipdata pointers must be reloaded on any modifying operation
+ *	 to the inode as its underlying chain may have changed.
+ */
 
 #include "hammer2.h"
 
@@ -55,6 +61,9 @@
 static void hammer2_truncate_file(hammer2_inode_t *, hammer2_key_t);
 static void hammer2_extend_file(hammer2_inode_t *, hammer2_key_t);
 
+/*
+ * Last reference to a vnode is going away but it is still cached.
+ */
 static int
 hammer2_inactive(void *v)
 {
@@ -65,7 +74,9 @@ hammer2_inactive(void *v)
 	struct vnode *vp = ap->a_vp;
 	hammer2_inode_t *ip = VTOI(vp);
 
-	/* degenerate case */
+	/*
+	 * Degenerate case
+	 */
 	if (ip->meta.mode == 0) {
 		/*
 		 * If we are done with the inode, reclaim it
@@ -108,6 +119,10 @@ hammer2_inactive(void *v)
 	return (0);
 }
 
+/*
+ * Reclaim a vnode so that it can be reused; after the inode is
+ * disassociated, the filesystem must manage it alone.
+ */
 static int
 hammer2_reclaim(void *v)
 {
@@ -119,6 +134,11 @@ hammer2_reclaim(void *v)
 
 	if (ip == NULL)
 		return (0);
+
+	/*
+	 * NOTE! We do not attempt to flush chains here, flushing is
+	 *	 really fragile and could also deadlock.
+	 */
 
 	/* The inode lock is required to disconnect it. */
 	hammer2_inode_lock(ip, 0);
@@ -269,6 +289,9 @@ hammer2_check_permitted(struct vnode *vp, hammer2_inode_t *ip, accmode_t accmode
 	    NULL, accmode)));
 }
 
+/*
+ * No lock needed, just handle ip->update
+ */
 static int
 hammer2_access(void *v)
 {
@@ -508,6 +531,9 @@ hammer2_setattr(void *v)
 		kflags |= NOTE_ATTRIB;
 	}
 
+	/*
+	 * Resize the file
+	 */
 	if (vap->va_size != (u_quad_t)VNOVAL && ip->meta.size != vap->va_size) {
 		/*
 		 * Disallow write attempts on read-only file systems;
@@ -587,7 +613,7 @@ done:
 	 * cause havoc.
 	 *
 	 * If an extend occured that changed the DIRECTDATA state, we must
-	 * call daemon_inode_sync now in order to prepare the inode's indirect
+	 * call inode_chain_sync now in order to prepare the inode's indirect
 	 * block table.
 	 *
 	 * WARNING! This means we are making an adjustment to the inode's
@@ -670,7 +696,7 @@ hammer2_readdir(void *v)
 	 * Handle artificial entries.  To ensure that only positive 64 bit
 	 * quantities are returned to userland we always strip off bit 63.
 	 * The hash code is designed such that codes 0x0000-0x7FFF are not
-	 * used, allowing us to use these codes for articial entries.
+	 * used, allowing us to use these codes for artificial entries.
 	 *
 	 * Entry 0 is used for '.' and entry 1 is used for '..'.  Do not
 	 * allow '..' to cross the mount point into (e.g.) the super-root.
@@ -793,7 +819,7 @@ done:
 }
 
 /*
- * Perform read operations on a file or symlink given an unlocked
+ * Perform read operations on a file or symlink given an UNLOCKED
  * inode and uio.
  *
  * The passed ip is not locked.
@@ -852,6 +878,9 @@ hammer2_read_file(hammer2_inode_t *ip, struct uio *uio, int ioflag)
 	return (error);
 }
 
+/*
+ * hammer2_readlink { vp, uio, cred }
+ */
 static int
 hammer2_readlink(void *v)
 {
@@ -881,11 +910,17 @@ hammer2_read(void *v)
 	struct vnode *vp = ap->a_vp;
 	hammer2_inode_t *ip = VTOI(vp);
 
+	/*
+	 * Read operations supported on this vnode?
+	 */
 	if (vp->v_type == VDIR)
 		return (EISDIR);
 	if (vp->v_type != VREG)
 		return (EINVAL);
 
+	/*
+	 * Misc
+	 */
 	return (hammer2_read_file(ip, ap->a_uio, ap->a_ioflag));
 }
 
@@ -1123,9 +1158,15 @@ hammer2_write(void *v)
 #ifndef HAMMER2_WRITE
 	return (EOPNOTSUPP);
 #endif
+	/*
+	 * Read operations supported on this vnode?
+	 */
 	if (vp->v_type != VREG)
 		return (EINVAL);
 
+	/*
+	 * Misc
+	 */
 	if (ip->pmp->rdonly || (ip->pmp->flags & HAMMER2_PMPF_EMERG))
 		return (EROFS);
 
@@ -1373,6 +1414,10 @@ hammer2_lookup(void *v)
 	hammer2_inode_lock(dip, HAMMER2_RESOLVE_SHARED);
 	xop = hammer2_xop_alloc(dip, 0);
 	hammer2_xop_setname(&xop->head, cnp->cn_nameptr, cnp->cn_namelen);
+
+	/*
+	 * Note: In DragonFly the kernel handles '.' and '..'.
+	 */
 	hammer2_xop_start(&xop->head, &hammer2_nresolve_desc);
 	error = hammer2_xop_collect(&xop->head, 0);
 	error = hammer2_error_to_errno(error);
@@ -1382,6 +1427,17 @@ hammer2_lookup(void *v)
 		ip = hammer2_inode_get(dip->pmp, &xop->head, -1, -1);
 	hammer2_inode_unlock(dip);
 
+	/*
+	 * Acquire the related vnode
+	 *
+	 * NOTE: For error processing, only ENOENT resolves the namecache
+	 *	 entry to NULL, otherwise we just return the error and
+	 *	 leave the namecache unresolved.
+	 *
+	 * WARNING: inode structure is locked exclusively via inode_get
+	 *	    but chain was locked shared.  inode_unlock()
+	 *	    will handle it properly.
+	 */
 	if (ip) {
 		if (nameiop == DELETE && (flags & ISLASTCN)) {
 			/* Write access to directory required. */
@@ -1467,6 +1523,9 @@ out:
 	return (error);
 }
 
+/*
+ * Make a device node (typically a fifo)
+ */
 static int
 hammer2_mknod(void *v)
 {
@@ -1587,7 +1646,9 @@ hammer2_mkdir(void *v)
 		return (ENOSPC);
 
 	/*
-	 * Create the directory inode and then create the directory entry.
+	 * Create the directory as an inode and then create the directory
+	 * entry.
+	 *
 	 * dip must be locked before nip to avoid deadlock.
 	 */
 	hammer2_trans_init(dip->pmp, 0);
@@ -1601,6 +1662,7 @@ hammer2_mkdir(void *v)
 	else
 		error = hammer2_dirent_create(dip, cnp->cn_nameptr,
 		    cnp->cn_namelen, nip->meta.inum, nip->meta.type);
+		/* returns UNIX error code */
 	if (error) {
 		if (nip) {
 			hammer2_inode_unlink_finisher(nip, NULL);
@@ -1657,6 +1719,12 @@ hammer2_mkdir(void *v)
 	return (error);
 }
 
+/*
+ * hammer2_create { cnp, dvp, vpp, cred, vap }
+ *
+ * The operating system has already ensured that the directory entry
+ * does not exist and done all appropriate namespace locking.
+ */
 static int
 hammer2_create(void *v)
 {
@@ -1681,7 +1749,9 @@ hammer2_create(void *v)
 		return (ENOSPC);
 
 	/*
-	 * Create the regular file inode and then create the directory entry.
+	 * Create the regular file as an inode and then create the directory
+	 * entry.
+	 *
 	 * dip must be locked before nip to avoid deadlock.
 	 */
 	hammer2_trans_init(dip->pmp, 0);
@@ -1749,6 +1819,9 @@ hammer2_create(void *v)
 	return (error);
 }
 
+/*
+ * hammer2_rmdir { cnp, dvp, cred }
+ */
 static int
 hammer2_rmdir(void *v)
 {
@@ -1850,6 +1923,9 @@ hammer2_rmdir(void *v)
 	return (error);
 }
 
+/*
+ * hammer2_remove { cnp, dvp, cred }
+ */
 static int
 hammer2_remove(void *v)
 {
@@ -2247,6 +2323,10 @@ done:
 	hammer2_inode_drop(fip);
 	hammer2_trans_done(tdip->pmp, HAMMER2_TRANS_SIDEQ);
 
+	/*
+	 * Issue the namecache update after unlocking all the internal
+	 * hammer2 structures, otherwise we might deadlock.
+	 */
 	if (error == 0)
 		genfs_rename_cache_purge(fdvp, fvp, tdvp, tvp);
 	if (error == 0) {
@@ -2281,6 +2361,11 @@ abortit:
 	return (error);
 }
 
+/*
+ * hammer2_link { cnp, dvp, vp, cred }
+ *
+ * Create a hardlink from (vp) to {dvp, cnp}.
+ */
 static int
 hammer2_link(void *v)
 {
@@ -2364,6 +2449,9 @@ hammer2_link(void *v)
 	return (error);
 }
 
+/*
+ * hammer2_symlink { cnp, dvp, vpp, cred, vap, target }
+ */
 static int
 hammer2_symlink(void *v)
 {
@@ -2434,7 +2522,9 @@ hammer2_symlink(void *v)
 		hammer2_inode_unlock(nip);
 	}
 
-	/* Build the softlink. */
+	/*
+	 * Build the softlink (~like file data) and finalize the namecache.
+	 */
 	if (error == 0) {
 		bzero(&auio, sizeof(auio));
 		bzero(&aiov, sizeof(aiov));
@@ -2514,6 +2604,9 @@ hammer2_close(void *v)
 	return (0);
 }
 
+/*
+ * hammer2_ioctl { vp, command, data, fflag, cred }
+ */
 static int
 hammer2_ioctl(void *v)
 {
@@ -2666,6 +2759,9 @@ hammer2_vinit(struct mount *mp, struct vnode **vpp)
 	return (0);
 }
 
+/*
+ * VOPS vector
+ */
 int (**hammer2_vnodeop_p)(void *);
 static const struct vnodeopv_entry_desc hammer2_vnodeop_entries[] = {
 	{ &vop_default_desc, vn_default_error },
@@ -2758,6 +2854,9 @@ const struct vnodeopv_entry_desc hammer2_specop_entries[] = {
 const struct vnodeopv_desc hammer2_specop_opv_desc =
 	{ &hammer2_specop_p, hammer2_specop_entries };
 
+/*
+ * FIFO VOPS
+ */
 int (**hammer2_fifoop_p)(void *);
 const struct vnodeopv_entry_desc hammer2_fifoop_entries[] = {
 	{ &vop_default_desc, vn_default_error },

@@ -417,7 +417,7 @@ dirhash(const char *aname, size_t len)
 	/*
 	 * Set bit 15.  This allows readdir to strip bit 63 so a positive
 	 * 64-bit cookie/offset can always be returned, and still guarantee
-	 * that the values 0x0000-0x7FFF are available for artificial entries
+	 * that the values 0x0000-0x7FFF are available for artificial entries.
 	 * ('.' and '..').
 	 */
 	key |= 0x8000U;

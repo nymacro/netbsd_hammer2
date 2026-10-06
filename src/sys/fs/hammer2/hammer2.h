@@ -36,7 +36,7 @@
  */
 
 /*
- * HAMMER2 in-memory cache of media structures.
+ * HAMMER2 IN-MEMORY CACHE OF MEDIA STRUCTURES
  *
  * This header file contains structures used internally by the HAMMER2
  * implementation.  See hammer2_disk.h for on-disk structures.
@@ -46,7 +46,7 @@
  * Other higher-level structures typically map to chains.
  *
  * A great deal of data is accessed simply via its buffer cache buffer,
- * which is mapped for the duration of the chain's lock.  HAMMER2 must
+ * which is mapped for the duration of the chain's lock.  Hammer2 must
  * implement its own buffer cache layer on top of the system layer to
  * allow for different threads to lock different sub-block-sized buffers.
  *
@@ -56,8 +56,9 @@
  * front-end unless the front-end operation crosses the current inode being
  * flushed.
  *
- * The in-memory representation may remain cached even after the related
- * data has been detached.
+ * The in-memory representation may remain cached (for example in order to
+ * placemark clustering locks) even after the related data has been
+ * detached.
  */
 
 #ifndef _FS_HAMMER2_HAMMER2_H_
@@ -116,6 +117,68 @@ typedef struct hammer2_devvp_list hammer2_devvp_list_t;
 LIST_HEAD(hammer2_ipdep_list, hammer2_inode); /* <-> hammer2_inode::ientry */
 typedef struct hammer2_ipdep_list hammer2_ipdep_list_t;
 
+/*
+ * The chain structure tracks a portion of the media topology from the
+ * root (volume) down.  Chains represent volumes, inodes, indirect blocks,
+ * data blocks, and freemap nodes and leafs.
+ *
+ * The chain structure utilizes a simple singly-homed topology and the
+ * chain's in-memory topology will move around as the chains do, due mainly
+ * to renames and indirect block creation.
+ *
+ * Block Table Updates
+ *
+ *	Block table updates for insertions and updates are delayed until the
+ *	flush.  This allows us to avoid having to modify the parent chain
+ *	all the way to the root.
+ *
+ *	Block table deletions are performed immediately (modifying the parent
+ *	in the process) because the flush code uses the chain structure to
+ *	track delayed updates and the chain will be (likely) gone or moved to
+ *	another location in the topology after a deletion.
+ *
+ *	A prior iteration of the code tried to keep the relationship intact
+ *	on deletes by doing a delete-duplicate operation on the chain, but
+ *	it added way too much complexity to the codebase.
+ *
+ * Flush Synchronization
+ *
+ *	The flush code must flush modified chains bottom-up.  Because chain
+ *	structures can shift around and are NOT topologically stable,
+ *	modified chains are independently indexed for the flush.  As the flush
+ *	runs it modifies (or further modifies) and updates the parents,
+ *	propagating the flush all the way to the volume root.
+ *
+ *	Modifying front-end operations can occur during a flush but will block
+ *	in two cases: (1) when the front-end tries to operate on the inode
+ *	currently in the midst of being flushed and (2) if the front-end
+ *	crosses an inode currently being flushed (such as during a rename).
+ *	So, for example, if you rename directory "x" to "a/b/c/d/e/f/g/x" and
+ *	the flusher is currently working on "a/b/c", the rename will block
+ *	temporarily in order to ensure that "x" exists in one place or the
+ *	other.
+ *
+ *	Meta-data statistics are updated by the flusher.  The front-end will
+ *	make estimates but meta-data must be fully synchronized only during a
+ *	flush in order to ensure that it remains correct across a crash.
+ *
+ *	Multiple flush synchronizations can theoretically be in-flight at the
+ *	same time but the implementation is not coded to handle the case and
+ *	currently serializes them.
+ *
+ * Snapshots:
+ *
+ *	Snapshots currently require the subdirectory tree being snapshotted
+ *	to be flushed.  The snapshot then creates a new super-root inode which
+ *	copies the flushed blockdata of the directory or file that was
+ *	snapshotted.
+ *
+ * Radix tree NOTES:
+ *
+ *	- Note that the radix tree runs in powers of 2 only so sub-trees
+ *	  cannot straddle edges.
+ */
+
 /* per chain rbtree of sub-chain */
 RB_HEAD(hammer2_chain_tree, hammer2_chain); /* <-> hammer2_chain::rbnode */
 typedef struct hammer2_chain_tree hammer2_chain_tree_t;
@@ -163,6 +226,13 @@ typedef struct hammer2_inoq_head hammer2_inoq_head_t;
 #define HAMMER2_IO_DEBUG_CALL
 #endif
 
+/*
+ * DIO - Management structure wrapping system buffer cache.
+ *
+ * HAMMER2 uses an I/O abstraction that allows it to cache and manipulate
+ * fixed-sized filesystem buffers frontend by variable-sized hammer2_chain
+ * structures.
+ */
 struct hammer2_io {
 	struct hammer2_io	*next;
 	hammer2_mtx_t		lock;
@@ -316,16 +386,18 @@ struct hammer2_chain {
 					 HAMMER2_CHAIN_DESTROY)
 
 /*
- * HAMMER2 error codes, used by chain->error and cluster->error.  The error
+ * Hammer2 error codes, used by chain->error and cluster->error.  The error
  * code is typically set on-lock unless no I/O was requested, and set on
  * I/O otherwise.  If set for a cluster it generally means that the cluster
  * code could not find a valid copy to present.
  *
- * All HAMMER2 error codes are flags and can be accumulated by ORing them
+ * All H2 error codes are flags and can be accumulated by ORing them
  * together.
  *
- * EIO		- An I/O error occurred
+ * IO		- An I/O error occurred
  * CHECK	- I/O succeeded but did not match the check code
+ * INCOMPLETE	- A cluster is not complete enough to use, or
+ *		  a chain cannot be loaded because its parent has an error.
  *
  * NOTE: API allows callers to check zero/non-zero to determine if an error
  *	 condition exists.
@@ -430,6 +502,31 @@ struct hammer2_chain {
 /*
  * HAMMER2 cluster - A set of chains representing the same entity.
  *
+ * hammer2_cluster typically represents a temporary set of representitive
+ * chains.  The one exception is that a hammer2_cluster is embedded in
+ * hammer2_inode.  This embedded cluster is ONLY used to track the
+ * representitive chains and cannot be directly locked.
+ *
+ * A cluster is usually temporary (and thus per-thread) for locking purposes,
+ * allowing us to embed the asynchronous storage required for cluster
+ * operations in the cluster itself and adjust the state and status without
+ * having to worry too much about SMP issues.
+ *
+ * The exception is the cluster embedded in the hammer2_inode structure.
+ * This is used to cache the cluster state on an inode-by-inode basis.
+ * Individual hammer2_chain structures not incorporated into clusters might
+ * also stick around to cache miscellanious elements.
+ *
+ * Because the cluster is a 'working copy' and is usually subject to cluster
+ * quorum rules, it is quite possible for us to end up with an insufficient
+ * number of live chains to execute an operation.  If an insufficient number
+ * of chains remain in a working copy, the operation may have to be
+ * downgraded, retried, stall until the requisit number of chains are
+ * available, or possibly even error out depending on the mount type.
+ *
+ * A cluster's focus is set when it is locked.  The focus can only be set
+ * to a chain still part of the synchronized set.
+ *
  * Currently a valid cluster can only have 1 set of chains (nchains)
  * representing the same entity.
  */
@@ -442,12 +539,22 @@ struct hammer2_chain {
 
 struct hammer2_cluster_item {
 	hammer2_chain_t		*chain;
-	uint32_t		flags;		/* for HAMMER2_CITEM_xxx */
 	int			error;
+	uint32_t		flags;		/* for HAMMER2_CITEM_xxx */
 };
 
 typedef struct hammer2_cluster_item hammer2_cluster_item_t;
 
+/*
+ * INVALID	- Invalid for focus, i.e. not part of synchronized set.
+ *		  Once set, this bit is sticky across operations.
+ *
+ * FEMOD	- Indicates that front-end modifying operations can
+ *		  mess with this entry and MODSYNC will copy also
+ *		  effect it.
+ */
+#define HAMMER2_CITEM_INVALID	0x00000001
+#define HAMMER2_CITEM_FEMOD	0x00000002
 #define HAMMER2_CITEM_NULL	0x00000004
 
 struct hammer2_cluster {
@@ -460,6 +567,66 @@ struct hammer2_cluster {
 
 typedef struct hammer2_cluster	hammer2_cluster_t;
 
+/*
+ * WRHARD	- Hard mounts can write fully synchronized
+ * RDHARD	- Hard mounts can read fully synchronized
+ * UNHARD	- Unsynchronized masters present
+ * NOHARD	- No masters visible
+ * WRSOFT	- Soft mounts can write to at least the SOFT_MASTER
+ * RDSOFT	- Soft mounts can read from at least a SOFT_SLAVE
+ * UNSOFT	- Unsynchronized slaves present
+ * NOSOFT	- No slaves visible
+ * RDSLAVE	- slaves are accessible (possibly unsynchronized or remote).
+ * MSYNCED	- All masters are fully synchronized
+ * SSYNCED	- All known local slaves are fully synchronized to masters
+ *
+ * All available masters are always incorporated.  All PFSs belonging to a
+ * cluster (master, slave, copy, whatever) always try to synchronize the
+ * total number of known masters in the PFSs root inode.
+ *
+ * A cluster might have access to many slaves, copies, or caches, but we
+ * have a limited number of cluster slots.  Any such elements which are
+ * directly mounted from block device(s) will always be incorporated.   Note
+ * that SSYNCED only applies to such elements which are directly mounted,
+ * not to any remote slaves, copies, or caches that could be available.  These
+ * bits are used to monitor and drive our synchronization threads.
+ *
+ * When asking the question 'is any data accessible at all', then a simple
+ * test against (RDHARD|RDSOFT|RDSLAVE) gives you the answer.  If any of
+ * these bits are set the object can be read with certain caveats:
+ * RDHARD - no caveats.  RDSOFT - authoritative but might not be synchronized.
+ * and RDSLAVE - not authoritative, has some data but it could be old or
+ * incomplete.
+ *
+ * When both soft and hard mounts are available, data will be read and written
+ * via the soft mount only.  But all might be in the cluster because
+ * background synchronization threads still need to do their work.
+ */
+#define HAMMER2_CLUSTER_INODE	0x00000001	/* embedded in inode struct */
+#define HAMMER2_CLUSTER_UNUSED2	0x00000002
+#define HAMMER2_CLUSTER_LOCKED	0x00000004	/* cluster lks not recursive */
+#define HAMMER2_CLUSTER_WRHARD	0x00000100	/* hard-mount can write */
+#define HAMMER2_CLUSTER_RDHARD	0x00000200	/* hard-mount can read */
+#define HAMMER2_CLUSTER_UNHARD	0x00000400	/* unsynchronized masters */
+#define HAMMER2_CLUSTER_NOHARD	0x00000800	/* no masters visible */
+#define HAMMER2_CLUSTER_WRSOFT	0x00001000	/* soft-mount can write */
+#define HAMMER2_CLUSTER_RDSOFT	0x00002000	/* soft-mount can read */
+#define HAMMER2_CLUSTER_UNSOFT	0x00004000	/* unsynchronized slaves */
+#define HAMMER2_CLUSTER_NOSOFT	0x00008000	/* no slaves visible */
+#define HAMMER2_CLUSTER_MSYNCED	0x00010000	/* all masters synchronized */
+#define HAMMER2_CLUSTER_SSYNCED	0x00020000	/* known slaves synchronized */
+
+#define HAMMER2_CLUSTER_ANYDATA	( HAMMER2_CLUSTER_RDHARD |	\
+				  HAMMER2_CLUSTER_RDSOFT |	\
+				  HAMMER2_CLUSTER_RDSLAVE)
+#if 0
+#define HAMMER2_CLUSTER_RDOK	( HAMMER2_CLUSTER_RDHARD |	\
+				  HAMMER2_CLUSTER_RDSOFT)
+
+#define HAMMER2_CLUSTER_WROK	( HAMMER2_CLUSTER_WRHARD |	\
+				  HAMMER2_CLUSTER_WRSOFT)
+#endif
+
 struct hammer2_depend {
 	TAILQ_ENTRY(hammer2_depend) entry;
 	hammer2_inoq_head_t	sideq;
@@ -468,7 +635,11 @@ struct hammer2_depend {
 };
 
 /*
- * HAMMER2 inode.
+ * A hammer2 inode.
+ *
+ * NOTE: The inode-embedded cluster is never used directly for I/O (since
+ *	 it may be shared).  Instead it will be replicated-in and synchronized
+ *	 back out if changed.
  */
 struct hammer2_inode {
 	struct genfs_node	h_gnode;	/* NetBSD: must be at offset 0 */
@@ -755,6 +926,16 @@ typedef struct hammer2_xop_flush hammer2_xop_flush_t;
 typedef struct hammer2_xop_strategy hammer2_xop_strategy_t;
 typedef struct hammer2_xop_bmap hammer2_xop_bmap_t;
 
+/*
+ * hammer2_xop - container for VOP/XOP operation (allocated, not on stack).
+ *
+ * This structure is used to distribute a VOP operation across multiple
+ * nodes.  It provides a rendezvous for concurrent node execution and
+ * can be detached from the frontend operation to allow the frontend to
+ * return early.
+ *
+ * This structure also sequences operations on up to three inodes.
+ */
 union hammer2_xop {
 	hammer2_xop_head_t	head;
 	hammer2_xop_ipcluster_t	xop_ipcluster;
@@ -845,11 +1026,13 @@ typedef struct hammer2_iostat hammer2_iostat_t;
 /*
  * Global (per partition) management structure, represents a hard block
  * device.  Typically referenced by hammer2_chain structures when applicable.
+ * Typically not used for network-managed elements.
  *
  * Note that a single hammer2_dev can be indirectly tied to multiple system
  * mount points.  There is no direct relationship.  System mounts are
  * per-cluster-id, not per-block-device, and a single hard mount might contain
- * many PFSs.
+ * many PFSs and those PFSs might combine together in various ways to form
+ * the set of available clusters.
  */
 struct hammer2_dev {
 	TAILQ_ENTRY(hammer2_dev) mntentry;	/* hammer2_mntlist */
@@ -885,13 +1068,23 @@ struct hammer2_dev {
 
 /*
  * Per-cluster management structure.  This structure will be tied to a
- * system mount point if the system is mounting the PFS.
+ * system mount point if the system is mounting the PFS, but is also used
+ * to manage clusters encountered during the super-root scan or received
+ * via LNK_SPANs that might not be mounted.
  *
  * This structure is also used to represent the super-root that hangs off
  * of a hard mount point.  The super-root is not really a cluster element.
  * In this case the spmp_hmp field will be non-NULL.  It's just easier to do
  * this than to special case super-root manipulation in the hammer2_chain*
  * code as being only hammer2_dev-related.
+ *
+ * pfs_mode and pfs_nmasters are rollup fields which critically describes
+ * how elements of the cluster act on the cluster.  pfs_mode is only applicable
+ * when a PFS is mounted by the system.  pfs_nmasters is our best guess as to
+ * how many masters have been configured for a cluster and is always
+ * applicable.  pfs_types[] is an array with 1:1 correspondance to the
+ * iroot cluster and describes the PFS types of the nodes making up the
+ * cluster.
  *
  * WARNING! The chains making up pfs->iroot's cluster are accounted for in
  *	    hammer2_dev->mount_count when the pfs is associated with a mount
@@ -943,8 +1136,11 @@ struct hammer2_pfs {
 	int			count_lwinprog;	/* logical write in prog */
 };
 
+/*
+ * pmp->flags
+ */
 #define HAMMER2_PMPF_SPMP	0x00000001
-#define HAMMER2_PMPF_EMERG	0x00000002
+#define HAMMER2_PMPF_EMERG	0x00000002	/* Emergency delete mode */
 #define HAMMER2_PMPF_WAITING	0x10000000
 
 #define HAMMER2_DIRTYCHAIN_WAITING	0x80000000
@@ -953,8 +1149,14 @@ struct hammer2_pfs {
 #define HAMMER2_LWINPROG_WAITING0	0x80000000
 #define HAMMER2_LWINPROG_MASK		0x3FFFFFFF
 
+/*
+ * hammer2_cluster_check
+ */
 #define HAMMER2_CHECK_NULL	0x00000001
 
+/*
+ * Misc
+ */
 #define MPTOPMP(mp)	((hammer2_pfs_t *)(mp)->mnt_data)
 #define VTOI(vp)	((hammer2_inode_t *)(vp)->v_data)
 
@@ -1039,7 +1241,9 @@ void hammer2_chain_unhold(hammer2_chain_t *);
 void hammer2_chain_drop_unhold(hammer2_chain_t *);
 void hammer2_chain_rehold(hammer2_chain_t *);
 int hammer2_chain_lock(hammer2_chain_t *, int);
+//void hammer2_chain_lock_unhold(hammer2_chain_t *chain, int how);
 void hammer2_chain_unlock(hammer2_chain_t *);
+//void hammer2_chain_unlock_hold(hammer2_chain_t *chain);
 int hammer2_chain_resize(hammer2_chain_t *, hammer2_tid_t, hammer2_off_t, int,
     int);
 int hammer2_chain_modify(hammer2_chain_t *, hammer2_tid_t, hammer2_off_t, int);
@@ -1241,7 +1445,10 @@ int hammer2_vfs_enospace(hammer2_inode_t *, off_t, kauth_cred_t);
 /* hammer2_vnops.c */
 int hammer2_vinit(struct mount *, struct vnode **);
 
-/* hammer2_xops.c */
+/*
+ * XOP backends in hammer2_xops.c, primarily for VNOPS.  Other XOP backends
+ * may be integrated into other source files.
+ */
 void hammer2_xop_ipcluster(hammer2_xop_t *, void *, int);
 void hammer2_xop_readdir(hammer2_xop_t *, void *, int);
 void hammer2_xop_nresolve(hammer2_xop_t *, void *, int);
@@ -1262,81 +1469,104 @@ void hammer2_xop_inode_connect(hammer2_xop_t *, void *, int);
 void hammer2_xop_bmap(hammer2_xop_t *, void *, int);
 
 /* XXX no way to return multiple errnos */
-static __inline int
+static __inline
+int
 hammer2_error_to_errno(int error)
 {
-	if (error == 0)
-		return (0);
-	else if (error & HAMMER2_ERROR_EIO)
-		return (EIO);
-	else if (error & HAMMER2_ERROR_CHECK)
-		return (EDOM);
-	else if (error & HAMMER2_ERROR_BADBREF)
-		return (EIO); /* no EBADBREF */
-	else if (error & HAMMER2_ERROR_ENOSPC)
-		return (ENOSPC);
-	else if (error & HAMMER2_ERROR_ENOENT)
-		return (ENOENT);
-	else if (error & HAMMER2_ERROR_ENOTEMPTY)
-		return (ENOTEMPTY);
-	else if (error & HAMMER2_ERROR_EAGAIN)
-		return (EAGAIN);
-	else if (error & HAMMER2_ERROR_ENOTDIR)
-		return (ENOTDIR);
-	else if (error & HAMMER2_ERROR_EISDIR)
-		return (EISDIR);
-	else if (error & HAMMER2_ERROR_ABORTED)
-		return (EINTR);
-	//else if (error & HAMMER2_ERROR_EOF)
-	//	return (xxx);
-	else if (error & HAMMER2_ERROR_EINVAL)
-		return (EINVAL);
-	else if (error & HAMMER2_ERROR_EEXIST)
-		return (EEXIST);
-	else if (error & HAMMER2_ERROR_EOPNOTSUPP)
-		return (EOPNOTSUPP);
-	else
-		return (EDOM);
+	if (error) {
+		if (error & HAMMER2_ERROR_EIO)
+			error = EIO;
+		else if (error & HAMMER2_ERROR_CHECK)
+			error = EDOM;
+		else if (error & HAMMER2_ERROR_ABORTED)
+			error = EINTR;
+		else if (error & HAMMER2_ERROR_BADBREF)
+			error = EIO;	/* no EBADBREF */
+		else if (error & HAMMER2_ERROR_ENOSPC)
+			error = ENOSPC;
+		else if (error & HAMMER2_ERROR_ENOENT)
+			error = ENOENT;
+		else if (error & HAMMER2_ERROR_ENOTEMPTY)
+			error = ENOTEMPTY;
+		else if (error & HAMMER2_ERROR_EAGAIN)
+			error = EAGAIN;
+		else if (error & HAMMER2_ERROR_ENOTDIR)
+			error = ENOTDIR;
+		else if (error & HAMMER2_ERROR_EISDIR)
+			error = EISDIR;
+		else if (error & HAMMER2_ERROR_EINPROGRESS)
+			error = EINPROGRESS;
+		else if (error & HAMMER2_ERROR_EEXIST)
+			error = EEXIST;
+		else if (error & HAMMER2_ERROR_EINVAL)
+			error = EINVAL;
+		else if (error & HAMMER2_ERROR_EDEADLK)
+			error = EDEADLK;
+		else if (error & HAMMER2_ERROR_ESRCH)
+			error = ESRCH;
+		else if (error & HAMMER2_ERROR_ETIMEDOUT)
+			error = ETIMEDOUT;
+		//else if (error & HAMMER2_ERROR_EOF)
+		//	error = xxx;
+		else if (error & HAMMER2_ERROR_EOPNOTSUPP)
+			error = EOPNOTSUPP;	/* NetBSD: unsupported op */
+		else
+			error = EDOM;
+	}
+	return error;
 }
 
-static __inline int
+static __inline
+int
 hammer2_errno_to_error(int error)
 {
-	switch (error) {
+	switch(error) {
 	case 0:
-		return (0);
+		return 0;
 	case EIO:
-		return (HAMMER2_ERROR_EIO);
+		return HAMMER2_ERROR_EIO;
 	case EDOM:
-		return (HAMMER2_ERROR_CHECK);
-	//case EIO:
-	//	return (HAMMER2_ERROR_BADBREF);
-	case ENOSPC:
-		return (HAMMER2_ERROR_ENOSPC);
-	case ENOENT:
-		return (HAMMER2_ERROR_ENOENT);
-	case ENOTEMPTY:
-		return (HAMMER2_ERROR_ENOTEMPTY);
-	case EAGAIN:
-		return (HAMMER2_ERROR_EAGAIN);
-	case ENOTDIR:
-		return (HAMMER2_ERROR_ENOTDIR);
-	case EISDIR:
-		return (HAMMER2_ERROR_EISDIR);
+		return HAMMER2_ERROR_CHECK;
 	case EINTR:
-		return (HAMMER2_ERROR_ABORTED);
-	//case xxx:
-	//	return (HAMMER2_ERROR_EOF);
-	case EINVAL:
-		return (HAMMER2_ERROR_EINVAL);
+		return HAMMER2_ERROR_ABORTED;
+	//case EIO:
+	//	return HAMMER2_ERROR_BADBREF;
+	case ENOSPC:
+		return HAMMER2_ERROR_ENOSPC;
+	case ENOENT:
+		return HAMMER2_ERROR_ENOENT;
+	case ENOTEMPTY:
+		return HAMMER2_ERROR_ENOTEMPTY;
+	case EAGAIN:
+		return HAMMER2_ERROR_EAGAIN;
+	case ENOTDIR:
+		return HAMMER2_ERROR_ENOTDIR;
+	case EISDIR:
+		return HAMMER2_ERROR_EISDIR;
+	case EINPROGRESS:
+		return HAMMER2_ERROR_EINPROGRESS;
 	case EEXIST:
-		return (HAMMER2_ERROR_EEXIST);
+		return HAMMER2_ERROR_EEXIST;
+	case EINVAL:
+		return HAMMER2_ERROR_EINVAL;
+	case EDEADLK:
+		return HAMMER2_ERROR_EDEADLK;
+	case ESRCH:
+		return HAMMER2_ERROR_ESRCH;
+	case ETIMEDOUT:
+		return HAMMER2_ERROR_ETIMEDOUT;
+	//case xxx:
+	//	return HAMMER2_ERROR_EOF;
 	case EOPNOTSUPP:
-		return (HAMMER2_ERROR_EOPNOTSUPP);
+		return HAMMER2_ERROR_EOPNOTSUPP;	/* NetBSD */
 	default:
-		return (HAMMER2_ERROR_EINVAL);
+		return HAMMER2_ERROR_EINVAL;
 	}
 }
+
+/*
+ * More complex inlines
+ */
 
 #define hammer2_xop_gdata(xop)	_hammer2_xop_gdata((xop), __FILE__, __LINE__)
 

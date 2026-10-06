@@ -34,6 +34,9 @@
  * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  */
+/*
+ * Ioctl Functions.
+ */
 
 #include "hammer2.h"
 #include "hammer2_ioctl.h"
@@ -63,7 +66,7 @@ hammer2_is_rdonly(const struct mount *mp)
 }
 
 /*
- * Retrieve ondisk version.
+ * Retrieve version and basic info
  */
 static int
 hammer2_ioctl_version_get(hammer2_inode_t *ip, void *data)
@@ -110,6 +113,9 @@ hammer2_ioctl_pfs_get(hammer2_inode_t *ip, void *data)
 
 	save_key = pfs->name_key;
 
+	/*
+	 * Setup
+	 */
 	if (save_key == (hammer2_key_t)-1) {
 		hammer2_inode_lock(ip->pmp->iroot, 0);
 		parent = NULL;
@@ -171,6 +177,9 @@ hammer2_ioctl_pfs_get(hammer2_inode_t *ip, void *data)
 		error = ENOENT;
 	}
 
+	/*
+	 * Cleanup
+	 */
 	if (chain) {
 		hammer2_chain_unlock(chain);
 		hammer2_chain_drop(chain);
@@ -500,6 +509,7 @@ hammer2_ioctl_pfs_snapshot(hammer2_inode_t *ip, void *data)
 	hammer2_inode_modify(ip);
 	ip->meta.pfs_lsnap_tid = mtid;
 
+	/* XXX cluster it! */
 	chain = hammer2_inode_chain(ip, 0, HAMMER2_RESOLVE_ALWAYS);
 	hmp = chain->hmp;
 
@@ -1001,7 +1011,7 @@ hammer2_ioctl_volume_list(hammer2_inode_t *ip, void *data)
 			break;
 		vol = &hmp->volumes[i];
 		bzero(&entry, sizeof(entry));
-		/* Copy hammer2_volume_t fields. */
+		/* copy hammer2_volume_t fields */
 		entry.id = vol->id;
 		bcopy(vol->dev->path, entry.path, sizeof(entry.path));
 		entry.offset = vol->offset;
@@ -1039,7 +1049,7 @@ hammer2_ioctl_volume_list2(hammer2_inode_t *ip, void *data)
 			break;
 		vol = &hmp->volumes[i];
 		entry = &vollist->volumes[cnt];
-		/* Copy hammer2_volume_t fields. */
+		/* copy hammer2_volume_t fields */
 		entry->id = vol->id;
 		bcopy(vol->dev->path, entry->path, sizeof(entry->path));
 		entry->offset = vol->offset;

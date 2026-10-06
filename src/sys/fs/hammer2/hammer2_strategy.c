@@ -34,6 +34,15 @@
  * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  */
+/*
+ * This module handles low level logical file I/O (strategy) which backs
+ * the logical buffer cache.
+ *
+ * [De]compression, zero-block, check codes, and buffer cache operations
+ * for file data is handled here.
+ *
+ * Live dedup makes its home here as well.
+ */
 
 #include "hammer2.h"
 #include "hammer2_lz4.h"
@@ -79,6 +88,9 @@ hammer2_strategy(void *v)
 	return (0);
 }
 
+/****************************************************************************
+ *				READ SUPPORT				    *
+ ****************************************************************************/
 /*
  * Callback used in read path in case that a block is compressed with LZ4.
  */
@@ -89,6 +101,12 @@ hammer2_decompress_LZ4_callback(const char *data, unsigned int bytes,
 	char *compressed_buffer;
 	int compressed_size;
 	int result, n;
+
+#if 0
+	if bio->bio_caller_info2.index &&
+	      bio->bio_caller_info1.uvalue32 !=
+	      crc32(bp->b_data, bp->b_bufsize) --- return error
+#endif
 
 	KKASSERT(bp->b_bufsize <= HAMMER2_PBUFSIZE);
 	compressed_size = *(const int *)data;
@@ -101,7 +119,7 @@ hammer2_decompress_LZ4_callback(const char *data, unsigned int bytes,
 	if (result < 0) {
 		hprintf("error during decompression: buf %016llx/%016llx/%d\n",
 		    (long long)bp->b_lblkno, (long long)bp->b_blkno, bytes);
-		/* Make sure it isn't random garbage. */
+		/* make sure it isn't random garbage */
 		bzero(compressed_buffer, HAMMER2_PBUFSIZE);
 		result = 0;
 	}
@@ -120,6 +138,8 @@ hammer2_decompress_LZ4_callback(const char *data, unsigned int bytes,
 
 /*
  * Callback used in read path in case that a block is compressed with ZLIB.
+ * It is almost identical to LZ4 callback, so in theory they can be unified,
+ * but we didn't want to make changes in buf structure for that.
  */
 static void
 hammer2_decompress_ZLIB_callback(const char *data, unsigned int bytes,
@@ -143,7 +163,7 @@ hammer2_decompress_ZLIB_callback(const char *data, unsigned int bytes,
 	    M_WAITOK | M_ZERO);
 	strm_decompress.next_in = __DECONST(char *, data);
 
-	/* XXX Supply proper size, subset of device bp. */
+	/* XXX supply proper size, subset of device bp */
 	strm_decompress.avail_in = bytes;
 	strm_decompress.next_out = compressed_buffer;
 	strm_decompress.avail_out = HAMMER2_PBUFSIZE;
@@ -229,6 +249,18 @@ hammer2_xop_strategy_read(hammer2_xop_t *arg, void *scratch, int clindex)
 	const char *data;
 	int error;
 
+	/*
+	 * This is difficult to optimize.  The logical buffer might be
+	 * partially dirty (contain dummy zero-fill pages), which would
+	 * mess up our crc calculation if we were to try a direct read.
+	 * So for now we always double-buffer through the underlying
+	 * storage.
+	 *
+	 * If not for the above problem we could conditionalize on
+	 * (1) 64KB buffer, (2) one chain (not multi-master) and
+	 * (3) !hammer2_double_buffer, and issue a direct read into the
+	 * logical buffer.
+	 */
 	parent = hammer2_inode_chain(xop->head.ip1, clindex,
 	    HAMMER2_RESOLVE_ALWAYS | HAMMER2_RESOLVE_SHARED);
 	if (parent) {
@@ -253,6 +285,11 @@ hammer2_xop_strategy_read(hammer2_xop_t *arg, void *scratch, int clindex)
 	parent = NULL; /* safety */
 
 	bp = xop->bp;
+	/*
+	 * NOTE: The chain->data for xop->head.cluster.focus will be
+	 *	 synchronized to the current cpu by xop_collect(),
+	 *	 but other chains in the cluster might not be.
+	 */
 	error = hammer2_xop_collect(&xop->head, HAMMER2_XOP_COLLECT_NOWAIT);
 	switch (error) {
 	case 0:
@@ -342,6 +379,14 @@ hammer2_strategy_read_completion(hammer2_chain_t *focus, const char *data,
 	}
 }
 
+/****************************************************************************
+ *				WRITE SUPPORT				    *
+ ****************************************************************************/
+
+/*
+ * Functions for compression in threads,
+ * from hammer2_vnops.c
+ */
 static void hammer2_write_file_core(char *, hammer2_inode_t *,
     hammer2_chain_t **, hammer2_key_t, int, int, hammer2_tid_t, int *);
 static void hammer2_compress_and_write(char *, hammer2_inode_t *,
@@ -415,6 +460,9 @@ hammer2_xop_strategy_write(hammer2_xop_t *arg, void *scratch, int clindex)
 	bcopy(bp->b_data, bio_data, lblksize);
 	bp = NULL; /* safety, illegal to access after unlock */
 
+	/*
+	 * Actual operation
+	 */
 	parent = hammer2_inode_chain(ip, clindex, HAMMER2_RESOLVE_ALWAYS);
 	hammer2_write_file_core(bio_data, ip, &parent, lbase, IO_ASYNC,
 	    pblksize, xop->head.mtid, &error);
@@ -560,6 +608,8 @@ failed:
 }
 
 /*
+ * hammer2_write_file_core()
+ *
  * The core write function which determines which path to take
  * depending on compression settings.  We also have to locate the
  * related chains so we can calculate and set the check data for
@@ -590,7 +640,7 @@ hammer2_write_file_core(char *data, hammer2_inode_t *ip,
 		chain = hammer2_assign_physical(ip, parentp, lbase, pblksize,
 		    mtid, &bdata, errorp);
 		if (*errorp) {
-			/* Skip modifications. */
+			/* skip modifications */
 		} else if (chain->bref.type == HAMMER2_BREF_TYPE_INODE) {
 			wipdata = &chain->data->ipdata;
 			KKASSERT(wipdata->meta.op_flags &
@@ -629,6 +679,8 @@ hammer2_write_file_core(char *data, hammer2_inode_t *ip,
 }
 
 /*
+ * Helper
+ *
  * Generic function that will perform the compression in compression
  * write path. The compression algorithm is determined by the settings
  * obtained from inode.
@@ -733,12 +785,16 @@ hammer2_compress_and_write(char *data, hammer2_inode_t *ip,
 	}
 
 	if (comp_size == 0) {
-		/* Compression failed or turned off. */
+		/*
+		 * compression failed or turned off
+		 */
 		comp_block_size = pblksize; /* safety */
 		if (++ip->comp_heuristic > 128)
 			ip->comp_heuristic = 8;
 	} else {
-		/* Compression succeeded. */
+		/*
+		 * compression succeeded
+		 */
 		ip->comp_heuristic = 0;
 		if (comp_size <= 1024) {
 			comp_block_size = 1024;
@@ -845,6 +901,9 @@ hammer2_compress_and_write(char *data, hammer2_inode_t *ip,
 			hammer2_dedup_record(chain, dio, bdata);
 			/* Now write the related dio. */
 			if (ioflag & IO_SYNC)
+				/*
+				 * Synchronous I/O requested.
+				 */
 				hammer2_io_bwrite(&dio);
 			else if (ioflag & IO_ASYNC)
 				hammer2_io_bawrite(&dio);
@@ -866,6 +925,8 @@ done:
 }
 
 /*
+ * Helper
+ *
  * Function that performs zero-checking and writing without compression,
  * it corresponds to default zero-checking path.
  */
@@ -894,7 +955,7 @@ hammer2_zero_check_and_write(char *data, hammer2_inode_t *ip,
 		chain = hammer2_assign_physical(ip, parentp, lbase, pblksize,
 		    mtid, &bdata, errorp);
 		if (*errorp) {
-			/* Do nothing. */
+			/* do nothing */
 		} else if (bdata) {
 			hammer2_write_bp(chain, data, ioflag, pblksize, mtid,
 			    errorp, check_algo);
@@ -914,6 +975,8 @@ hammer2_zero_check_and_write(char *data, hammer2_inode_t *ip,
 }
 
 /*
+ * Helper
+ *
  * A function to test whether a block of data contains only zeros,
  * returns TRUE (non-zero) if the block is all zeros.
  */
@@ -930,6 +993,8 @@ test_block_zeros(const char *buf, size_t bytes)
 }
 
 /*
+ * Helper
+ *
  * Function to "write" a block that contains only zeros.
  */
 static void
@@ -965,6 +1030,8 @@ zero_write(char *data, hammer2_inode_t *ip, hammer2_chain_t **parentp,
 }
 
 /*
+ * Helper
+ *
  * Function to write the data as it is, without performing any sort of
  * compression. This function is used in path without compression and
  * default zero-checking path.
@@ -1018,6 +1085,9 @@ hammer2_write_bp(hammer2_chain_t *chain, char *data, int ioflag, int pblksize,
 		hammer2_dedup_record(chain, dio, bdata);
 		/* Now write the related dio. */
 		if (ioflag & IO_SYNC)
+			/*
+			 * Synchronous I/O requested.
+			 */
 			hammer2_io_bwrite(&dio);
 		else if (ioflag & IO_ASYNC)
 			hammer2_io_bawrite(&dio);

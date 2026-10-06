@@ -110,10 +110,17 @@ hammer2_xop_fifo_alloc(hammer2_xop_fifo_t *fifo, size_t new_nmemb,
 	adjust_malloc_leak(-old_size, M_HAMMER2);
 }
 
+/****************************************************************************
+ *			    HAMMER2 XOPS API	 			    *
+ ****************************************************************************/
+
 /*
  * Allocate a XOP request.
+ *
  * Once allocated a XOP request can be started, collected, and retired,
  * and can be retired early if desired.
+ *
+ * NOTE: Fifo indices might not be zero but ri == wi on pool_get().
  */
 void *
 hammer2_xop_alloc(hammer2_inode_t *ip, int flags)
@@ -315,6 +322,8 @@ xop_storage_func(hammer2_xop_head_t *xop, hammer2_inode_t *ip, void *scratch,
 /*
  * Start a XOP request, queueing it to all nodes in the cluster to
  * execute the cluster op.
+ *
+ * XXX optimize single-target case.
  */
 void
 hammer2_xop_start(hammer2_xop_head_t *xop, hammer2_xop_desc_t *desc)
@@ -394,7 +403,8 @@ hammer2_xop_retire(hammer2_xop_head_t *xop, uint32_t mask)
 
 	/*
 	 * All collectors are gone, we can cleanup and dispose of the XOP.
-	 * Cleanup the collection cluster.
+	 * Note that this can wind up being a frontend OR a backend.
+	 * Pending chains are locked shared and not owned by any thread.
 	 */
 	/*
 	 * Cleanup the xop's cluster.  If there is an inode reference,
@@ -436,6 +446,9 @@ hammer2_xop_retire(hammer2_xop_head_t *xop, uint32_t mask)
 		}
 	}
 
+	/*
+	 * Drop and unhold chains in xop cluster
+	 */
 	for (i = 0; i < xop->cluster.nchains; ++i) {
 		xop->cluster.array[i].flags = 0;
 		chain = xop->cluster.array[i].chain;
@@ -514,7 +527,10 @@ hammer2_xop_retire(hammer2_xop_head_t *xop, uint32_t mask)
 }
 
 /*
- * (Backend) Feed chain data.
+ * (Backend) Feed chain data through the cluster validator and back to
+ * the frontend.  Chains are fed from multiple nodes concurrently
+ * and pipelined via per-node FIFOs in the XOP.
+ *
  * The chain must be locked (either shared or exclusive).  The caller may
  * unlock and drop the chain on return.  This function will add an extra
  * ref and hold the chain's data for the pass-back.
@@ -522,7 +538,7 @@ hammer2_xop_retire(hammer2_xop_head_t *xop, uint32_t mask)
  * No xop lock is needed because we are only manipulating fields under
  * our direct control.
  *
- * Returns 0 on success and a HAMMER2 error code if sync is permanently
+ * Returns 0 on success and a hammer2 error code if sync is permanently
  * lost.  The caller retains a ref on the chain but by convention
  * the lock is typically inherited by the xop (caller loses lock).
  *
@@ -536,7 +552,9 @@ hammer2_xop_feed(hammer2_xop_head_t *xop, hammer2_chain_t *chain, int clindex,
 	hammer2_xop_fifo_t *fifo;
 	size_t old_fifo_size;
 
-	/* Early termination (typically of xop_readir). */
+	/*
+	 * Early termination (typicaly of xop_readir)
+	 */
 	if (hammer2_xop_active(xop) == 0) {
 		error = HAMMER2_ERROR_ABORTED;
 		goto done;
@@ -566,17 +584,45 @@ hammer2_xop_feed(hammer2_xop_head_t *xop, hammer2_chain_t *chain, int clindex,
 	++fifo->wi;
 
 	error = 0;
+
+	/*
+	 * Cleanup.  If no error
+	 * occurred the fifo inherits the lock and gains an additional ref.
+	 *
+	 * The caller's ref remains in both cases.
+	 */
 done:
 	return (error);
 }
 
 /*
  * (Frontend) collect a response from a running cluster op.
- * Responses are collected into a cohesive response >= collect_key.
+ *
+ * Responses are fed from all appropriate nodes concurrently
+ * and collected into a cohesive response >= collect_key.
+ *
+ * The collector will return the instant quorum or other requirements
+ * are met, even if some nodes get behind or become non-responsive.
+ *
+ * HAMMER2_XOP_COLLECT_NOWAIT	- Used to 'poll' a completed collection,
+ *				  usually called synchronously from the
+ *				  node XOPs for the strategy code to
+ *				  fake the frontend collection and complete
+ *				  the BIO as soon as possible.
  *
  * Returns 0 on success plus a filled out xop->cluster structure.
  * Return ENOENT on normal termination.
  * Otherwise return an error.
+ *
+ * WARNING! If the xop returns a cluster with a non-NULL focus, note that
+ *	    none of the chains in the cluster (or the focus) are either
+ *	    locked or I/O synchronized with the cpu.  hammer2_xop_gdata()
+ *	    and hammer2_xop_pdata() must be used to safely access the focus
+ *	    chain's content.
+ *
+ *	    The frontend can make certain assumptions based on higher-level
+ *	    locking done by the frontend, but data integrity absolutely
+ *	    requires using the gdata/pdata API.
  */
 int
 hammer2_xop_collect(hammer2_xop_head_t *xop, int flags)
@@ -630,7 +676,7 @@ hammer2_xop_collect(hammer2_xop_head_t *xop, int flags)
 			 * operation in-progress.
 			 */
 			xop->cluster.array[i].chain = NULL;
-			/* Retain any CITEM_NULL setting. */
+			/* retain any CITEM_NULL setting */
 		}
 	}
 

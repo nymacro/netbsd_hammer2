@@ -146,6 +146,7 @@ hammer2_freemap_reserve(hammer2_chain_t *chain, int radix)
 		break;
 	default:
 		hpanic("bad radix %d", bref->keybits);
+		/* NOT REACHED */
 		break;
 	}
 	bref->data_off = off | radix;
@@ -630,8 +631,8 @@ hammer2_bmap_alloc(hammer2_dev_t *hmp, hammer2_bmap_data_t *bmap,
 				bmmask <<= bmradix;
 			}
 		}
-		/* Fragments might remain. */
-		/* KKASSERT(bmap->avail == 0); */
+		/*fragments might remain*/
+		/*KKASSERT(bmap->avail == 0);*/
 		return (HAMMER2_ERROR_ENOSPC);
 success:
 		offset = i * (HAMMER2_SEGSIZE / HAMMER2_BMAP_ELEMENTS) +
@@ -810,7 +811,7 @@ hammer2_freemap_init(hammer2_dev_t *hmp, hammer2_key_t key,
 }
 
 /*
- * The current level1 freemap has been exhausted, iterate to the next
+ * The current Level 1 freemap has been exhausted, iterate to the next
  * one, return ENOSPC if no freemaps remain.
  *
  * At least two loops are required.  If we are not in relaxed mode and
@@ -818,7 +819,7 @@ hammer2_freemap_init(hammer2_dev_t *hmp, hammer2_key_t key,
  * The relaxed mode is recorded back in the hmp so once we enter the mode
  * we remain relaxed until stuff begins to get freed and only do 2 loops.
  *
- * XXX This should rotate back to the beginning to handle freed-up space
+ * XXX this should rotate back to the beginning to handle freed-up space
  * XXX or use intermediate entries to locate free space. TODO
  */
 static int
@@ -850,10 +851,10 @@ hammer2_freemap_iterate(hammer2_chain_t **parentp, hammer2_chain_t **chainp,
  *
  * WARNING! Cannot be called with a empty-data bref (radix == 0).
  *
- * XXX Currently disabled when how == 0 (the normal real-time case).
- * At the moment we depend on the bulk freescan to actually free blocks.
- * It will still call this routine with a non-zero how to stage possible
- * frees and to do the actual free.
+ * XXX currently disabled when how == 0 (the normal real-time case).  At
+ * the moment we depend on the bulk freescan to actually free blocks.  It
+ * will still call this routine with a non-zero how to stage possible frees
+ * and to do the actual free.
  */
 void
 hammer2_freemap_adjust(hammer2_dev_t *hmp, hammer2_blockref_t *bref, int how)
@@ -950,6 +951,12 @@ hammer2_freemap_adjust(hammer2_dev_t *hmp, hammer2_blockref_t *bref, int how)
 		}
 		/* XXX handle error */
 	}
+
+#if FREEMAP_DEBUG
+	kprintf("FREEMAP ADJUST TYPE %d %016jx/%d DATA_OFF=%016jx\n",
+		chain->bref.type, chain->bref.key,
+		chain->bref.keybits, chain->bref.data_off);
+#endif
 
 	/* Calculate the bitmask (runs in 2-bit pairs). */
 	start = ((int)(data_off >> HAMMER2_FREEMAP_BLOCK_RADIX) & 15) * 2;

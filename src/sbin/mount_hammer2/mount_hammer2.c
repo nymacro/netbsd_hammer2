@@ -55,6 +55,9 @@ static struct mntopt mopts[] = {
 	MOPT_NULL,
 };
 
+/*
+ * Usage: mount_hammer2 [volume] [mtpt]
+ */
 #ifndef MOUNT_NOMAIN
 int
 main(int argc, char **argv)
@@ -107,6 +110,9 @@ mount_hammer2_parseargs(int argc, char **argv,
 		goto ignore_special;
 	}
 
+	/*
+	 * New mount
+	 */
 	if (argc != 2) {
 		usage("missing parameter(s) (special[@label] node)");
 		/* not reached */

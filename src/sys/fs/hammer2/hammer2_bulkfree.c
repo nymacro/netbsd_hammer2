@@ -84,6 +84,10 @@ static int h2_bulkfree_test(hammer2_bulkfree_info_t *, hammer2_blockref_t *,
     int, int);
 static uint32_t bigmask_get(hammer2_bmap_data_t *);
 static int bigmask_good(hammer2_bmap_data_t *, uint32_t);
+
+/*
+ * Bulkfree callback info
+ */
 static void cbinfo_bmap_init(hammer2_bulkfree_info_t *, size_t);
 static int h2_bulkfree_callback(hammer2_bulkfree_info_t *,
     hammer2_blockref_t *);
@@ -322,7 +326,7 @@ hammer2_bulkfree_scan(hammer2_chain_t *parent,
 			--info->depth;
 			break;
 		default:
-			/* Does not recurse. */
+			/* does not recurse */
 			break;
 		}
 		if (rup_error & HAMMER2_ERROR_ABORTED)
@@ -538,7 +542,7 @@ hammer2_bulkfree_pass(hammer2_dev_t *hmp, hammer2_chain_t *vchain,
 	    ~(size_t)(HAMMER2_FREEMAP_LEVELN_PSIZE - 1);
 
 	/*
-	 * Cap at 1/4 of physical memory (hammer2 utility will not normally
+	 * Cap at 1/4 physical memory (hammer2 utility will not normally
 	 * ever specify a buffer this big, but leave the option available).
 	 */
 	if (size > (size_t)ctob(physmem) / 4) {
@@ -827,7 +831,7 @@ h2_bulkfree_callback(hammer2_bulkfree_info_t *cbinfo, hammer2_blockref_t *bref)
 	 * Calculate the information needed to generate the in-memory
 	 * freemap record.
 	 *
-	 * HAMMER2 does not allow allocations to cross the L1 (1GB) boundary,
+	 * Hammer2 does not allow allocations to cross the L1 (1GB) boundary,
 	 * it's a problem if it does.  (Or L0 (4MB) for that matter).
 	 */
 	radix = (int)(bref->data_off & HAMMER2_OFF_MASK_RADIX);
@@ -853,7 +857,7 @@ h2_bulkfree_callback(hammer2_bulkfree_info_t *cbinfo, hammer2_blockref_t *bref)
 	 * Convert data_off to a bmap-relative value (~4MB storage range).
 	 * Adjust linear, class, and avail.
 	 *
-	 * HAMMER2 does not allow allocations to cross the L0 (4MB) boundary,
+	 * Hammer2 does not allow allocations to cross the L0 (4MB) boundary,
 	 * it's a problem if it does.
 	 */
 	data_off &= HAMMER2_FREEMAP_LEVEL0_MASK;
@@ -941,8 +945,8 @@ h2_bulkfree_callback(hammer2_bulkfree_info_t *cbinfo, hammer2_blockref_t *bref)
 }
 
 /*
- * Synchronize the in-memory bitmap with the live freemap.
- * This is not a direct copy.  Instead the bitmaps must be compared:
+ * Synchronize the in-memory bitmap with the live freemap.  This is not a
+ * direct copy.  Instead the bitmaps must be compared:
  *
  *	In-memory	Live-freemap
  *	   00		  11 -> 10	(do nothing if live modified)
@@ -1016,7 +1020,7 @@ h2_bulkfree_sync(hammer2_bulkfree_info_t *cbinfo)
 		}
 		if (live_chain == NULL) {
 			/*
-			 * XXX If we implement a full recovery mode we need
+			 * XXX if we implement a full recovery mode we need
 			 * to create/recreate missing freemap chains if our
 			 * bmap has any allocated blocks.
 			 */
@@ -1287,7 +1291,7 @@ h2_bulkfree_sync_adjust(hammer2_bulkfree_info_t *cbinfo, hammer2_off_t data_off,
 }
 
 /*
- * Bulkfree dedup heuristic
+ * BULKFREE DEDUP HEURISTIC
  *
  * WARNING! This code is SMP safe but the heuristic allows SMP collisions.
  *	    All fields must be loaded into locals and validated.

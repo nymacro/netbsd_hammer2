@@ -34,6 +34,16 @@
  * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  */
+/*
+ *			TRANSACTION AND FLUSH HANDLING
+ *
+ * Deceptively simple but actually fairly difficult to implement properly is
+ * how I would describe it.
+ *
+ * Flushing generally occurs bottom-up but requires a top-down scan to
+ * locate chains with MODIFIED and/or UPDATE bits set.  The ONFLUSH flag
+ * tells how to recurse downward to find these chains.
+ */
 
 #include "hammer2.h"
 
@@ -81,9 +91,23 @@ hammer2_trans_manage_init(hammer2_pfs_t *pmp)
  * Transaction support for any modifying operation.  Transactions are used
  * in the pmp layer by the frontend and in the spmp layer by the backend.
  *
+ * 0			- Normal transaction.  Interlocks against just the
+ *			  COPYQ portion of an ISFLUSH transaction.
+ *
  * TRANS_ISFLUSH	- Flush transaction.  Interlocks against other flush
  *			  transactions.
+ *
+ *			  When COPYQ is also specified, waits for the count
+ *			  to drop to 1.
+ *
  * TRANS_BUFCACHE	- Buffer cache transaction.  No interlock.
+ *
+ * TRANS_SIDEQ		- Run the sideq (only tested in trans_done())
+ *
+ * Initializing a new transaction allocates a transaction ID.  Typically
+ * passed a pmp (hmp passed as NULL), indicating a cluster transaction.  Can
+ * be passed a NULL pmp and non-NULL hmp to indicate a transaction on a single
+ * media target.  The latter mode is used by the recovery code.
  */
 /*
  * XXX trans_lock protects trans.flags.
@@ -298,7 +322,8 @@ hammer2_trans_newinum(hammer2_pfs_t *pmp)
 
 /*
  * Assert that a strategy call is ok here.  Currently we allow strategy
- * calls in all situations, including during flushes.
+ * calls in all situations, including during flushes.  Previously:
+ *	(old) (1) In a normal transaction.
  */
 void
 hammer2_trans_assert_strategy(hammer2_pfs_t *pmp)
@@ -462,7 +487,7 @@ hammer2_flush_core(hammer2_flush_info_t *info, hammer2_chain_t *chain,
 	int count, save_error, retry = 0;
 
 	/*
-	 * Optimize downward recursion to locate nodes needing action.
+	 * (1) Optimize downward recursion to locate nodes needing action.
 	 * Nothing to do if none of these flags are set.
 	 */
 	if ((chain->flags & HAMMER2_CHAIN_FLUSH_MASK) == 0)
@@ -648,6 +673,11 @@ hammer2_flush_core(hammer2_flush_info_t *info, hammer2_chain_t *chain,
 		    chain->parent == NULL);
 		atomic_clear_int(&chain->flags, HAMMER2_CHAIN_MODIFIED);
 		atomic_add_int(&hammer2_count_chain_modified, -1);
+
+		/*
+		 * Manage threads waiting for excessive dirty memory to
+		 * be retired.
+		 */
 		hammer2_pfs_memory_wakeup(chain->pmp, -1);
 
 #if 0
@@ -697,6 +727,7 @@ hammer2_flush_core(hammer2_flush_info_t *info, hammer2_chain_t *chain,
 			KKASSERT(hmp->vchain.flags & HAMMER2_CHAIN_MODIFIED);
 			KKASSERT(chain == &hmp->fchain);
 			hmp->voldata.freemap_tid = chain->bref.mirror_tid;
+			/* debug only, avoid syslogd loop */
 			debug_hprintf("sync freemap mirror_tid %016llx\n",
 			    (long long)chain->bref.mirror_tid);
 
@@ -728,6 +759,7 @@ hammer2_flush_core(hammer2_flush_info_t *info, hammer2_chain_t *chain,
 			hammer2_chain_lock(&hmp->fchain,
 			    HAMMER2_RESOLVE_ALWAYS);
 			hammer2_voldata_lock(hmp);
+			/* debug only, avoid syslogd loop */
 			debug_hprintf("sync volume mirror_tid %016llx\n",
 			    (long long)chain->bref.mirror_tid);
 
@@ -762,6 +794,7 @@ hammer2_flush_core(hammer2_flush_info_t *info, hammer2_chain_t *chain,
 			    hammer2_icrc32((char *)&hmp->voldata +
 			    HAMMER2_VOLUME_ICRCVH_OFF,
 			    HAMMER2_VOLUME_ICRCVH_SIZE);
+			/* debug only, avoid syslogd loop */
 			debug_hprintf("sync volhdr %016llx %016llx\n",
 			    (long long)hmp->voldata.mirror_tid,
 			    (long long)hmp->vchain.bref.mirror_tid);
@@ -817,12 +850,13 @@ hammer2_flush_core(hammer2_flush_info_t *info, hammer2_chain_t *chain,
 					ipdata->meta.pfs_inum =
 					    chain->pmp->inode_tid;
 			} else {
-				/* Can't be mounted as a PFS. */
+				/* can't be mounted as a PFS */
 			}
 			hammer2_chain_setcheck(chain, chain->data);
 			break;
 		default:
 			hpanic("bad blockref type %d", chain->bref.type);
+			/* NOT REACHED */
 			break;
 		}
 
@@ -889,8 +923,10 @@ hammer2_flush_core(hammer2_flush_info_t *info, hammer2_chain_t *chain,
 	    (flags & HAMMER2_FLUSH_FSSYNC) == 0 &&
 	    (flags & HAMMER2_FLUSH_ALL) == 0 &&
 	    chain->pmp && chain->pmp->mp) {
-		debug_hprintf("inum %016llx do not update parent, non-fssync\n",
+#ifdef HAMMER2_DEBUG_SYNC
+		kprintf("inum %016llx do not update parent, non-fssync\n",
 		    (long long)chain->bref.key);
+#endif
 		goto skipupdate;
 	}
 	if (chain->bref.type == HAMMER2_BREF_TYPE_INODE)
@@ -1344,7 +1380,7 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch, int clindex)
 	 * The flush code sets CHAIN_VOLUMESYNC to indicate that the
 	 * volume header needs synchronization via hmp->volsync.
 	 *
-	 * XXX synchronize the flag & data with only this flush
+	 * XXX synchronize the flag & data with only this flush XXX
 	 */
 	if (fsync_error == 0 && flush_error == 0 &&
 	    (hmp->vchain.flags & HAMMER2_CHAIN_VOLUMESYNC)) {
@@ -1365,6 +1401,7 @@ hammer2_xop_inode_flush(hammer2_xop_t *arg, void *scratch, int clindex)
 		if (j * HAMMER2_ZONE_BYTES64 + HAMMER2_SEGSIZE >
 		    hmp->volsync.volu_size)
 			j = 0;
+		/* debug only, avoid syslogd loop */
 		debug_hprintf("sync volhdr %d size %016llx\n",
 		    j, (long long)hmp->volsync.volu_size);
 

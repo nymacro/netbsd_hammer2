@@ -340,6 +340,17 @@ hammer2_init(void)
 {
 	hammer2_assert_clean();
 
+	/*
+	 * A large DIO cache is needed to retain dedup enablement masks.
+	 * The bulkfree code clears related masks as part of the disk block
+	 * recycling algorithm, preventing it from being used for a later
+	 * dedup.
+	 *
+	 * NOTE: A large buffer cache can actually interfere with dedup
+	 *	 operation because we dedup based on media physical buffers
+	 *	 and not logical buffers.  Try to make the DIO case large
+	 *	 enough to avoid this problem, but also cap it.
+	 */
 	hammer2_dio_limit = buf_nbuf() * 2;
 	if (hammer2_dio_limit > 100000 || hammer2_dio_limit < 0)
 		hammer2_dio_limit = 100000;
@@ -397,6 +408,15 @@ hammer2_done(void)
 /*
  * Core PFS allocator.  Used to allocate or reference the pmp structure
  * for PFS cluster mounts and the spmp structure for media (hmp) structures.
+ * The pmp can be passed in or loaded by this function using the chain and
+ * inode data.
+ *
+ * pmp->modify_tid tracks new modify_tid transaction ids for front-end
+ * transactions.  Note that synchronization does not use this field.
+ * (typically frontend operations and synchronization cannot run on the
+ * same PFS node at the same time).
+ *
+ * XXX check locking
  */
 hammer2_pfs_t *
 hammer2_pfsalloc(hammer2_chain_t *chain, const hammer2_inode_data_t *ripdata,
@@ -411,7 +431,7 @@ hammer2_pfsalloc(hammer2_chain_t *chain, const hammer2_inode_data_t *ripdata,
 	 * is NULL this is a spmp which is unique and is always allocated.
 	 *
 	 * If the device is mounted in local mode all PFSs are considered
-	 * independent and not part of any cluster.
+	 * independent and not part of any cluster (for debugging only).
 	 */
 	if (ripdata) {
 		TAILQ_FOREACH(pmp, &hammer2_pfslist, mntentry) {
@@ -449,6 +469,10 @@ hammer2_pfsalloc(hammer2_chain_t *chain, const hammer2_inode_data_t *ripdata,
 		    &pmp->ipdep_mask);
 		KKASSERT(HAMMER2_IHASH_SIZE == pmp->ipdep_mask + 1);
 
+		/*
+		 * Save the last media transaction id for the flusher.  Set
+		 * initial
+		 */
 		if (ripdata) {
 			pmp->pfs_clid = ripdata->meta.pfs_clid;
 			TAILQ_INSERT_TAIL(&hammer2_pfslist, pmp, mntentry);
@@ -458,7 +482,9 @@ hammer2_pfsalloc(hammer2_chain_t *chain, const hammer2_inode_data_t *ripdata,
 		}
 	}
 
-	/* Create the PFS's root inode. */
+	/*
+	 * Create the PFS's root inode and any missing XOP helper threads.
+	 */
 	if ((iroot = pmp->iroot) == NULL) {
 		iroot = hammer2_inode_get(pmp, NULL, 1, -1);
 		if (ripdata)
@@ -474,7 +500,8 @@ hammer2_pfsalloc(hammer2_chain_t *chain, const hammer2_inode_data_t *ripdata,
 
 	/*
 	 * When a chain is passed in we must add it to the PFS's root
-	 * inode, update pmp->pfs_types[].
+	 * inode, update pmp->pfs_types[], and update the syncronization
+	 * threads.
 	 *
 	 * When forcing local mode, mark the PFS as a MASTER regardless.
 	 *
@@ -584,6 +611,7 @@ hammer2_pfsfree(hammer2_pfs_t *pmp)
 		KASSERTMSG(iroot->refs == 1,
 		    "iroot inum %016llx refs %d not 1",
 		    (long long)iroot->meta.inum, iroot->refs);
+		/* ref for iroot */
 		hammer2_inode_drop(iroot);
 		pmp->iroot = NULL;
 	}
@@ -612,6 +640,8 @@ hammer2_pfsfree(hammer2_pfs_t *pmp)
 /*
  * Remove all references to hmp from the pfs list.  Any PFS which becomes
  * empty is terminated and freed.
+ *
+ * XXX inefficient.
  */
 static void
 hammer2_pfsfree_scan(hammer2_dev_t *hmp, int which)
@@ -631,7 +661,14 @@ again:
 		if ((iroot = pmp->iroot) == NULL)
 			continue;
 
-		/* Determine if this PFS is affected. */
+		/*
+		 * Determine if this PFS is affected.  If it is we must
+		 * freeze all management threads and lock its iroot.
+		 *
+		 * Freezing a management thread forces it idle, operations
+		 * in-progress will be aborted and it will have to start
+		 * over again when unfrozen, or exit if told to exit.
+		 */
 		for (i = 0; i < HAMMER2_MAXCLUSTER; ++i)
 			if (pmp->pfs_hmps[i] == hmp)
 				break;
@@ -646,6 +683,9 @@ again:
 		 * here because that would attempt to validate the
 		 * cluster that we are in the middle of ripping
 		 * apart.
+		 *
+		 * WARNING! We are working directly on the inodes
+		 *	    embedded cluster.
 		 */
 		hammer2_mtx_ex(&iroot->lock);
 
@@ -676,7 +716,10 @@ again:
 				break;
 		iroot->cluster.nchains = i + 1;
 
-		/* If the PMP has no elements remaining we can destroy it. */
+		/*
+		 * If the PMP has no elements remaining we can destroy it.
+		 * (this will transition management threads from frozen->exit).
+		 */
 		if (iroot->cluster.nchains == 0) {
 			/*
 			 * If this was the hmp's spmp, we need to clean
@@ -696,7 +739,24 @@ again:
 }
 
 /*
- * Mount or remount HAMMER2 fileystem from physical media.
+ * Mount or remount HAMMER2 fileystem from physical media
+ *
+ *	mountroot
+ *		mp		mount point structure
+ *		path		NULL
+ *		data		<unused>
+ *		cred		<unused>
+ *
+ *	mount
+ *		mp		mount point structure
+ *		path		path to mount point
+ *		data		pointer to argument structure in user space
+ *			volume	volume path (device@LABEL form)
+ *			hflags	user mount flags
+ *		cred		user credentials
+ *
+ * RETURNS:	0	Success
+ *		!0	error number
  */
 static int
 hammer2_mount(struct mount *mp, const char *path, void *data, size_t *data_len)
@@ -747,6 +807,9 @@ hammer2_mount(struct mount *mp, const char *path, void *data, size_t *data_len)
 		 * Update mount.  Note that pmp->iroot->cluster is
 		 * an inode-embedded cluster and thus cannot be
 		 * directly locked.
+		 *
+		 * XXX HAMMER2 needs to implement NFS export via
+		 *     mountctl.
 		 */
 		error = 0;
 		pmp = MPTOPMP(mp);
@@ -803,13 +866,14 @@ hammer2_mount(struct mount *mp, const char *path, void *data, size_t *data_len)
 	debug_hprintf("devstr \"%s\" mntpt \"%s\"\n", devstr, "<userspace>");
 
 	/*
-	 * Extract device and label, automatically mount @DATA if no label
-	 * specified.  Error out if no label or device is specified.  This is
+	 * Extract device and label, automatically mount @BOOT, @ROOT, or @DATA
+	 * if no label specified, based on the partition id.  Error out if no
+	 * label or device (with partition id) is specified.  This is strictly
 	 * a convenience to match the default label created by newfs_hammer2,
 	 * our preference is that a label always be specified.
 	 *
 	 * NOTE: We allow 'mount @LABEL <blah>'... that is, a mount command
-	 *	 that does not specify a device, as long as some HAMMER2 label
+	 *	 that does not specify a device, as long as some H2 label
 	 *	 has already been mounted from that device.  This makes
 	 *	 mounting snapshots a lot easier.
 	 */
@@ -864,7 +928,7 @@ hammer2_mount(struct mount *mp, const char *path, void *data, size_t *data_len)
 	/*
 	 * Determine if the device has already been mounted.  After this
 	 * check hmp will be non-NULL if we are doing the second or more
-	 * HAMMER2 mounts from the same device.
+	 * hammer2 mounts from the same device.
 	 */
 	hammer2_lk_ex(&hammer2_mntlk);
 	if (!TAILQ_EMPTY(&devvpl)) {
@@ -932,8 +996,8 @@ next_hmp:
 	}
 
 	/*
-	 * Open the device if this isn't a secondary mount and construct the
-	 * HAMMER2 device mount (hmp).
+	 * Open the device if this isn't a secondary mount and construct
+	 * the H2 device mount (hmp).
 	 */
 	if (hmp == NULL) {
 			/* Now open the device(s) unless this is a root mount. */
@@ -1058,16 +1122,16 @@ next_hmp:
 		 */
 
 		/*
-		 * Really important to get these right or teardown code
-		 * will get confused.
+		 * Really important to get these right or the flush and
+		 * teardown code will get confused.
 		 */
 		hmp->spmp = hammer2_pfsalloc(NULL, NULL, hmp);
 		spmp = hmp->spmp;
 		spmp->pfs_hmps[0] = hmp;
 
 		/*
-		 * Dummy-up vchain and fchain's modify_tid.
-		 * mirror_tid is inherited from the volume header.
+		 * Dummy-up vchain and fchain's modify_tid.  mirror_tid
+		 * is inherited from the volume header.
 		 */
 		hmp->vchain.bref.mirror_tid = hmp->voldata.mirror_tid;
 		hmp->vchain.bref.modify_tid = hmp->vchain.bref.mirror_tid;
@@ -1140,9 +1204,10 @@ next_hmp:
 		hammer2_inode_unlock(spmp->iroot);
 		hammer2_chain_unlock(schain);
 		hammer2_chain_drop(schain);
-		schain = NULL;
+		/* do not call hammer2_cluster_drop() on an embedded cluster */
+		schain = NULL;	/* now invalid */
 		pool_put(&hammer2_pool_xops, xop);
-		/* Leave spmp->iroot with one ref. */
+		/* leave spmp->iroot with one ref */
 #ifdef HAMMER2_INVARIANTS
 		/*
 		 * XXX rwlock(9) says "Callers must not recursively acquire
@@ -1224,7 +1289,10 @@ next_hmp:
 		}
 	}
 
-	/* Acquire the pmp structure. */
+	/*
+	 * Acquire the pmp structure (it should have already been allocated
+	 * via hammer2_update_pmps()).
+	 */
 	if (chain->error) {
 		hprintf("PFS label \"%s\" chain error %08x\n",
 		    label, chain->error);
@@ -1244,6 +1312,11 @@ next_hmp:
 		return (EINVAL);
 	}
 
+	/*
+	 * Finish the mount
+	 */
+
+	/* Check if the pmp has already been mounted. */
 	if (pmp->mp) {
 		hprintf("PFS already mounted!\n");
 		hammer2_unmount_helper(mp, NULL, hmp);
@@ -1274,7 +1347,9 @@ next_hmp:
 	mp->mnt_dev_bshift = DEV_BSHIFT;
 	mp->mnt_fs_bshift = HAMMER2_PBUFRADIX;
 
-	/* Required mount structure initializations. */
+	/*
+	 * required mount structure initializations
+	 */
 	mp->mnt_stat.f_iosize = HAMMER2_PBUFSIZE;
 	mp->mnt_stat.f_bsize = HAMMER2_PBUFSIZE;
 
@@ -1504,7 +1579,7 @@ hammer2_mount_helper(struct mount *mp, hammer2_pfs_t *pmp)
 	mp->mnt_data = (qaddr_t)pmp;
 	pmp->mp = mp;
 
-	/* After pmp->mp is set adjust hmp->mount_count. */
+	/* After pmp->mp is set we have to adjust hmp->mount_count. */
 	cluster = &pmp->iroot->cluster;
 	for (i = 0; i < cluster->nchains; ++i) {
 		rchain = cluster->array[i].chain;
@@ -1557,7 +1632,7 @@ hammer2_unmount_helper(struct mount *mp, hammer2_pfs_t *pmp, hammer2_dev_t *hmp)
 			if (rchain == NULL)
 				continue;
 			--rchain->hmp->mount_count;
-			/* Scrapping hmp now may invalidate the pmp. */
+			/* scrapping hmp now may invalidate the pmp */
 		}
 again:
 		TAILQ_FOREACH(hmp, &hammer2_mntlist, mntentry) {
@@ -1667,11 +1742,19 @@ again:
 	}
 #endif
 	/*
-	 * Final drop of embedded volume/freemap root chain to clean up
-	 * [vf]chain.core ([vf]chain structure is not flagged ALLOCATED so
-	 * it is cleaned out and then left to rot).
+	 * Final drop of embedded volume root chain to clean
+	 * up vchain.core (vchain structure is not flagged
+	 * ALLOCATED so it is cleaned out and then left to
+	 * rot).
 	 */
 	hammer2_chain_drop(&hmp->vchain);
+
+	/*
+	 * Final drop of embedded freemap root chain to
+	 * clean up fchain.core (fchain structure is not
+	 * flagged ALLOCATED so it is cleaned out and then
+	 * left to rot).
+	 */
 	hammer2_chain_drop(&hmp->fchain);
 
 	hammer2_mtx_ex(&hmp->iohash_lock);
@@ -2036,6 +2119,15 @@ hammer2_sync(struct mount *mp, int waitfor, kauth_cred_t cred)
 	return (hammer2_vfs_sync_pmp(MPTOPMP(mp), waitfor));
 }
 
+/*
+ * Because frontend operations lock vnodes before we get a chance to
+ * lock the related inode, we can't just acquire a vnode lock without
+ * risking a deadlock.  The frontend may be holding a vnode lock while
+ * also blocked on our SYNCQ flag while trying to get the inode lock.
+ *
+ * To deal with this situation we can check the vnode lock situation
+ * after locking the inode and perform a work-around.
+ */
 int
 hammer2_vfs_sync_pmp(hammer2_pfs_t *pmp, int waitfor __unused)
 {
@@ -2066,7 +2158,9 @@ hammer2_vfs_sync_pmp(hammer2_pfs_t *pmp, int waitfor __unused)
 	 * inode_depend() are atomic with the spin-lock.
 	 */
 	hammer2_trans_init(pmp, HAMMER2_TRANS_ISFLUSH);
-	debug_hprintf("FILESYSTEM SYNC BOUNDARY\n");
+#ifdef HAMMER2_DEBUG_SYNC
+	kprintf("FILESYSTEM SYNC BOUNDARY\n");
+#endif
 	dorestart = 0;
 	syndel_loops = 0;
 
@@ -2075,7 +2169,9 @@ hammer2_vfs_sync_pmp(hammer2_pfs_t *pmp, int waitfor __unused)
 	 * depend structures.
 	 */
 restart:
-	debug_hprintf("FILESYSTEM SYNC RESTART (%d)\n", dorestart);
+#ifdef HAMMER2_DEBUG_SYNC
+	kprintf("FILESYSTEM SYNC RESTART (%d)\n", dorestart);
+#endif
 	hammer2_trans_setflags(pmp, 0);
 	hammer2_trans_clearflags(pmp, HAMMER2_TRANS_RESCAN);
 
@@ -2196,8 +2292,10 @@ restart:
 				vrele(vp);
 				vp = NULL;
 				dorestart |= 1;
-				debug_hprintf("inum %016llx vn_lock failed\n",
+#ifdef HAMMER2_DEBUG_SYNC
+				kprintf("inum %016llx vn_lock failed\n",
 				    (long long)ip->meta.inum);
+#endif
 				hammer2_mtx_ex(&ip->lock);
 				hammer2_inode_delayed_sideq(ip);
 				hammer2_mtx_unlock(&ip->lock);
@@ -2252,9 +2350,17 @@ restart:
 		}
 
 		/*
-		 * Ok we have the inode exclusively locked and if vp_held
-		 * the vnode is also exclusively locked and referenced.
-		 * Do the meat of the flush.
+		 * Ok we have the inode exclusively locked and if vp is
+		 * not NULL that will also be exclusively locked.  Do the
+		 * meat of the flush.
+		 *
+		 * vp token needed for v_rbdirty_tree check / vclrisdirty
+		 * sequencing.  Though we hold the vnode exclusively so
+		 * we shouldn't need to hold the token also in this case.
+		 *
+		 * NOTE: this port keeps vp and vp_held separate; a non-NULL
+		 *	 vp may be an unreferenced (inactivated, LRU) vnode,
+		 *	 in which case only the chain flush below runs.
 		 */
 		if (vp_held) {
 			hammer2_mtx_unlock(&ip->lock); /* XXX iplock */
@@ -2276,12 +2382,16 @@ restart:
 		 * update the parent.
 		 */
 		if (ip->flags & HAMMER2_INODE_DELETING) {
-			debug_hprintf("inum %016llx destroy\n",
+#ifdef HAMMER2_DEBUG_SYNC
+			kprintf("inum %016llx destroy\n",
 			    (long long)ip->meta.inum);
+#endif
 			hammer2_inode_chain_des(ip);
 		} else if (ip->flags & HAMMER2_INODE_CREATING) {
-			debug_hprintf("inum %016llx insert\n",
+#ifdef HAMMER2_DEBUG_SYNC
+			kprintf("inum %016llx insert\n",
 			    (long long)ip->meta.inum);
+#endif
 			hammer2_inode_chain_ins(ip);
 		}
 
@@ -2300,8 +2410,10 @@ restart:
 		 * XXX at the moment this will likely result in a double-flush
 		 * of the iroot chain.
 		 */
-		debug_hprintf("inum %016llx pinum %016llx chain-sync\n",
+#ifdef HAMMER2_DEBUG_SYNC
+		kprintf("inum %016llx pinum %016llx chain-sync\n",
 		    (long long)ip->meta.inum, (long long)ip->meta.iparent);
+#endif
 		hammer2_inode_chain_sync(ip);
 
 		if (ip == pmp->iroot)
@@ -2358,12 +2470,12 @@ restart:
 		 * looping too hard, try to unclog the frontend
 		 * dependency and wait a bit before restarting.
 		 *
-		 * NOTE: A frontend waiting in hammer2_pfs_memory_wait()
-		 *	 must NOT hold any vnode lock (this port invokes
-		 *	 the wait at the strategy-write entry and at
-		 *	 pre-lock ioctl points only).  Otherwise this
-		 *	 vn_lock(LK_NOWAIT) restart loop can livelock
-		 *	 against that frontend.
+		 * NOTE: The frontend could be stuck in h2memw, though
+		 *	 it isn't supposed to be holding vnode locks
+		 *	 in that case.  This port invokes the wait at the
+		 *	 strategy-write entry and at pre-lock ioctl points
+		 *	 only; otherwise this vn_lock(LK_NOWAIT) restart
+		 *	 loop can livelock against that frontend.
 		 */
 		if (dorestart & 2) {
 			tsleep(&dorestart, 0, "h2syndel", 2);
@@ -2377,13 +2489,17 @@ restart:
 				syndel_loops = 0;
 			}
 		}
-		debug_hprintf("FILESYSTEM SYNC STAGE 1 RESTART\n");
+#ifdef HAMMER2_DEBUG_SYNC
+		kprintf("FILESYSTEM SYNC STAGE 1 RESTART\n");
 		/*tsleep(&dorestart, 0, "h2STG1-R", hz*20);*/
+#endif
 		dorestart = 1;
 		goto restart;
 	}
-	debug_hprintf("FILESYSTEM SYNC STAGE 2 BEGIN\n");
+#ifdef HAMMER2_DEBUG_SYNC
+	kprintf("FILESYSTEM SYNC STAGE 2 BEGIN\n");
 	/*tsleep(&dorestart, 0, "h2STG2", hz*20);*/
+#endif
 
 	/*
 	 * We have to flush the PFS root last, even if it does not appear to
@@ -2403,7 +2519,9 @@ restart:
 		    HAMMER2_XOP_VOLHDR);
 		hammer2_inode_unlock(ip); /* unlock+drop */
 	}
-	debug_hprintf("FILESYSTEM SYNC STAGE 2 DONE\n");
+#ifdef HAMMER2_DEBUG_SYNC
+	kprintf("FILESYSTEM SYNC STAGE 2 DONE\n");
+#endif
 
 	error = 0; /* XXX */
 	hammer2_trans_done(pmp, HAMMER2_TRANS_ISFLUSH);
@@ -2434,6 +2552,10 @@ hammer2_pfs_memory_inc(hammer2_pfs_t *pmp)
 		atomic_add_int(&pmp->inmem_dirty_chains, 1);
 }
 
+/*
+ * Wake up any stalled frontend ops waiting, with hysteresis, using
+ * 2/3 of the limit.
+ */
 void
 hammer2_pfs_memory_wakeup(hammer2_pfs_t *pmp, int count)
 {
@@ -2455,6 +2577,10 @@ hammer2_pfs_memory_wakeup(hammer2_pfs_t *pmp, int count)
 	}
 }
 
+/*
+ * Initiate an asynchronous filesystem sync and, with hysteresis,
+ * stall if the internal data structure count becomes too bloated.
+ */
 void
 hammer2_pfs_memory_wait(hammer2_pfs_t *pmp)
 {
@@ -2479,7 +2605,7 @@ hammer2_pfs_memory_wait(hammer2_pfs_t *pmp)
 		/*
 		 * Stall at the limit waiting for the counts to drop.
 		 * This code will typically be woken up once the count
-		 * drops below 2/3 the limit, or in one second.
+		 * drops below 3/4 the limit, or in one second.
 		 */
 		if (waiting < hammer2_limit_dirty_chains &&
 		    pmp->sideq_count < hammer2_limit_dirty_inodes)
@@ -2518,8 +2644,14 @@ hammer2_pfs_memory_wait(hammer2_pfs_t *pmp)
 }
 
 /*
- * This handles hysteresis on regular file flushes, controlling the
- * write pipe of in-flight logical writes.
+ * This handles hysteresis on regular file flushes.  Because the BIOs are
+ * routed to a thread it is possible for an excessive number to build up
+ * and cause long front-end stalls long before the runningbuffspace limit
+ * is hit, so we implement hammer2_flush_pipe to control the
+ * hysteresis.
+ *
+ * This is a particular problem when compression is used.  This port
+ * controls the write pipe of in-flight logical writes.
  */
 void
 hammer2_lwinprog_ref(hammer2_pfs_t *pmp)
@@ -2705,15 +2837,18 @@ hammer2_root(struct mount *mp, int lktype, struct vnode **vpp)
 			pmp->iroot->meta = *meta;
 			pmp->inode_tid = meta->pfs_inum + 1;
 			hammer2_xop_pdata(&xop->head);
+			/* meta invalid */
 
 			if (pmp->inode_tid < HAMMER2_INODE_START)
 				pmp->inode_tid = HAMMER2_INODE_START;
 			pmp->modify_tid =
 			    xop->head.cluster.focus->bref.modify_tid + 1;
-			debug_hprintf("PFS nextino %016llx mod %016llx\n",
-			    (long long)pmp->inode_tid,
-			    (long long)pmp->modify_tid);
-
+#if 0
+			kprintf("PFS: Starting inode %jd\n",
+				(intmax_t)pmp->inode_tid);
+			kprintf("PMP focus good set nextino=%ld mod=%016jx\n",
+				pmp->inode_tid, pmp->modify_tid);
+#endif
 			wakeup(&pmp->iroot);
 			hammer2_xop_retire(&xop->head, HAMMER2_XOPMASK_VOP);
 
@@ -2742,9 +2877,17 @@ hammer2_root(struct mount *mp, int lktype, struct vnode **vpp)
 	return (error);
 }
 
+/*
+ * Filesystem status
+ *
+ * XXX incorporate ipdata->meta.inode_quota and data_quota
+ */
 static int
 hammer2_statvfs(struct mount *mp, struct statvfs *sbp)
 {
+	/*
+	 * NOTE: iroot might not have validated the cluster yet.
+	 */
 	hammer2_pfs_t *pmp = MPTOPMP(mp);
 	hammer2_dev_t *hmp;
 	hammer2_blockref_t bref;
@@ -2892,8 +3035,8 @@ hammer2_voldata_unlock(hammer2_dev_t *hmp)
 }
 
 /*
- * Caller indicates that the volume header is being modified.
- * Flag the related chain and adjust its transaction id.
+ * Caller indicates that the volume header is being modified.  Flag
+ * the related chain and adjust its transaction id.
  *
  * The transaction id is set to voldata.mirror_tid + 1, similar to
  * what hammer2_chain_modify() does.  Be very careful here, volume
@@ -2910,8 +3053,8 @@ hammer2_voldata_modify(hammer2_dev_t *hmp)
 }
 
 /*
- * Returns 0 if the filesystem has tons of free space.
- * Returns 1 if the filesystem has less than 10% remaining.
+ * Returns 0 if the filesystem has tons of free space
+ * Returns 1 if the filesystem has less than 10% remaining
  * Returns 2 if the filesystem has less than 2%/5% (user/root) remaining.
  */
 int
@@ -2974,6 +3117,9 @@ static const struct vnodeopv_desc * const hammer2_vnodeopv_descs[] = {
 	NULL,
 };
 
+/*
+ * HAMMER2 vfs operations.
+ */
 static struct vfsops hammer2_vfsops = {
 	.vfs_name = MOUNT_HAMMER2,
 	.vfs_min_mount_data = sizeof(struct hammer2_mount_info),

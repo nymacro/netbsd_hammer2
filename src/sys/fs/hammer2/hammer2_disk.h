@@ -1052,6 +1052,13 @@ struct hammer2_volume_data {
 
 	hammer2_off_t	total_size;		/* 00C0 Total volume size, bytes */
 
+	/*
+	 * Copyids are allocated dynamically from the copyexists bitmap.
+	 * An id from the active copies set (up to 8, see copyinfo later on)
+	 * may still exist after the copy set has been removed from the
+	 * volume header and its bit will remain active in the bitmap and
+	 * cannot be reused until it is 100% removed from the hierarchy.
+	 */
 	uint32_t	copyexists[8];		/* 00C8-00E7 unused */
 	char		reserved00E8[248];	/* 00E8-01DF */
 
@@ -1156,6 +1163,9 @@ union hammer2_media_data {
 
 typedef union hammer2_media_data hammer2_media_data_t;
 
+/*
+ * Catch programmer snafus
+ */
 _Static_assert((1 << HAMMER2_SET_RADIX) == HAMMER2_SET_COUNT,
     "hammer2 direct radix is incorrect");
 _Static_assert((1 << HAMMER2_PBUFRADIX) == HAMMER2_PBUFSIZE,

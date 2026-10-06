@@ -181,8 +181,9 @@ hammer2_lkc_wakeup(hammer2_lkc_t *c)
 }
 
 /*
- * Mutex and spinlock shims.
- * Normal synchronous non-abortable locks can be substituted for spinlocks.
+ * Mutex and lock shims.  Hammer2 requires support for asynchronous and
+ * abortable locks, and both exclusive and shared spinlocks.  Normal
+ * synchronous non-abortable locks can be substituted for spinlocks.
  * NetBSD HAMMER2 currently uses rwlock(9) for both mtx and spinlock.
  */
 struct krwlock_t_wrapper {
@@ -393,10 +394,12 @@ hammer2_spin_assert_unlocked(hammer2_spin_t *p)
 #define hammer2_spin_assert_unlocked(p)	do {} while (0)
 #endif
 
+#ifdef MALLOC_DECLARE
 MALLOC_DECLARE(M_HAMMER2);
 MALLOC_DECLARE(M_HAMMER2_RBUF);
 MALLOC_DECLARE(M_HAMMER2_WBUF);
 MALLOC_DECLARE(M_HAMMER2_LZ4);
+#endif
 MALLOC_DECLARE(M_TEMP); /* nonexistent in sys/sys/malloc.h */
 extern struct pool hammer2_pool_inode;
 extern struct pool hammer2_pool_xops;

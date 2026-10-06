@@ -34,6 +34,26 @@
  * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  */
+/*
+ * This subsystem implements most of the core support functions for
+ * the hammer2_chain structure.
+ *
+ * Chains are the in-memory version on media objects (volume header, inodes,
+ * indirect blocks, data blocks, etc).  Chains represent a portion of the
+ * HAMMER2 topology.
+ *
+ * Chains are no-longer delete-duplicated.  Instead, the original in-memory
+ * chain will be moved along with its block reference (e.g. for things like
+ * renames, hardlink operations, modifications, etc), and will be indexed
+ * on a secondary list for flush handling instead of propagating a flag
+ * upward to the root.
+ *
+ * Concurrent front-end operations can still run against backend flushes
+ * as long as they do not cross the current flush boundary.  An operation
+ * running above the current flush (in areas not yet flushed) can become
+ * part of the current flush while ano peration running below the current
+ * flush can become part of the next flush.
+ */
 
 #include "hammer2.h"
 #include "hammer2_mount.h"
@@ -53,7 +73,7 @@ static void hammer2_chain_load_data(hammer2_chain_t *);
 static int hammer2_chain_testcheck(hammer2_chain_t *, void *);
 
 /*
- * Basic RBTree for chains.
+ * Basic RBTree for chains (core.rbtree).
  */
 int
 hammer2_chain_cmp(const hammer2_chain_t *chain1, const hammer2_chain_t *chain2)
@@ -79,6 +99,11 @@ hammer2_chain_cmp(const hammer2_chain_t *chain1, const hammer2_chain_t *chain2)
 RB_GENERATE(hammer2_chain_tree, hammer2_chain, rbnode, hammer2_chain_cmp);
 RB_GENERATE_SCAN(hammer2_chain_tree, hammer2_chain, rbnode);
 
+/*
+ * There are many degenerate situations where an extreme rate of console
+ * output can occur from warnings and errors.  Make sure this output does
+ * not impede operations.
+ */
 static struct krate krate_h2chk = { .freq = 5 };
 static struct krate krate_h2me = { .freq = 1 };
 static struct krate krate_h2em = { .freq = 1 };
@@ -136,7 +161,10 @@ hammer2_chain_setflush(hammer2_chain_t *chain)
  * bref.  chain->refs is set to 1 and the passed bref is copied to
  * chain->bref.  chain->bytes is derived from the bref.
  *
- * Returns a referenced but unlocked (because there is no core) chain.
+ * chain->pmp inherits pmp unless the chain is an inode (other than the
+ * super-root inode).
+ *
+ * NOTE: Returns a referenced but unlocked (because there is no core) chain.
  */
 static hammer2_chain_t *
 hammer2_chain_alloc(hammer2_dev_t *hmp, hammer2_pfs_t *pmp,
@@ -225,8 +253,9 @@ hammer2_chain_init(hammer2_chain_t *chain)
 
 /*
  * Add a reference to a chain element, preventing its destruction.
- * Undone via hammer2_chain_drop().
- * Can be called with spinlock held.
+ * Undone via hammer2_chain_drop()
+ *
+ * (can be called with spinlock held)
  */
 void
 hammer2_chain_ref(hammer2_chain_t *chain)
@@ -326,11 +355,11 @@ hammer2_chain_drop(hammer2_chain_t *chain)
 		if (refs == 1) {
 			if (hammer2_mtx_ex_try(&chain->lock) == 0)
 				chain = hammer2_chain_lastdrop(chain, 0);
-			/* Retry the same chain, or chain from lastdrop. */
+			/* retry the same chain, or chain from lastdrop */
 		} else {
 			if (atomic_cmpset_int(&chain->refs, refs, refs - 1))
 				break;
-			/* Retry the same chain. */
+			/* retry the same chain */
 		}
 		cpu_pause();
 	}
@@ -377,6 +406,8 @@ hammer2_chain_unhold(hammer2_chain_t *chain)
 			 * the gap inbetween the 1->0 transition and the
 			 * final unlock.  We cannot safely block on the
 			 * mutex because lockcnt might go above 1.
+			 *
+			 * XXX Sleep for one tick if it takes too long.
 			 */
 			if (++iter > 1000) {
 				if (iter > 1000 + hz) {
@@ -410,8 +441,8 @@ hammer2_chain_rehold(hammer2_chain_t *chain)
  * the mutex exclusively locked, refs == 1, and lockcnt 0.  SMP races are
  * possible against refs and lockcnt.  We must dispose of the mutex on chain.
  *
- * This function returns an unlocked chain for recursive drop or NULL.
- * It can return the same chain if it determines it has raced another ref.
+ * This function returns an unlocked chain for recursive drop or NULL.  It
+ * can return the same chain if it determines it has raced another ref.
  *
  * --
  * When two chains need to be recursively dropped we use the chain we
@@ -543,8 +574,8 @@ hammer2_chain_lastdrop(hammer2_chain_t *chain, int depth)
 		}
 		return (chain);
 	}
-	/* Spinlock still held. */
-	/* No chains left under us. */
+	/* spinlock still held */
+	/* no chains left under us */
 
 	/*
 	 * chain->core has no children left so no accessors can get to our
@@ -566,8 +597,8 @@ hammer2_chain_lastdrop(hammer2_chain_t *chain, int depth)
 	 * On success determine if we should dispose of the chain
 	 * (remove the chain from its parent, etc).
 	 *
-	 * Normal core locks are top-down recursive but we define
-	 * core spinlocks as bottom-up recursive, so this is safe.
+	 * (normal core locks are top-down recursive but we define
+	 * core spinlocks as bottom-up recursive, so this is safe).
 	 */
 	if (parent) {
 		hammer2_spin_ex(&parent->core.spin);
@@ -613,6 +644,7 @@ hammer2_chain_lastdrop(hammer2_chain_t *chain, int depth)
 		}
 		hammer2_spin_unex(&parent->core.spin);
 		parent = NULL; /* safety */
+		/* FALL THROUGH */
 	} else {
 		/* No-parent case. */
 		if (atomic_cmpset_int(&chain->refs, 1, 0) == 0) {
@@ -720,8 +752,8 @@ hammer2_chain_drop_data(hammer2_chain_t *chain)
  * HAMMER2_RESOLVE_SHARED- (flag) The chain is locked shared, otherwise
  *			   it will be locked exclusive.
  *
- * HAMMER2_RESOLVE_NONBLOCK- (flag) The chain is locked non-blocking.
- *			   If the lock fails, EAGAIN is returned.
+ * HAMMER2_RESOLVE_NONBLOCK- (flag) The chain is locked non-blocking.  If
+ *			   the lock fails, EAGAIN is returned.
  *
  * NOTE: Embedded elements (volume header, inodes) are always resolved
  *	 regardless.
@@ -730,7 +762,7 @@ hammer2_chain_drop_data(hammer2_chain_t *chain)
  *	 element will instantiate and zero its buffer, and flush it on
  *	 release.
  *
- * NOTE: (data) elements are normally locked RESOLVE_MAYBE
+ * NOTE: (data) elements are normally locked RESOLVE_NEVER or RESOLVE_MAYBE
  *	 so as not to instantiate a device buffer, which could alias against
  *	 a logical file buffer.  However, if ALWAYS is specified the
  *	 device buffer will be instantiated anyway.
@@ -740,7 +772,11 @@ hammer2_chain_drop_data(hammer2_chain_t *chain)
  *
  * WARNING! This function blocks on I/O if data needs to be fetched.  This
  *	    blocking can run concurrent with other compatible lock holders
- *	    who do not need data returning.
+ *	    who do not need data returning.  The lock is not upgraded to
+ *	    exclusive during a data fetch, a separate bit is used to
+ *	    interlock I/O.  However, an exclusive lock holder can still count
+ *	    on being interlocked against an I/O fetch managed by a shared
+ *	    lock holder.
  */
 int
 hammer2_chain_lock(hammer2_chain_t *chain, int how)
@@ -811,7 +847,7 @@ hammer2_chain_lock(hammer2_chain_t *chain, int how)
 	/*
 	 * Do we have to resolve the data?  This is generally only
 	 * applicable to HAMMER2_BREF_TYPE_DATA which is special-cased.
-	 * Other bref types expects the data to be there.
+	 * Other BREF types expects the data to be there.
 	 */
 	switch (how & HAMMER2_RESOLVE_MASK) {
 	case HAMMER2_RESOLVE_NEVER:
@@ -899,6 +935,13 @@ again:
 		goto done;
 
 	/*
+	 * We must resolve to a device buffer, either by issuing I/O or
+	 * by creating a zero-fill element.  We do not mark the buffer
+	 * dirty when creating a zero-fill element (the hammer2_chain_modify()
+	 * API must still be used to do that).
+	 */
+
+	/*
 	 * The getblk() optimization can only be used on newly created
 	 * elements if the physical block size matches the request.
 	 */
@@ -925,17 +968,18 @@ again:
 	 * if I/O was actually issued for the read.  TESTEDGOOD will work
 	 * pretty well without the B_IOISSUED logic because chains are
 	 * cached, but in that situation (without B_IOISSUED) it will not
-	 * detect whether a re-read via I/O is corrupted versus the
-	 * original read.
+	 * detect whether a re-read via I/O is corrupted verses the original
+	 * read.
 	 *
 	 * We can't re-run the CRC on every fresh lock.  That would be
 	 * insanely expensive.
 	 *
 	 * If the underlying kernel buffer covers the entire chain we can
-	 * use the B_IOISSUED indication (set by spec_strategy(9) when I/O
-	 * is dispatched) to determine if we have to re-run the CRC on
-	 * chain data for chains that managed to stay cached across the
-	 * kernel disposal of the original buffer.
+	 * use the B_IOISSUED indication to determine if we have to re-run
+	 * the CRC on chain data for chains that managed to stay cached
+	 * across the kernel disposal of the original buffer.  (In this
+	 * kernel B_IOISSUED is set by spec_strategy(9) when I/O is
+	 * dispatched.)
 	 */
 	{
 		hammer2_io_t *dio;
@@ -973,7 +1017,7 @@ again:
 		atomic_set_int(&chain->flags, HAMMER2_CHAIN_NOTTESTED);
 	} else if (chain->flags & HAMMER2_CHAIN_MODIFIED) {
 		/*
-		 * Check data not currently synchronized due to
+		 * check data not currently synchronized due to
 		 * modification.  XXX assumes data stays in the buffer
 		 * cache, which might not be true (need biodep on flush
 		 * to calculate crc?  or simple crc?).
@@ -985,7 +1029,11 @@ again:
 			atomic_set_int(&chain->flags, HAMMER2_CHAIN_TESTEDGOOD);
 	}
 
-	/* Setup the data pointer by pointing it into the buffer. */
+	/*
+	 * Setup the data pointer by pointing it into the buffer.
+	 * WARNING! Other threads can start using the data the instant we
+	 *	    set chain->data non-NULL.
+	 */
 	switch (bref->type) {
 	case HAMMER2_BREF_TYPE_VOLUME:
 	case HAMMER2_BREF_TYPE_FREEMAP:
@@ -1048,7 +1096,7 @@ hammer2_chain_unlock(hammer2_chain_t *chain)
 				return;
 			}
 		} else if (hammer2_mtx_upgrade_try(&chain->lock) == 0) {
-			/* While holding the mutex exclusively. */
+			/* while holding the mutex exclusively */
 			if (atomic_cmpset_int(&chain->lockcnt, 1, 0))
 				break;
 		} else {
@@ -1057,6 +1105,8 @@ hammer2_chain_unlock(hammer2_chain_t *chain)
 			 * the gap inbetween the 1->0 transition and the
 			 * final unlock.  We cannot safely block on the
 			 * mutex because lockcnt might go above 1.
+			 *
+			 * XXX Sleep for one tick if it takes too long.
 			 */
 			if (++iter > 1000) {
 				if (iter > 1000 + hz) {
@@ -1438,7 +1488,7 @@ hammer2_chain_modify(hammer2_chain_t *chain, hammer2_tid_t mtid,
 	 *
 	 * NOTE: Only applicable when chain->bytes != 0.
 	 *
-	 * XXX Can a chain already be marked MODIFIED without a data
+	 * XXX can a chain already be marked MODIFIED without a data
 	 * assignment?  If not, assert here instead of testing the case.
 	 */
 	if (chain != &hmp->vchain && chain != &hmp->fchain && chain->bytes) {
@@ -1584,7 +1634,7 @@ hammer2_chain_modify(hammer2_chain_t *chain, hammer2_tid_t mtid,
 	 * situation but we have to be sure NOT to bzero the storage if
 	 * no data is present.
 	 *
-	 * Clearing of NOTTESTED is allowed if the MODIFIED bit is set.
+	 * Clearing of NOTTESTED is allowed if the MODIFIED bit is set,
 	 */
 	if (chain->flags & HAMMER2_CHAIN_INITIAL) {
 		atomic_clear_int(&chain->flags, HAMMER2_CHAIN_INITIAL);
@@ -1597,7 +1647,10 @@ hammer2_chain_modify(hammer2_chain_t *chain, hammer2_tid_t mtid,
 	switch (chain->bref.type) {
 	case HAMMER2_BREF_TYPE_VOLUME:
 	case HAMMER2_BREF_TYPE_FREEMAP:
-		/* The data is embedded, no copy-on-write operation needed. */
+		/*
+		 * The data is embedded, no copy-on-write operation is
+		 * needed.
+		 */
 		KKASSERT(chain->dio == NULL);
 		break;
 	case HAMMER2_BREF_TYPE_DIRENT:
@@ -1650,7 +1703,9 @@ hammer2_chain_modify(hammer2_chain_t *chain, hammer2_tid_t mtid,
 		bdata = hammer2_io_data(dio, chain->bref.data_off);
 
 		if (chain->data) {
-			/* COW (unless a dedup) */
+			/*
+			 * COW (unless a dedup).
+			 */
 			KKASSERT(chain->dio != NULL);
 			if (chain->data != (void *)bdata && dedup_off == 0)
 				bcopy(chain->data, bdata, chain->bytes);
@@ -1874,7 +1929,7 @@ hammer2_chain_get(hammer2_chain_t *parent, int generation,
 		chain = hammer2_chain_alloc(hmp, NULL, bref);
 	else
 		chain = hammer2_chain_alloc(hmp, parent->pmp, bref);
-	/* Ref'd chain returned. */
+	/* ref'd chain returned */
 
 	/*
 	 * Flag that the chain is in the parent's blockmap so delete/flush
@@ -1882,7 +1937,9 @@ hammer2_chain_get(hammer2_chain_t *parent, int generation,
 	 */
 	atomic_set_int(&chain->flags, HAMMER2_CHAIN_BLKMAPPED);
 
-	/* Chain must be locked to avoid unexpected ripouts. */
+	/*
+	 * chain must be locked to avoid unexpected ripouts
+	 */
 	hammer2_chain_lock(chain, how);
 
 	/*
@@ -1890,6 +1947,9 @@ hammer2_chain_get(hammer2_chain_t *parent, int generation,
 	 * access the RBTREE, and it is possible to collide with another
 	 * hammer2_chain_get() operation because the caller might only hold
 	 * a shared lock on the parent.
+	 *
+	 * NOTE: Get races can occur quite often when we distribute
+	 *	 asynchronous read-aheads across multiple threads.
 	 */
 	KKASSERT(parent->refs > 0);
 	error = hammer2_chain_insert(parent, chain,
@@ -2070,8 +2130,8 @@ hammer2_chain_repparent(hammer2_chain_t **chainp, int flags)
 	 * Once parent is locked and matches our reptrack, our reptrack
 	 * will be stable and we have our parent.  We can unlink our reptrack.
 	 *
-	 * WARNING!  Remember that the chain lock might be shared.
-	 *	     Chains locked shared have stable parent linkages.
+	 * WARNING!  Remember that the chain lock might be shared.  Chains
+	 *	     locked shared have stable parent linkages.
 	 */
 	hammer2_spin_ex(&parent->core.spin);
 	repp = &parent->core.reptrack;
@@ -2250,7 +2310,7 @@ again:
 	/*
 	 * No lookup is possible if the parent is errored.  We delayed
 	 * this check as long as we could to ensure that the parent backup,
-	 * embedded data code could still execute.
+	 * embedded data, and MATCHIND code could still execute.
 	 */
 	if (parent->error) {
 		*errorp = parent->error;
@@ -2398,9 +2458,9 @@ again:
 	}
 
 	/*
-	 * Skip deleted chains (XXX cache 'i' end-of-block-array?)
+	 * Skip deleted chains (XXX cache 'i' end-of-block-array? XXX)
 	 *
-	 * NOTE: chain's key range is not relevant as there might be
+	 * NOTE: Chain's key range is not relevant as there might be
 	 *	 one-offs within the range that are not deleted.
 	 *
 	 * NOTE: Lookups can race delete-duplicate because
@@ -2448,6 +2508,11 @@ done:
 	/*
 	 * All done, return the locked chain.
 	 *
+	 * If the caller does not want a locked chain, replace the lock with
+	 * a ref.  Perhaps this can eventually be optimized to not obtain the
+	 * lock in the first place for situations where the data does not
+	 * need to be resolved.
+	 *
 	 * NOTE! A chain->error must be tested by the caller upon return.
 	 *	 *errorp is only set based on issues which occur while
 	 *	 trying to reach the chain.
@@ -2459,6 +2524,7 @@ done:
  * After having issued a lookup we can iterate all matching keys.
  *
  * If chain is non-NULL we continue the iteration from just after it's index.
+ *
  * If chain is NULL we assume the parent was exhausted and continue the
  * iteration at the next parent.
  *
@@ -2470,6 +2536,8 @@ done:
  *
  * parent must be locked on entry and remains locked throughout.  chain's
  * lock status must match flags.  Chain is always at least referenced.
+ *
+ * WARNING!  The MATCHIND flag does not apply to this function.
  */
 hammer2_chain_t *
 hammer2_chain_next(hammer2_chain_t **parentp, hammer2_chain_t *chain,
@@ -2725,7 +2793,7 @@ again:
 	}
 
 	/*
-	 * Skip deleted chains (XXX cache 'i' end-of-block-array?)
+	 * Skip deleted chains (XXX cache 'i' end-of-block-array? XXX)
 	 *
 	 * NOTE: chain's key range is not relevant as there might be
 	 *	 one-offs within the range that are not deleted.
@@ -2873,7 +2941,9 @@ hammer2_chain_create(hammer2_chain_t **parentp, hammer2_chain_t **chainp,
 			KKASSERT(bytes == sizeof(chain->data->bmdata));
 			/* fall through */
 		default:
-			/* Leave chain->data NULL, set INITIAL. */
+			/*
+			 * leave chain->data NULL, set INITIAL
+			 */
 			KKASSERT(chain->data == NULL);
 			atomic_set_int(&chain->flags, HAMMER2_CHAIN_INITIAL);
 			break;
@@ -2989,7 +3059,9 @@ again:
 		goto again;
 	}
 
-	/* Fall through if parent, or skip to here if no parent. */
+	/*
+	 * fall through if parent, or skip to here if no parent.
+	 */
 skip:
 	if (chain->flags & HAMMER2_CHAIN_DELETED)
 		hprintf("inserting deleted %s chain %016llx/%d\n",
@@ -3036,6 +3108,7 @@ skip:
 			 * handled by create_indirect().
 			 */
 			hpanic("bad blockref type %d", chain->bref.type);
+			/* NOT REACHED */
 			break;
 		}
 	} else {
@@ -3106,6 +3179,7 @@ hammer2_chain_rename(hammer2_chain_t **parentp, hammer2_chain_t *chain,
 	 *	     be inaccessible.
 	 */
 	KKASSERT(chain->parent == NULL);
+	/*KKASSERT(chain->error == 0); allow */
 	bref = &chain->bref;
 
 	/*
@@ -3260,7 +3334,9 @@ _hammer2_chain_delete_helper(hammer2_chain_t *parent, hammer2_chain_t *chain,
 			break;
 		}
 
-		/* Delete blockmapped chain from its parent. */
+		/*
+		 * delete blockmapped chain from its parent.
+		 */
 		if (base)
 			hammer2_base_delete(parent, base, count, chain, obref);
 
@@ -3559,7 +3635,9 @@ hammer2_chain_create_indirect(hammer2_chain_t *parent, hammer2_key_t create_key,
 		 */
 		bsave = *bref;
 		if (chain) {
-			/* Use chain already present in the rbtree. */
+			/*
+			 * Use chain already present in the RBTREE
+			 */
 			hammer2_chain_ref(chain);
 			hammer2_spin_unex(&parent->core.spin);
 			hammer2_chain_lock(chain, HAMMER2_RESOLVE_NEVER);

@@ -43,10 +43,13 @@
 #define HAMMER2_DOP_READQ	4
 
 /*
- * Implements an abstraction layer for buffered device I/O.
- * Can be used as an OS-abstraction but the main purpose is to allow larger
- * buffers to be used against hammer2_chain's using smaller allocations,
- * without causing deadlocks.
+ * Implements an abstraction layer for synchronous and asynchronous
+ * buffered device I/O.  Can be used as an OS-abstraction but the main
+ * purpose is to allow larger buffers to be used against hammer2_chain's
+ * using smaller allocations, without causing deadlocks.
+ *
+ * The DIOs also record temporary state with limited persistence.  This
+ * feature is used to keep track of dedupable blocks.
  */
 static hammer2_io_t *hammer2_io_hash_lookup(hammer2_dev_t *, hammer2_off_t,
     uint64_t *);
@@ -87,7 +90,10 @@ hammer2_io_hash_destroy(hammer2_dev_t *hmp)
 }
 
 /*
- * Returns the locked DIO corresponding to the data|radix offset.
+ * Returns the DIO corresponding to the data|radix, creating it if necessary.
+ *
+ * If createit is 0, NULL can be returned indicating that the DIO does not
+ * exist.  (btype) is ignored when createit is 0.
  */
 static hammer2_io_t *
 hammer2_io_alloc(hammer2_dev_t *hmp, hammer2_off_t data_off, uint8_t btype,
@@ -114,7 +120,13 @@ hammer2_io_alloc(hammer2_dev_t *hmp, hammer2_off_t data_off, uint8_t btype,
 		    (long long)pbase, (long long)lbase, lsize,
 		    (long long)pmask);
 
-	/* Access or allocate dio, bump dio->refs to prevent destruction. */
+	/*
+	 * Access/Allocate the DIO, bump dio->refs to prevent destruction.
+	 *
+	 * If DIO_GOOD is set the ref should prevent it from being cleared
+	 * out from under us, we can set *isgoodp, and the caller can operate
+	 * on the buffer without any further interaction.
+	 */
 	dio = hammer2_io_hash_lookup(hmp, pbase, NULL);
 	if (dio) {
 		/* NOP */
@@ -216,7 +228,9 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, hammer2_off_t lbase,
 	hammer2_assert_io_refs(dio); /* dio locked + refs > 0 */
 	hammer2_mtx_unlock(&hmp->iohash_lock);
 
-	/* Buffer is already GOOD, handle the op and return. */
+	/*
+	 * Buffer is already good, handle the op and return.
+	 */
 	if (dio->refs & HAMMER2_DIO_GOOD) {
 		switch (op) {
 		case HAMMER2_DOP_NEW:
@@ -226,6 +240,7 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, hammer2_off_t lbase,
 			dio->refs |= HAMMER2_DIO_DIRTY;
 			break;
 		default:
+			/* nothing to do */
 			break;
 		}
 		hammer2_mtx_unlock(&dio->lock);
@@ -257,6 +272,9 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, hammer2_off_t lbase,
 		error = hammer2_bread(hmp, dio, lblkno);
 		if (dio->bp) {
 			KKASSERT(error == 0);
+			/*
+			 * Handle NEW flags
+			 */
 			switch (op) {
 			case HAMMER2_DOP_NEW:
 				bzero(hammer2_io_data(dio, lbase), lsize);
@@ -290,7 +308,9 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, hammer2_off_t lbase,
 
 /*
  * Release our ref on *diop.
- * On the 1->0 transition we clear DIO_GOOD and dispose of dio->bp.
+ *
+ * On the 1->0 transition we clear DIO_GOOD, set DIO_INPROG, and dispose
+ * of dio->bp.  Then we clean up DIO_INPROG and DIO_WAITING.
  */
 void
 _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
@@ -315,7 +335,8 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 
 	/*
 	 * Drop refs.
-	 * On the 1->0 transition clear DIO_GOOD.
+	 *
+	 * On the 1->0 transition clear GOOD and set INPROG, and break.
 	 * On any other transition we can return early.
 	 */
 	orefs = dio->refs;
@@ -323,18 +344,29 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 		dio->refs--;
 		dio->refs &= ~(HAMMER2_DIO_GOOD | HAMMER2_DIO_DIRTY);
 	} else {
+		/*
+		 * Normal drop case.
+		 */
 		dio->refs--;
 		hammer2_mtx_unlock(&dio->lock);
 		return;
 	}
 
-	/* Lastdrop (1->0 transition) case. */
+	/*
+	 * Lastdrop (1->0 transition).  INPROG has been set, GOOD and DIRTY
+	 * have been cleared.  iofree_count has not yet been incremented,
+	 * note that another accessor race will decrement iofree_count so
+	 * we have to increment it regardless.
+	 * We can now dispose of the buffer.
+	 */
 	bp = dio->bp;
 	dio->bp = NULL;
 
 	/* Write out and dispose of buffer. */
 	if ((orefs & HAMMER2_DIO_GOOD) && bp) {
-		/* Non-errored disposal of buffer. */
+		/*
+		 * Non-errored disposal of bp
+		 */
 		if (orefs & HAMMER2_DIO_DIRTY) {
 			/*
 			 * Allows dirty buffers to accumulate and
@@ -362,7 +394,9 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 			bqrelse(bp, 0);
 		}
 	} else if (bp) {
-		/* Errored disposal of buffer. */
+		/*
+		 * Errored disposal of bp
+		 */
 		brelse(bp, 0);
 	}
 
@@ -374,8 +408,8 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 	/* Another process may come in and get/put this dio. */
 
 	/*
-	 * We cache free buffers so re-use cases can use a shared lock,
-	 * but if too many build up we have to clean them out.
+	 * We cache free buffers so re-use cases can use a shared lock, but
+	 * if too many build up we have to clean them out.
 	 */
 	hammer2_mtx_ex(&hmp->iohash_lock);
 	dio_limit = hammer2_dio_limit;
@@ -388,6 +422,9 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 	hammer2_mtx_unlock(&hmp->iohash_lock);
 }
 
+/*
+ * Returns a pointer to the requested data.
+ */
 char *
 hammer2_io_data(hammer2_io_t *dio, hammer2_off_t lbase)
 {
@@ -429,7 +466,19 @@ int
 _hammer2_io_bread(hammer2_dev_t *hmp, int btype, hammer2_off_t lbase, int lsize,
     hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 {
+#ifdef HAMMER2_IO_DEBUG
+	hammer2_io_t *dio;
+#endif
+
 	*diop = hammer2_io_getblk(hmp, btype, lbase, lsize, HAMMER2_DOP_READ);
+#ifdef HAMMER2_IO_DEBUG
+	if ((dio = *diop) != NULL) {
+#if 0
+		int i = (dio->debug_index - 1) & HAMMER2_IO_DEBUG_MASK;
+		dio->debug_data[i] = debug_data;
+#endif
+	}
+#endif
 	return ((*diop)->error);
 }
 

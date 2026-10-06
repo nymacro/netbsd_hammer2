@@ -176,8 +176,8 @@ hammer2_inode_setdepend_locked(hammer2_inode_t *ip, hammer2_depend_t *depend)
 }
 
 /*
- * Put a solo inode on the SIDEQ (meaning that its dirty).
- * This can also occur from inode_lock4() and inode_depend().
+ * Put a solo inode on the SIDEQ (meaning that its dirty).  This can also
+ * occur from inode_lock4() and inode_depend().
  *
  * Caller must pass-in a locked inode.
  */
@@ -207,12 +207,27 @@ hammer2_inode_delayed_sideq(hammer2_inode_t *ip)
  *	- pass HAMMER2_RESOLVE_ALWAYS if you need the inode's meta-data.
  *	  Most front-end inode locks do.
  *
+ *	- pass HAMMER2_RESOLVE_NEVER if you do not want to require that
+ *	  the inode data be resolved.  This is used by the syncthr because
+ *	  it can run on an unresolved/out-of-sync cluster, and also by the
+ *	  vnode reclamation code to avoid unnecessary I/O (particularly when
+ *	  disposing of hundreds of thousands of cached vnodes).
+ *
  * This function, along with lock4, has SYNCQ semantics.  If the inode being
  * locked is on the SYNCQ, that is it has been staged by the syncer, we must
  * block until the operation is complete (even if we can lock the inode).  In
  * order to reduce the stall time, we re-order the inode to the front of the
  * pmp->syncq prior to blocking.  This reordering VERY significantly improves
  * performance.
+ *
+ * The inode locking function locks the inode itself, resolves any stale
+ * chains in the inode's cluster, and allocates a fresh copy of the
+ * cluster with 1 ref and all the underlying chains locked.
+ *
+ * ip->cluster will be stable while the inode is locked.
+ *
+ * NOTE: We don't combine the inode/chain lock because putting away an
+ *       inode would otherwise confuse multiple lock holders of the inode.
  */
 void
 hammer2_inode_lock(hammer2_inode_t *ip, int how)
@@ -532,7 +547,8 @@ hammer2_inode_lookup(hammer2_pfs_t *pmp, hammer2_tid_t inum)
 /*
  * Adding a ref to an inode is only legal if the inode already has at least
  * one ref.
- * Can be called with spinlock held.
+ *
+ * (can be called with spinlock held)
  */
 void
 hammer2_inode_ref(hammer2_inode_t *ip)
@@ -612,6 +628,9 @@ hammer2_inode_drop(hammer2_inode_t *ip)
  * necessary.  The vnode will be returned exclusively locked.
  *
  * The caller must lock the inode (shared or exclusive).
+ *
+ * Great care must be taken to avoid deadlocks and vnode acquisition/reclaim
+ * races.
  */
 int
 hammer2_igetv(hammer2_inode_t *ip, int lktype, struct vnode **vpp)
@@ -656,12 +675,19 @@ hammer2_igetv(hammer2_inode_t *ip, int lktype, struct vnode **vpp)
 	KASSERTMSG(vp->v_type != VBAD, "VBAD");
 	KASSERTMSG(vp->v_type != VNON, "VNON");
 
+	/*
+	 * Return non-NULL vp and error == 0, or NULL vp and error != 0.
+	 */
 	*vpp = vp;
 	return (0);
 }
 
 /*
- * Returns the inode associated with the arguments, allocating a new
+ * XXX this API needs a rewrite.  It needs to be split into a
+ * hammer2_inode_alloc() and hammer2_inode_build() to allow us to get
+ * rid of the inode/chain lock reversal fudge.
+ *
+ * Returns the inode associated with the passed-in cluster, allocating a new
  * hammer2_inode structure if necessary, then synchronizing it to the passed
  * xop cluster.  When synchronizing, if idx >= 0, only cluster index (idx)
  * is synchronized.  Otherwise the whole cluster is synchronized.  inum will
@@ -673,11 +699,15 @@ hammer2_igetv(hammer2_inode_t *ip, int lktype, struct vnode **vpp)
  * returned instead of allocating a new one.  The superroot and PFS inodes
  * are not indexed in memory.
  *
+ * The passed-in cluster must be locked and will remain locked on return.
  * The returned inode will be locked and the caller may dispose of both
- * via hammer2_inode_unlock() + hammer2_inode_drop().
+ * via hammer2_inode_unlock() + hammer2_inode_drop().  However, if the caller
+ * needs to resolve a hardlink it must ref/unlock/relock/drop the inode.
  *
  * The hammer2_inode structure regulates the interface between the high level
  * kernel VNOPS API and the filesystem backend (the chains).
+ *
+ * On return the inode is locked with the supplied cluster.
  */
 hammer2_inode_t *
 hammer2_inode_get(hammer2_pfs_t *pmp, hammer2_xop_head_t *xop,
@@ -691,6 +721,13 @@ hammer2_inode_get(hammer2_pfs_t *pmp, hammer2_xop_head_t *xop,
 	    hammer2_cluster_type(&xop->cluster) == HAMMER2_BREF_TYPE_INODE);
 	KKASSERT(pmp);
 
+	/*
+	 * Interlocked lookup/ref of the inode.  This code is only needed
+	 * when looking up inodes with nlinks != 0 (TODO: optimize out
+	 * otherwise and test for duplicates).
+	 *
+	 * Cluster can be NULL during the initial pfs allocation.
+	 */
 	if (xop) {
 		iptmp = &hammer2_xop_gdata(xop)->ipdata;
 		inum = iptmp->meta.inum;
@@ -742,6 +779,10 @@ again:
 	hammer2_spin_init(&nip->cluster_spin, "h2ip_cl");
 
 	nip->cluster.pmp = pmp;
+	/*
+	 * Initialize nip's cluster.  A cluster is provided for normal
+	 * inodes but typically not for the super-root or PFS inodes.
+	 */
 	if (xop) {
 		nipdata = &hammer2_xop_gdata(xop)->ipdata;
 		nip->meta = nipdata->meta;
@@ -749,6 +790,7 @@ again:
 		hammer2_inode_repoint(nip, &xop->cluster);
 	} else {
 		nip->meta.inum = inum;
+		/* mtime will be updated when a cluster is available */
 	}
 
 	nip->pmp = pmp;
@@ -773,6 +815,7 @@ again:
 	hammer2_mtx_init(&nip->vhold_lock, "h2ip_vh");
 	hammer2_mtx_ex(&nip->lock);
 	TAILQ_INIT(&nip->depend_static.sideq);
+	/* combination of thread lock and chain lock == inode lock */
 
 	/*
 	 * Attempt to add the inode.  If it fails we raced another inode
@@ -948,7 +991,10 @@ hammer2_inode_create_normal(hammer2_inode_t *pip, struct vattr *vap,
 	pip_check_algo = pip->meta.check_algo;
 	pip_inum = (pip == pip->pmp->iroot) ? 1 : pip->meta.inum;
 
-	/* Create the in-memory inode structure for the specified inode. */
+	/*
+	 * Create the in-memory hammer2_inode structure for the specified
+	 * inode.
+	 */
 	nip = hammer2_inode_get(dip->pmp, NULL, inum, -1);
 	nip->comp_heuristic = 0;
 	KKASSERT((nip->flags & HAMMER2_INODE_CREATING) == 0 &&
@@ -1132,7 +1178,11 @@ done2:
 
 /*
  * Repoint ip->cluster's chains to cluster's chains and fixup the default
- * focus.  All items, valid or invalid, are repointed.
+ * focus.  All items, valid or invalid, are repointed.  hammer2_xop_start()
+ * filters out invalid or non-matching elements.
+ *
+ * Caller must hold the inode and cluster exclusive locked, if not NULL,
+ * must also be locked.
  *
  * Cluster may be NULL to clean out any chains in ip->cluster.
  */
@@ -1170,7 +1220,10 @@ hammer2_inode_repoint(hammer2_inode_t *ip, hammer2_cluster_t *cluster)
 	 */
 	hammer2_spin_ex(&ip->cluster_spin);
 	for (i = 0; cluster && i < cluster->nchains; ++i) {
-		/* Do not replace elements which are the same. */
+		/*
+		 * Do not replace elements which are the same.  Also handle
+		 * element count discrepancies.
+		 */
 		nchain = cluster->array[i].chain;
 		if (i < ip->cluster.nchains) {
 			ochain = ip->cluster.array[i].chain;
@@ -1218,8 +1271,9 @@ hammer2_inode_repoint(hammer2_inode_t *ip, hammer2_cluster_t *cluster)
 }
 
 /*
- * Repoint a single element from the cluster to the ip.  Does not change
- * focus and requires inode to be re-locked to clean-up flags.
+ * Repoint a single element from the cluster to the ip.  Used by the
+ * synchronization threads to piecemeal update inodes.  Does not change
+ * focus and requires inode to be re-locked to clean-up flags (XXX).
  */
 static void
 hammer2_inode_repoint_one(hammer2_inode_t *ip, hammer2_cluster_t *cluster,
@@ -1459,7 +1513,8 @@ hammer2_inode_vdrop(hammer2_inode_t *ip, int n)
  * level layers are responsible for doing that).
  *
  * Called with a locked inode inside a normal transaction.
- * Inode must be locked.
+ *
+ * inode must be locked.
  */
 int
 hammer2_inode_chain_sync(hammer2_inode_t *ip)
@@ -1570,7 +1625,7 @@ hammer2_inode_chain_des(hammer2_inode_t *ip)
  * function creating or modifying a chain under this inode will re-set the
  * flag.
  *
- * Inode must be locked.
+ * inode must be locked.
  */
 int
 hammer2_inode_chain_flush(hammer2_inode_t *ip, int flags)

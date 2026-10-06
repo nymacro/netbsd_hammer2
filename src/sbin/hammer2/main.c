@@ -393,6 +393,16 @@ main(int ac, char **av)
 		} else {
 			ecode = cmd_bulkfree(av[1]);
 		}
+#if 0
+	} else if (strcmp(av[0], "bulkfree-async") == 0) {
+		if (ac != 2) {
+			fprintf(stderr,
+				"bulkfree-async: requires path to mount\n");
+			usage(1);
+		} else {
+			ecode = cmd_bulkfree_async(av[1]);
+		}
+#endif
 	} else if (strcmp(av[0], "cleanup") == 0) {
 		ecode = cmd_cleanup(av[1]);	/* can be NULL */
 	} else {
@@ -480,6 +490,10 @@ usage(int code)
 			"Dump inode\n"
 		"    dumpchain [<path> [<chnflags>]]   "
 			"Dump in-memory chain topology\n"
+#if 0
+		"    bulkfree-async path               "
+			"Run bulkfree pass asynchronously\n"
+#endif
 	);
 	exit(code);
 }

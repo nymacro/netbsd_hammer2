@@ -34,6 +34,14 @@
  * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  */
+/*
+ * Per-node backend for kernel filesystem interface.
+ *
+ * This executes a VOP concurrently on multiple nodes, each node via its own
+ * thread, and competes to advance the original request.  The original
+ * request is retired the moment all requirements are met, even if the
+ * operation is still in-progress on some nodes.
+ */
 
 #include "hammer2.h"
 
@@ -535,7 +543,7 @@ hammer2_xop_nrename(hammer2_xop_t *arg, void *scratch, int clindex)
 	}
 
 	if (chain == NULL) {
-		/* XXX Shouldn't happen, but does under fsstress. */
+		/* XXX shouldn't happen, but does under fsstress */
 		hprintf("\"%s\" -> \"%s\" ENOENT\n",
 		    xop->head.name1, xop->head.name2);
 		if (error == 0)
@@ -896,6 +904,11 @@ done:
 	hammer2_xop_feed(&xop->head, NULL, clindex, error);
 }
 
+/************************************************************************
+ *			    INODE LAYER XOPS				*
+ ************************************************************************
+ *
+ */
 /*
  * Helper to create a directory entry.
  */
@@ -1147,7 +1160,9 @@ fail:
 }
 
 /*
- * Inode delete helper (backend, threaded).
+ * Inode delete helper (backend, threaded)
+ *
+ * Generally used by hammer2_run_sideq()
  */
 void
 hammer2_xop_inode_destroy(hammer2_xop_t *arg, void *scratch, int clindex)
@@ -1220,7 +1235,7 @@ hammer2_xop_inode_unlinkall(hammer2_xop_t *arg, void *scratch, int clindex)
 		hammer2_chain_delete(parent, chain, xop->head.mtid,
 		    HAMMER2_DELETE_PERMANENT);
 		hammer2_xop_feed(&xop->head, chain, clindex, chain->error);
-		/* Depend on function to unlock the shared lock. */
+		/* depend on function to unlock the shared lock */
 		chain = hammer2_chain_next(&parent, chain, &key_next,
 		    xop->key_end, &error, HAMMER2_LOOKUP_ALWAYS);
 	}
@@ -1299,6 +1314,10 @@ hammer2_xop_inode_connect(hammer2_xop_t *arg, void *scratch, int clindex)
 	error = hammer2_chain_create(&parent, &chain, NULL, pmp,
 	    HAMMER2_METH_DEFAULT, xop->lhc, 0, HAMMER2_BREF_TYPE_INODE,
 	    HAMMER2_INODE_BYTES, xop->head.mtid, 0, 0);
+
+	/*
+	 * Feed result back.
+	 */
 fail:
 	hammer2_xop_feed(&xop->head, NULL, clindex, error);
 	if (parent) {

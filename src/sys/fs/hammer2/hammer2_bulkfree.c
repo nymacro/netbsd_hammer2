@@ -457,7 +457,7 @@ hammer2_bulkfree_dev_scan(hammer2_dev_t *hmp, struct hammer2_ioc_bulkfree *bfi)
 		for (i = 0; i < HAMMER2_MAXCLUSTER; ++i) {
 			if (pmp->pfs_hmps[i] != hmp)
 				continue;
-		etmp = hammer2_vfs_sync_pmp(pmp, MNT_WAIT);
+			etmp = hammer2_vfs_sync_pmp(pmp, MNT_WAIT);
 			if (etmp && (error == 0 || error == ENOSPC))
 				error = etmp;
 			break;
@@ -996,7 +996,7 @@ h2_bulkfree_sync(hammer2_bulkfree_info_t *cbinfo)
 			if (error) {
 				hprintf("freemap lookup error near %016llx "
 				    "error %d\n",
-				    (long long)data_off, live_chain->error);
+				    (long long)data_off, error);
 				break;
 			}
 		}

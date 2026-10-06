@@ -293,7 +293,6 @@ hammer2_xop_unset_ipdep(hammer2_inode_t *ip)
 }
 
 #ifdef HAMMER2_INVARIANTS
-//#define XOP_ADMIN_DEBUG
 static __inline void
 xop_storage_func(hammer2_xop_head_t *xop, hammer2_inode_t *ip, void *scratch,
     int i)
@@ -332,6 +331,27 @@ hammer2_xop_start(hammer2_xop_head_t *xop, hammer2_xop_desc_t *desc)
 		xop->scratch = hmalloc(hammer2_get_logical(), M_HAMMER2,
 		    M_WAITOK | M_ZERO);
 
+	/*
+	 * Register the dependent inodes in the pmp ipdep hash exactly
+	 * once per XOP, before the per-chain loop.  The entries stay
+	 * inserted until the XOP fully retires, so re-testing inside the
+	 * loop would collide with our own registration on the second
+	 * chain iteration.  A colliding alias (rename can alias ip1..ip4)
+	 * would livelock hammer2_xop_testset_ipdep() forever with the
+	 * inode locks held.
+	 */
+	if (hammer2_xop_active(xop)) {
+		hammer2_xop_testset_ipdep(ip);
+		if (xop->ip2 && xop->ip2 != xop->ip1) /* rename */
+			hammer2_xop_testset_ipdep(xop->ip2);
+		if (xop->ip3 && xop->ip3 != xop->ip1 &&
+		    xop->ip3 != xop->ip2) /* rename */
+			hammer2_xop_testset_ipdep(xop->ip3);
+		if (xop->ip4 && xop->ip4 != xop->ip1 &&
+		    xop->ip4 != xop->ip2 && xop->ip4 != xop->ip3) /* rename */
+			hammer2_xop_testset_ipdep(xop->ip4);
+	}
+
 	for (i = 0; i < ip->cluster.nchains; ++i) {
 		mask = 1LLU << i;
 		if (ip->cluster.array[i].chain) {
@@ -342,13 +362,6 @@ hammer2_xop_start(hammer2_xop_head_t *xop, hammer2_xop_desc_t *desc)
 		}
 
 		if (hammer2_xop_active(xop)) {
-			hammer2_xop_testset_ipdep(ip);
-			if (xop->ip2)
-				hammer2_xop_testset_ipdep(xop->ip2);
-			if (xop->ip3 && xop->ip3 != xop->ip1) /* rename */
-				hammer2_xop_testset_ipdep(xop->ip3);
-			if (xop->ip4 && xop->ip4 != xop->ip2) /* rename */
-				hammer2_xop_testset_ipdep(xop->ip4);
 			xop_storage_func(xop, ip, xop->scratch, i);
 			hammer2_xop_retire(xop, mask);
 		} else {
@@ -455,18 +468,20 @@ hammer2_xop_retire(hammer2_xop_head_t *xop, uint32_t mask)
 		xop->ip1 = NULL;
 	}
 	if (xop->ip2) {
-		hammer2_xop_unset_ipdep(xop->ip2);
+		if (xop->ip2 != xop->ip1) /* rename */
+			hammer2_xop_unset_ipdep(xop->ip2);
 		hammer2_inode_drop(xop->ip2);
 		xop->ip2 = NULL;
 	}
 	if (xop->ip3) {
-		if (xop->ip3 && xop->ip3 != xop->ip1) /* rename */
+		if (xop->ip3 != xop->ip1 && xop->ip3 != xop->ip2) /* rename */
 			hammer2_xop_unset_ipdep(xop->ip3);
 		hammer2_inode_drop(xop->ip3);
 		xop->ip3 = NULL;
 	}
 	if (xop->ip4) {
-		if (xop->ip4 && xop->ip4 != xop->ip2) /* rename */
+		if (xop->ip4 != xop->ip1 && xop->ip4 != xop->ip2 &&
+		    xop->ip4 != xop->ip3) /* rename */
 			hammer2_xop_unset_ipdep(xop->ip4);
 		hammer2_inode_drop(xop->ip4);
 		xop->ip4 = NULL;

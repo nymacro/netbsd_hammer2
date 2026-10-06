@@ -772,6 +772,7 @@ struct hammer2_devvp {
 	struct vnode		*devvp;		/* device vnode */
 	char			*path;		/* device vnode path */
 	int			open;		/* 1 if devvp open */
+	int			nameref;	/* 1 while the lookup ref is held */
 	int			xflags;		/* NetBSD */
 };
 

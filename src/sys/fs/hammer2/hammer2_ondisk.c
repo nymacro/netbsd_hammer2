@@ -160,6 +160,11 @@ hammer2_close_devvp(const hammer2_devvp_list_t *devvpl)
 				return (error);
 			}
 
+			/*
+			 * The vput() above consumed the reference
+			 * taken by the device lookup.
+			 */
+			e->nameref = 0;
 			e->open = 0;
 		}
 	}
@@ -226,6 +231,7 @@ hammer2_init_devvp(struct mount *mp, const char *blkdevs,
 		e = hmalloc(sizeof(*e), M_HAMMER2, M_WAITOK | M_ZERO);
 		e->devvp = devvp;
 		e->path = hstrdup(path);
+		e->nameref = 1; /* ref taken by the device lookup */
 		TAILQ_INSERT_TAIL(devvpl, e, entry);
 	}
 	hfree(path, M_TEMP, MAXPATHLEN);
@@ -244,7 +250,15 @@ hammer2_cleanup_devvp(hammer2_devvp_list_t *devvpl)
 
 		/* Cleanup device vnode. */
 		KKASSERT(e->devvp);
-		//vrele(e->devvp); /* unneeded on NetBSD */
+		/*
+		 * Drop the reference taken by the initial device lookup.
+		 * Opened entries have already had it consumed by the
+		 * vput() in hammer2_close_devvp(); root mount entries are
+		 * created with nameref == 0 (the reference belongs to
+		 * vfs_mountroot(9), which releases it itself).
+		 */
+		if (e->nameref)
+			vrele(e->devvp);
 		e->devvp = NULL;
 
 		/* Cleanup path. */

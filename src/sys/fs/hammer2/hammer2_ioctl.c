@@ -71,10 +71,7 @@ hammer2_ioctl_version_get(hammer2_inode_t *ip, void *data)
 	if (hmp == NULL)
 		return (EINVAL);
 
-	if (hmp)
-		v->version = hmp->voldata.version;
-	else
-		v->version = -1;
+	v->version = hmp->voldata.version;
 
 	return (0);
 }

@@ -69,6 +69,11 @@ RB_SCAN_INFO(name, type)
  * return < 0 for items below the desired range, 0 for items within	\
  * the range, and > 0 for items beyond the range.   Any item may be	\
  * deleted while the scan is in progress.				\
+ *									\
+ * PORT NOTE: this generator does no locking of its own; concurrent	\
+ * scans and concurrent mutations of the same tree must be serialized	\
+ * by the caller (all hammer2 call sites hold the appropriate chain	\
+ * lock around the scan).						\
  */									\
 static int								\
 name##_SCANCMP_ALL(struct type *type __unused, void *data __unused)	\

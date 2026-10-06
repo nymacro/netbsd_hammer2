@@ -352,7 +352,15 @@ hammer2_chain_unhold(hammer2_chain_t *chain)
 			    lockcnt - 1))
 				break;
 		} else if (hammer2_mtx_owned(&chain->lock)) {
-			/* XXX2 */
+			/*
+			 * XXX2 We already own the mutex: dropping and
+			 * re-acquiring it here can block if another thread
+			 * grabs the lock in the gap (upstream DragonFly has
+			 * the same shape with its mtx_unlock/mtx_lock).
+			 * Dormant today: only reached with lockcnt == 1
+			 * and the owner present, which no current call
+			 * site produces while another thread waits.
+			 */
 			hammer2_chain_unlock(chain);
 			hammer2_mtx_ex(&chain->lock);
 			break;
@@ -902,6 +910,39 @@ again:
 	chain->error = 0;
 
 	/*
+	 * This isn't perfect and can be ignored on OSs which do not have
+	 * an indication as to whether a buffer is coming from cache or
+	 * if I/O was actually issued for the read.  TESTEDGOOD will work
+	 * pretty well without the B_IOISSUED logic because chains are
+	 * cached, but in that situation (without B_IOISSUED) it will not
+	 * detect whether a re-read via I/O is corrupted versus the
+	 * original read.
+	 *
+	 * We can't re-run the CRC on every fresh lock.  That would be
+	 * insanely expensive.
+	 *
+	 * If the underlying kernel buffer covers the entire chain we can
+	 * use the B_IOISSUED indication (set by spec_strategy(9) when I/O
+	 * is dispatched) to determine if we have to re-run the CRC on
+	 * chain data for chains that managed to stay cached across the
+	 * kernel disposal of the original buffer.
+	 */
+	{
+		hammer2_io_t *dio;
+
+		if ((dio = chain->dio) != NULL && dio->bp) {
+			struct buf *bp = dio->bp;
+
+			if ((u_int)dio->psize == chain->bytes &&
+			    (bp->b_flags & B_IOISSUED)) {
+				atomic_clear_int(&chain->flags,
+				    HAMMER2_CHAIN_TESTEDGOOD);
+				bp->b_flags &= ~B_IOISSUED;
+			}
+		}
+	}
+
+	/*
 	 * NOTE: A locked chain's data cannot be modified without first
 	 *	 calling hammer2_chain_modify().
 	 */
@@ -1447,7 +1488,7 @@ hammer2_chain_modify(hammer2_chain_t *chain, hammer2_tid_t mtid,
 			}
 			if (dedup_off)
 				debug_hprintf("%s %s chain %016llx %016llx/%d\n",
-				    dedup_off ? "dedup" : "alloc",
+				    "dedup",
 				    hammer2_breftype_to_str(chain->bref.type),
 				    (long long)chain->bref.data_off,
 				    (long long)chain->bref.key,

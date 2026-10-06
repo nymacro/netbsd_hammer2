@@ -432,7 +432,7 @@ hammer2_xop_strategy_write(hammer2_xop_t *arg, void *scratch, int clindex)
 		bp->b_error = 0;
 		biodone(bp);
 	} else {
-		hprintf("error %08x at blkno %016llx/%016llx",
+		hprintf("error %08x at blkno %016llx/%016llx\n",
 		    error, (long long)bp->b_lblkno, (long long)bp->b_blkno);
 		bp->b_error = EIO;
 		biodone(bp);
@@ -1175,7 +1175,7 @@ hammer2_dedup_lookup(hammer2_dev_t *hmp, char **datap, int pblksize)
 			continue;
 		dio = hammer2_io_getquick(hmp, off, pblksize);
 		if (dio) {
-			dtmp = hammer2_io_data(dio, off),
+			dtmp = hammer2_io_data(dio, off);
 			mask = hammer2_dedup_mask(dio, off, pblksize);
 			/* No assert_unlocked: global rw_lock_held race, see
 			 * hammer2_dedup_record. */

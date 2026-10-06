@@ -630,9 +630,9 @@ hammer2_readdir(void *v)
 		struct vnode *a_vp;
 		struct uio *a_uio;
 		kauth_cred_t a_cred;
-		int **a_eofflag;
+		int *a_eofflag;
 		off_t **a_cookies;
-		int ncookies;
+		int *a_ncookies;
 	} */ *ap = v;
 	struct vnode *vp = ap->a_vp;
 	struct uio *uio = ap->a_uio;
@@ -996,8 +996,7 @@ hammer2_write_file(hammer2_inode_t *ip, struct uio *uio, int ioflag,
 			 * mmap/write visibility issue.
 			 */
 			bp = getblk(vp, lbn, lblksize, 0, 0);
-			if (1 /*(bp->b_flags & B_CACHE) == 0*/)
-				clrbuf(bp);
+			clrbuf(bp);
 		} else {
 			/*
 			 * Partial overwrite, read in any missing bits then
@@ -1154,16 +1153,9 @@ hammer2_write(void *v)
 	 * transaction related to the buffer cache or other direct
 	 * VM page manipulation.
 	 */
-	if (0)
-		hammer2_trans_init(ip->pmp, HAMMER2_TRANS_BUFCACHE);
-	else
-		hammer2_trans_init(ip->pmp, 0);
+	hammer2_trans_init(ip->pmp, 0);
 	error = hammer2_write_file(ip, uio, ioflag, ap->a_cred);
-	if (0)
-		hammer2_trans_done(ip->pmp,
-		    HAMMER2_TRANS_BUFCACHE | HAMMER2_TRANS_SIDEQ);
-	else
-		hammer2_trans_done(ip->pmp, HAMMER2_TRANS_SIDEQ);
+	hammer2_trans_done(ip->pmp, HAMMER2_TRANS_SIDEQ);
 
 	return (error);
 }
@@ -1778,18 +1770,25 @@ hammer2_rmdir(void *v)
 		return (EINVAL);
 	}
 
+	/*
+	 * Early error arms must still dispose of the leaf vnode: the
+	 * caller (do_rmdir) only vputs dvp.  dvp != vp here, the "."
+	 * case was handled above.
+	 */
 	if ((dip->meta.uflags & APPEND) ||
-	    (ip->meta.uflags & (IMMUTABLE | APPEND)))
+	    (ip->meta.uflags & (IMMUTABLE | APPEND))) {
+		vput(vp);
 		return (EPERM);
+	}
 
 	if (dip->pmp->rdonly) {
-		vrele(vp);
+		vput(vp);
 		return (EROFS);
 	}
 
 	/* DragonFly has this disabled, see 568c02c60c. */
 	if (hammer2_vfs_enospace(dip, 0, cnp->cn_cred) > 1) {
-		vrele(vp);
+		vput(vp);
 		return (ENOSPC);
 	}
 
@@ -1866,18 +1865,34 @@ hammer2_remove(void *v)
 	uint64_t mtime;
 	int error;
 
+	/*
+	 * Early error arms must still dispose of the leaf vnode: the
+	 * caller (do_unlink) only vputs dvp.  Mirror the success-path
+	 * disposal at the end of this function.
+	 */
 	if ((ip->meta.uflags & (IMMUTABLE | APPEND)) ||
-	    (dip->meta.uflags & APPEND))
+	    (dip->meta.uflags & APPEND)) {
+		if (dvp == vp)
+			vrele(vp);
+		else
+			vput(vp);
 		return (EPERM);
+	}
 
 	if (dip->pmp->rdonly) {
-		vrele(vp);
+		if (dvp == vp)
+			vrele(vp);
+		else
+			vput(vp);
 		return (EROFS);
 	}
 
 	/* DragonFly has this disabled, see 568c02c60c. */
 	if (hammer2_vfs_enospace(dip, 0, cnp->cn_cred) > 1) {
-		vrele(vp);
+		if (dvp == vp)
+			vrele(vp);
+		else
+			vput(vp);
 		return (ENOSPC);
 	}
 
@@ -2516,13 +2531,8 @@ hammer2_ioctl(void *v)
 	 * (bulkfree sync, snapshot, growfs) run their own transactions
 	 * and locking here would deadlock against them.
 	 */
-	error = 0;
-	if (error == 0) {
-		error = hammer2_ioctl_impl(vp, ap->a_command, ap->a_data,
-		    ap->a_fflag, ap->a_cred);
-	} else {
-		error = EBADF;
-	}
+	error = hammer2_ioctl_impl(vp, ap->a_command, ap->a_data,
+	    ap->a_fflag, ap->a_cred);
 
 	return (error);
 }

@@ -446,8 +446,8 @@ hfree(void *addr, struct malloc_type *type, size_t freedsize)
 	if (addr) {
 		KKASSERT(freedsize > 0);
 		adjust_malloc_leak(-(int)freedsize, type);
+		free(addr, type);
 	}
-	free(addr, type);
 }
 
 static __inline char *

@@ -47,6 +47,7 @@
 #include <miscfs/genfs/genfs.h>
 #include <miscfs/genfs/genfs_node.h>
 #include <miscfs/specfs/specdev.h> /* for v_rdev */
+#include <sys/vnode_impl.h> /* VSTATE_GET */
 
 #include <uvm/uvm_extern.h>
 
@@ -1356,7 +1357,6 @@ hammer2_mountroot(void)
 		    device_xname(root_device),
 		    root_pfs_label[0] ? root_pfs_label : "DATA");
 	hprintf("mountroot: devstr=%s\n", devstr);
-	hprintf("DBG-MR devstr=%s label=%s\n", devstr, root_pfs_label);
 	memset(&args, 0, sizeof(args));
 	args.fspec = devstr;
 	args.hflags = 0;
@@ -2126,8 +2126,28 @@ restart:
 		 */
 		vp = ip->vp; /* NULL after vflush() */
 		vp_held = 0;
-		if (vp && vrefcnt(vp) > 0) {
-			vref(vp); /* requires vrefcnt(vp) > 0 */
+		if (vp) {
+			/*
+			 * Taking a reference on a vnode we do not already
+			 * hold requires that the vnode cannot be reclaimed
+			 * concurrently: NetBSD's vref() is a bare count
+			 * increment with no vdead gate, so the state and
+			 * refcount test must be atomic against vgone().
+			 * Hold the vnode interlock across both.  Never take
+			 * the FIRST reference (an unreferenced vnode is
+			 * skipped entirely; buffer writeback belongs to
+			 * bufdaemon).
+			 */
+			mutex_enter(vp->v_interlock);
+			if (atomic_load_relaxed(
+			    &VNODE_TO_VIMPL(vp)->vi_state) == VS_LOADED &&
+			    vrefcnt(vp) > 0)
+				vref(vp); /* requires vrefcnt(vp) > 0 */
+			else
+				vp = NULL;
+			mutex_exit(vp->v_interlock);
+		}
+		if (vp) {
 			if (vn_lock(vp, LK_EXCLUSIVE | LK_NOWAIT)) {
 				/*
 				 * Failed to get the vnode, requeue the inode

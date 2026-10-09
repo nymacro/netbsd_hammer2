@@ -36,12 +36,6 @@
  * SUCH DAMAGE.
  */
 
-/*
- * XXX HAMMER2 userspace consists of sbin/{hammer2,newfs_hammer2,
- * mount_hammer2,fsck_hammer2}.  These are mostly portable, so avoid
- * non functional changes in the name of cleanup.
- */
-
 #include "hammer2.h"
 
 int VerboseOpt;
@@ -162,6 +156,10 @@ main(int ac, char **av)
 		else
 			ecode = cmd_dumpchain(av[1],
 					      (u_int)strtoul(av[2], NULL, 0));
+	} else if (strcmp(av[0], "info") == 0) {
+		ecode = cmd_info(ac - 1, (const char **)(void *)&av[1]);
+	} else if (strcmp(av[0], "mountall") == 0) {
+		ecode = cmd_mountall(ac - 1, (const char **)(void *)&av[1]);
 	} else if (strcmp(av[0], "destroy") == 0) {
 		if (ac < 2) {
 			fprintf(stderr,
@@ -240,7 +238,8 @@ main(int ac, char **av)
 		ecode = cmd_pfs_delete(sel_path, av, ac);
 	} else if (strcmp(av[0], "recover") == 0 ||
 		   strcmp(av[0], "recover-relaxed") == 0 ||
-		   strcmp(av[0], "recover-file") == 0) {
+		   strcmp(av[0], "recover-file") == 0)
+	{
 		/*
 		 * Recover a relative path (unanchored match), absolute path,
 		 * specific file, or directory sub-tree.  File restorals are
@@ -287,11 +286,16 @@ main(int ac, char **av)
 		 * Raw dump of filesystem.  Use -v to check all crc's, and
 		 * -vv to dump bulk file data.
 		 */
-		if (ac != 2) {
+		switch(ac) {
+		case 2:
+			cmd_show(av[1], NULL, 0);
+			break;
+		case 3:
+			cmd_show(av[1], av[2], 0);
+			break;
+		default:
 			fprintf(stderr, "show: requires device path\n");
 			usage(1);
-		} else {
-			cmd_show(av[1], 0);
 		}
 	} else if (strcmp(av[0], "freemap") == 0) {
 		/*
@@ -302,7 +306,7 @@ main(int ac, char **av)
 			fprintf(stderr, "freemap: requires device path\n");
 			usage(1);
 		} else {
-			cmd_show(av[1], 1);
+			cmd_show(av[1], NULL, 1);
 		}
 	} else if (strcmp(av[0], "volhdr") == 0) {
 		/*
@@ -312,7 +316,7 @@ main(int ac, char **av)
 			fprintf(stderr, "volhdr: requires device path\n");
 			usage(1);
 		} else {
-			cmd_show(av[1], 2);
+			cmd_show(av[1], NULL, 2);
 		}
 	} else if (strcmp(av[0], "volume-list") == 0) {
 		/*
@@ -436,6 +440,10 @@ usage(int code)
 			"THIS IS A VERY DANGEROUS MODE\n"
 		"    emergency-mode-disable <target>   "
 			"Disable emergency operations mode on filesystem\n"
+		"    info [<devpath>...]               "
+			"Info on all offline or online H2 partitions\n"
+		"    mountall [<devpath>...]           "
+			"Mount @LOCAL for all H2 partitions\n"
 		"    hash [<filename>...]              "
 			"Print directory hash (key) for name\n"
 		"    dhash [<filename>...]             "
@@ -464,8 +472,9 @@ usage(int code)
 			"Return inode quota & config\n"
 		"    growfs [<path>...]                "
 			"Grow a filesystem into resized partition\n"
-		"    show <devpath>                    "
+		"    show <devpath> [chainspec]        "
 			"Raw hammer2 media dump for topology\n"
+			"or specific block w/chainspec %%jx.%%02x\n"
 		"    freemap <devpath>                 "
 			"Raw hammer2 media dump for freemap\n"
 		"    volhdr <devpath>                  "
@@ -489,7 +498,7 @@ usage(int code)
 		"    printinode <path>                 "
 			"Dump inode\n"
 		"    dumpchain [<path> [<chnflags>]]   "
-			"Dump in-memory chain topology\n"
+			"Dump in-memory chain topology (ONFLUSH flag is 0x200)\n"
 #if 0
 		"    bulkfree-async path               "
 			"Run bulkfree pass asynchronously\n"

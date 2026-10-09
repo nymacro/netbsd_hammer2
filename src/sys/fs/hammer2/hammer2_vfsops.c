@@ -2276,11 +2276,14 @@ restart:
 			mutex_enter(vp->v_interlock);
 			if (atomic_load_relaxed(
 			    &VNODE_TO_VIMPL(vp)->vi_state) == VS_LOADED &&
-			    vrefcnt(vp) > 0)
+			    vrefcnt(vp) > 0) {
 				vref(vp); /* requires vrefcnt(vp) > 0 */
-			else
+				mutex_exit(vp->v_interlock);
+			} else {
+				/* Skip entirely (do not take the 1st ref). */
+				mutex_exit(vp->v_interlock);
 				vp = NULL;
-			mutex_exit(vp->v_interlock);
+			}
 		}
 		if (vp) {
 			if (vn_lock(vp, LK_EXCLUSIVE | LK_NOWAIT)) {

@@ -378,7 +378,8 @@ dirhash(const char *aname, size_t len)
 {
 	uint32_t crcx;
 	uint64_t key;
-	size_t i, j;
+	size_t i;
+	size_t j;
 
 	key = 0;
 
@@ -408,6 +409,7 @@ dirhash(const char *aname, size_t len)
 
 	/*
 	 * l16 - crc of entire filename
+	 *
 	 * This crc reduces degenerate hash collision conditions.
 	 */
 	crcx = hammer2_icrc32(aname, len);

@@ -117,6 +117,7 @@ int cmd_pfs_create(const char *sel_path, const char *name,
 int cmd_pfs_delete(const char *sel_path, char **av, int ac);
 int cmd_pfs_snapshot(const char *sel_path, const char *name, const char *label,
 			uint32_t pfs_flags);
+
 int cmd_hash(int ac, const char **av);
 int cmd_dhash(int ac, const char **av);
 int cmd_info(int ac, const char **av);
@@ -125,22 +126,22 @@ int cmd_stat(int ac, const char **av);
 int cmd_destroy_path(int ac, const char **av);
 int cmd_destroy_inum(const char *sel_path, int ac, const char **av);
 int cmd_dumpchain(const char *path, u_int flags);
-int cmd_emergency_mode(const char *sel_path, int enable, int ac,
-    const char **av);
+int cmd_emergency_mode(const char *sel_path, int enable,
+			int ac, const char **av);
 int cmd_growfs(const char *sel_path, int ac, const char **av);
-int cmd_show(const char *devpath, int which);
+int cmd_show(const char *devpath, const char *chspec, int which);
 int is_supported_volume_list(const char *f);
 int cmd_volume_list(int ac, char **av);
 int cmd_volume_list2(int ac, char **av);
 int cmd_setcomp(const char *comp_str, char **paths);
 int cmd_setcheck(const char *comp_str, char **paths);
 int cmd_bulkfree(const char *dir_path);
-#if 0
-int cmd_bulkfree_async(const char *dir_path);
-#endif
 int cmd_cleanup(const char *dir_path);
 int cmd_recover(const char *devpath, const char *filename,
 			const char *destdir, int strict, int isafile);
+#if 0
+int cmd_bulkfree_async(const char *dir_path);
+#endif
 
 void print_inode(const char *path);
 

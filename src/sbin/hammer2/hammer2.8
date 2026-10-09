@@ -194,6 +194,26 @@ operation.
 After resizing the disk partition you can issue this command on a
 mounted hammer2 filesystem to grow into the new space in the partition.
 This command is run on a live hammer2 filesystem.
+.\" ==== info ====
+.It Cm info Op devpath...
+Access and print the status and super-root entries for all HAMMER2
+partitions found in /dev (raw character devices) or the specified
+device path(s).
+Use raw device paths (e.g. /dev/rwd0b) on NetBSD: block devices allow
+only a single system-wide open and a mounted filesystem holds its block
+device open, so block paths fail with EBUSY while the filesystem is
+mounted.
+The partitions do not have to be mounted.
+Note that only mounted partitions will be under active management.
+This is accomplished by mounting at least one PFS within the partition.
+Typically at least the @LOCAL PFS is mounted.
+.\" ==== mountall ====
+.It Cm mountall Op devpath...
+This directive mounts the @LOCAL PFS on all HAMMER2 partitions found
+in /dev, or the specified device path(s).
+The partitions are mounted as /var/hammer2/LOCAL.<id>.
+Mounts are executed in the background and this command will wait a
+limited amount of time for the mounts to complete before returning.
 .\" ==== hash ====
 .It Cm hash Op filename...
 Compute and print the directory hash for any number of filenames.
@@ -406,10 +426,17 @@ Snapshot without filesystem sync.
 Print the inode statistics, compression, and other meta-data associated
 with a list of paths.
 .\" ==== show ====
-.It Cm show Ar devpath
+.It Cm show Ar devpath Op chainspec
 Dump the radix tree for the HAMMER2 filesystem by scanning a
 block device directly.
 No mount is required.
+If a chainspec is given, this function dumps the requested block.
+A chainspec looks something like this example: 000001559a68900a.01,
+it is the offset, block size, and type information format hammer2
+uses in its blockrefs.  Basically a partition-relative byte offset
+with the low nibble a power 2 of indicating the buffer size (1KB in this
+example), then a dot and a 2 hex-digit block type... 01 in this case means
+an inode.
 .\" ==== freemap ====
 .It Cm freemap Ar devpath
 Dump the freemap tree for the HAMMER2 filesystem by scanning a
@@ -487,7 +514,7 @@ Set the check code to the ISCSI 32-bit CRC for any newly created elements
 at or under the path if not overridden by deeper elements.
 .\" ==== setxxhash64 ====
 .It Cm setxxhash64 Op path...
-Set the check code to XXHASH64, a fast 64-bit hash.
+Set the check code to XXHASH64, a fast 64-bit hash
 .\" ==== setsha192 ====
 .It Cm setsha192 Op path...
 Set the check code to SHA192 for any newly created elements at or under

@@ -987,7 +987,14 @@ again:
 		if ((dio = chain->dio) != NULL && dio->bp) {
 			struct buf *bp = dio->bp;
 
-			if ((u_int)dio->psize == chain->bytes &&
+			/*
+			 * Any chain fully covered by the re-read buffer must
+			 * re-verify.  Chains smaller than the physical buffer
+			 * (e.g. 1KB inode records in a 64KB buffer) share the
+			 * buffer with siblings, so a re-read of the buffer
+			 * reloaded their bytes from media too.
+			 */
+			if ((u_int)dio->psize >= chain->bytes &&
 			    (bp->b_flags & B_IOISSUED)) {
 				atomic_clear_int(&chain->flags,
 				    HAMMER2_CHAIN_TESTEDGOOD);

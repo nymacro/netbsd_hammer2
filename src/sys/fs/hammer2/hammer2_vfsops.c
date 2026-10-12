@@ -50,6 +50,8 @@
 #include <sys/vnode_impl.h> /* VSTATE_GET */
 
 #include <uvm/uvm_extern.h>
+#include <uvm/uvm_page.h>
+#include <uvm/uvm_pager.h>
 
 MODULE(MODULE_CLASS_VFS, hammer2, NULL);
 
@@ -2137,6 +2139,7 @@ hammer2_vfs_sync_pmp(hammer2_pfs_t *pmp, int waitfor __unused)
 	int vp_held;
 	uint32_t pass2;
 	int error, dorestart, ndrop;
+	int syncerror;
 	int syndel_loops;
 
 	/*
@@ -2163,6 +2166,7 @@ hammer2_vfs_sync_pmp(hammer2_pfs_t *pmp, int waitfor __unused)
 #endif
 	dorestart = 0;
 	syndel_loops = 0;
+	syncerror = 0;
 
 	/*
 	 * Move inodes from depq to syncq, releasing the related
@@ -2375,7 +2379,17 @@ restart:
 			if (error) {
 				hprintf("inum %016llx vnode flush failed %d\n",
 				    (long long)ip->meta.inum, error);
-				error = 0; /* XXX */
+				/*
+				 * Remember the failure for the return value:
+				 * bulkfree(8) and fsync(2) callers rely on
+				 * sync errors to detect unwritten state
+				 * (bulkfree aborts its pass on a failed
+				 * sync instead of reclaiming from a
+				 * possibly-stale live topology).
+				 */
+				if (syncerror == 0)
+					syncerror = error;
+				error = 0;
 			}
 		}
 
@@ -2526,7 +2540,7 @@ restart:
 	kprintf("FILESYSTEM SYNC STAGE 2 DONE\n");
 #endif
 
-	error = 0; /* XXX */
+	error = syncerror; /* propagate buffer-flush failures (see above) */
 	hammer2_trans_done(pmp, HAMMER2_TRANS_ISFLUSH);
 
 	return (error);
@@ -3151,10 +3165,78 @@ static struct vfsops hammer2_vfsops = {
 	.vfs_opv_descs = hammer2_vnodeopv_descs
 };
 
+/*
+ * Pageout writeback for UVM-dirtied pages.
+ *
+ * genfs_compat_gop_write() passes whole pages to VOP_WRITE(), and
+ * hammer2_write_file() grows EOF to uio_offset + resid, so writing back
+ * a dirty partial last page extended the file to the page boundary.
+ * Clamp the write to the current vnode size (maintained by
+ * uvm_vnp_setsize on extend/truncate) so pageout cannot grow EOF;
+ * genfs_do_putpages() only hands us pages with valid data.
+ */
+static int
+hammer2_gop_write(struct vnode *vp, struct vm_page **pgs, int npages,
+    int flags)
+{
+	off_t offset, eof;
+	size_t len;
+	struct iovec iov;
+	struct uio uio;
+	struct buf *bp;
+	vaddr_t kva;
+	int error;
+
+	offset = pgs[0]->offset;
+	kva = uvm_pagermapin(pgs, npages,
+	    UVMPAGER_MAPIN_WRITE | UVMPAGER_MAPIN_WAITOK);
+
+	eof = (off_t)vp->v_size;
+	len = (size_t)npages << PAGE_SHIFT;
+	if (eof <= offset)
+		len = 0;
+	else if (eof - offset < (off_t)len)
+		len = (size_t)(eof - offset);
+
+	error = 0;
+	if (len) {
+		iov.iov_base = (void *)kva;
+		iov.iov_len = len;
+		uio.uio_iov = &iov;
+		uio.uio_iovcnt = 1;
+		uio.uio_offset = offset;
+		uio.uio_rw = UIO_WRITE;
+		uio.uio_resid = len;
+		UIO_SETUP_SYSSPACE(&uio);
+		error = VOP_WRITE(vp, &uio, 0, curlwp->l_cred);
+	}
+
+	mutex_enter(vp->v_interlock);
+	vp->v_numoutput++;
+	mutex_exit(vp->v_interlock);
+
+	/*
+	 * b_bcount/b_bufsize must cover the FULL page range so
+	 * uvm_aio_aiodone() completes every page, including any tail
+	 * pages past the EOF clamp (they are marked clean; their
+	 * content is beyond EOF by definition).
+	 */
+	bp = getiobuf(vp, true);
+	bp->b_cflags |= BC_BUSY | BC_AGE;
+	bp->b_lblkno = offset >> vp->v_mount->mnt_fs_bshift;
+	bp->b_data = (char *)kva;
+	bp->b_bcount = (size_t)npages << PAGE_SHIFT;
+	bp->b_bufsize = (size_t)npages << PAGE_SHIFT;
+	bp->b_resid = 0;
+	bp->b_error = error;
+	uvm_aio_aiodone(bp);
+	return (error);
+}
+
 static const struct genfs_ops hammer2_genfsops = {
 	.gop_size = genfs_size,
 	.gop_alloc = hammer2_gop_alloc,
-	.gop_write = genfs_compat_gop_write,
+	.gop_write = hammer2_gop_write,
 	.gop_putrange = genfs_gop_putrange,
 };
 

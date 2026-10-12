@@ -165,7 +165,14 @@ typedef struct hammer2_ioc_volume_list hammer2_ioc_volume_list_t;
 
 /*
  * Ioctl to manage volumes (version 2).
+ *
+ * The array is capped below HAMMER2_MAX_VOLUMES because NetBSD rejects
+ * ioctl argument blocks larger than IOCPARM_MAX (4096, unlike DragonFly's
+ * 8192): with all 64 volume slots the _IOWR size encodes 5704 bytes and
+ * the ioctl can never be issued (ENOTTY).
  */
+#define	HAMMER2_IOC_MAXVOLUMES	40
+
 struct hammer2_ioc_volume2 {
 	char			path[64];
 	int			id;
@@ -176,7 +183,7 @@ struct hammer2_ioc_volume2 {
 typedef struct hammer2_ioc_volume2 hammer2_ioc_volume2_t;
 
 struct hammer2_ioc_volume_list2 {
-	hammer2_ioc_volume2_t	volumes[HAMMER2_MAX_VOLUMES];
+	hammer2_ioc_volume2_t	volumes[HAMMER2_IOC_MAXVOLUMES];
 	int			nvolumes;
 	int			version;
 	char			pfs_name[HAMMER2_INODE_MAXNAME];

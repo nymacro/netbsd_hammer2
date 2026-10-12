@@ -296,7 +296,7 @@ hammer2_verify_volumes_common(const hammer2_ondisk_t *fsp,
 	}
 
 	/* fsp->nvolumes hasn't been verified yet, use nvolumes */
-	st = calloc(nvolumes, sizeof(*st));
+	st = calloc(HAMMER2_MAX_VOLUMES, sizeof(*st));
 
 	for (i = 0; i < HAMMER2_MAX_VOLUMES; ++i) {
 		vol = &fsp->volumes[i];

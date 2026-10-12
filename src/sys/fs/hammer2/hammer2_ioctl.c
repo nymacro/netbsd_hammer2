@@ -1045,7 +1045,8 @@ hammer2_ioctl_volume_list2(hammer2_inode_t *ip, void *data)
 		return (EINVAL);
 
 	for (i = 0; i < hmp->nvolumes; ++i) {
-		if (cnt >= vollist->nvolumes)
+		if (cnt >= (int)__arraycount(vollist->volumes) ||
+		    cnt >= vollist->nvolumes)
 			break;
 		vol = &hmp->volumes[i];
 		entry = &vollist->volumes[cnt];
@@ -1086,7 +1087,7 @@ hammer2_ioctl_impl(struct vnode *vp, unsigned long com, void *data,
 	 * as root anyway.
 	 */
 	error = kauth_authorize_system(cred, KAUTH_SYSTEM_MOUNT,
-	    KAUTH_REQ_SYSTEM_MOUNT_UPDATE, NULL, NULL, NULL);
+	    KAUTH_REQ_SYSTEM_MOUNT_UPDATE, NULL, vp->v_mount, NULL);
 
 	switch (com) {
 	case HAMMER2IOC_VERSION_GET:

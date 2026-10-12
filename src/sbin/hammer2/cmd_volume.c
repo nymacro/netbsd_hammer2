@@ -154,7 +154,7 @@ cmd_volume_list2(int ac, char **av)
 			goto failed;
 		}
 
-		vollist.nvolumes = HAMMER2_MAX_VOLUMES;
+		vollist.nvolumes = HAMMER2_IOC_MAXVOLUMES;
 		if (ioctl(fd, HAMMER2IOC_VOLUME_LIST2, &vollist) < 0) {
 			perror("ioctl");
 			close(fd);

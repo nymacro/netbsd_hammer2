@@ -840,8 +840,6 @@ hammer2_read_file(hammer2_inode_t *ip, struct uio *uio, int ioflag)
 	KKASSERT(uio->uio_resid >= 0);
 
 	/*
-	 * UIO read loop.
-	 *
 	 * WARNING! Assumes that the kernel interlocks size changes at the
 	 *	    vnode level.
 	 */
@@ -850,6 +848,26 @@ hammer2_read_file(hammer2_inode_t *ip, struct uio *uio, int ioflag)
 	isize = ip->meta.size;
 	hammer2_mtx_unlock(&ip->lock);
 
+	/*
+	 * NOTE: Reads for regular files deliberately still use the
+	 * logical buffer cache (bread) rather than ubc_uiomove(9).
+	 * A UBC-based read was tried and reverted: with the write
+	 * path still buffer-cache based, mixing the two made data
+	 * written through a second, non-extending write to the same
+	 * block invisible to later reads (bisected to this path).
+	 * Making regular-file reads coherent with mmap(2) requires
+	 * moving the write path to UBC as well (ufs_readwrite model:
+	 * ubc_uiomove for data + genfs_gop_write pageout), including
+	 * hammer2_strategy_write support for the genfs pager's packed
+	 * b_blkno / partial-count buffers.
+	 */
+
+	/*
+	 * UIO read loop.
+	 *
+	 * WARNING! Assumes that the kernel interlocks size changes at the
+	 *	    vnode level.
+	 */
 	while (uio->uio_resid > 0 && (hammer2_off_t)uio->uio_offset < isize) {
 		lblksize = hammer2_calc_logical(ip, uio->uio_offset, &lbase,
 		    NULL);
@@ -1226,8 +1244,42 @@ hammer2_truncate_file(hammer2_inode_t *ip, hammer2_key_t nsize)
 	hammer2_mtx_assert_locked(&ip->lock);
 
 	hammer2_mtx_unlock(&ip->lock);
-	if (ip->vp)
-		vtruncbuf(ip->vp, howmany(nsize, hammer2_get_logical()), 0, 0);
+	if (ip->vp) {
+		struct vnode *vp = ip->vp;
+		int lblksize = hammer2_get_logical();
+
+		vtruncbuf(vp, howmany(nsize, lblksize), 0, 0);
+		/*
+		 * NetBSD's vtruncbuf() does NOT zero out the retained
+		 * partial block (DragonFly's nvtruncbuf() does), and
+		 * nothing here updated the UVM vnode size.  Without this,
+		 * shrinking a file into the middle of a block and
+		 * re-extending it resurrects the old bytes (from the page
+		 * cache and from media), and mapped accesses beyond the
+		 * new EOF do not fault.
+		 *
+		 * Zero the tail through the UVM pages (the same memory the
+		 * buffer cache maps for this vnode), then dirty the block
+		 * so the zeroed range is rewritten to media, mirroring
+		 * ffs_truncate().  A fully-zero block is detected by the
+		 * strategy code and stored as a hole.
+		 */
+		if (nsize & (lblksize - 1)) {
+			hammer2_key_t lbase = nsize &
+			    ~(hammer2_key_t)(lblksize - 1);
+			hammer2_key_t lbn = lbase / lblksize;
+			struct buf *bp;
+			size_t off = (size_t)(nsize - lbase);
+
+			ubc_zerorange(&vp->v_uobj, (off_t)nsize,
+			    (size_t)lblksize - off, UBC_VNODE_FLAGS(vp));
+			bp = getblk(vp, lbn, lblksize, 0, 0);
+			memset((char *)bp->b_data + off, 0, lblksize - off);
+			bawrite(bp);
+		}
+		uvm_vnp_setsize(vp, nsize);
+		uvm_vnp_setwritesize(vp, nsize);
+	}
 	hammer2_mtx_ex(&ip->lock);
 	KKASSERT((ip->flags & HAMMER2_INODE_RESIZED) == 0);
 	ip->osize = ip->meta.size;

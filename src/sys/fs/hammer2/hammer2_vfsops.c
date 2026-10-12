@@ -36,6 +36,7 @@
  */
 
 #include "hammer2.h"
+#include <uvm/uvm.h>
 #include "hammer2_mount.h"
 
 #include <sys/module.h>
@@ -3198,17 +3199,46 @@ hammer2_gop_write(struct vnode *vp, struct vm_page **pgs, int npages,
 	else if (eof - offset < (off_t)len)
 		len = (size_t)(eof - offset);
 
+	/*
+	 * NetBSD: the pagedaemon must not enter the filesystem write
+	 * path at all -- buffer-pool growth, the xop pool and the 64KB
+	 * xop scratch all allocate with M_WAITOK, and under page
+	 * exhaustion that waits for free pages only the pagedaemon
+	 * itself can produce (observed as the whole machine wedged with
+	 * the pagedaemon in uvm_wait("plpg") inside allocbuf).  Defer
+	 * dirty-page cleaning to the syncer instead: complete this
+	 * batch with ENOMEM so genfs_do_putpages() re-dirties the pages
+	 * (uvm_aio_aiodone_pages() treats only ENOMEM as transient for
+	 * file pages -- any other error drops the data), and let the
+	 * syncer's vflushbuf() -- or the writer's own write-behind
+	 * putpages, which runs in a context that may wait -- flush them
+	 * later.  This only ever triggers for mmap stores that idle
+	 * long enough for the pagedaemon to reach them.
+	 */
 	error = 0;
-	if (len) {
-		iov.iov_base = (void *)kva;
-		iov.iov_len = len;
-		uio.uio_iov = &iov;
-		uio.uio_iovcnt = 1;
-		uio.uio_offset = offset;
-		uio.uio_rw = UIO_WRITE;
-		uio.uio_resid = len;
-		UIO_SETUP_SYSSPACE(&uio);
-		error = VOP_WRITE(vp, &uio, 0, curlwp->l_cred);
+	if (curlwp == uvm.pagedaemon_lwp) {
+		len = 0;
+		error = ENOMEM;
+	} else {
+		eof = (off_t)vp->v_size;
+		len = (size_t)npages << PAGE_SHIFT;
+		if (eof <= offset)
+			len = 0;
+		else if (eof - offset < (off_t)len)
+			len = (size_t)(eof - offset);
+
+		if (len) {
+			iov.iov_base = (void *)kva;
+			iov.iov_len = len;
+			uio.uio_iov = &iov;
+			uio.uio_iovcnt = 1;
+			uio.uio_offset = offset;
+			uio.uio_rw = UIO_WRITE;
+			uio.uio_resid = len;
+			UIO_SETUP_SYSSPACE(&uio);
+			error = VOP_WRITE(vp, &uio, HAMMER2_IO_PAGER,
+			    curlwp->l_cred);
+		}
 	}
 
 	mutex_enter(vp->v_interlock);

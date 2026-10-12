@@ -44,6 +44,7 @@
 #include "hammer2.h"
 
 #include <sys/syslimits.h>
+#include <sys/bitops.h>
 #include <sys/dirent.h>
 #include <sys/fcntl.h>
 #include <sys/lockf.h>
@@ -849,21 +850,45 @@ hammer2_read_file(hammer2_inode_t *ip, struct uio *uio, int ioflag)
 	hammer2_mtx_unlock(&ip->lock);
 
 	/*
-	 * NOTE: Reads for regular files deliberately still use the
-	 * logical buffer cache (bread) rather than ubc_uiomove(9).
-	 * A UBC-based read was tried and reverted: with the write
-	 * path still buffer-cache based, mixing the two made data
-	 * written through a second, non-extending write to the same
-	 * block invisible to later reads (bisected to this path).
-	 * Making regular-file reads coherent with mmap(2) requires
-	 * moving the write path to UBC as well (ufs_readwrite model:
-	 * ubc_uiomove for data + genfs_gop_write pageout), including
-	 * hammer2_strategy_write support for the genfs pager's packed
-	 * b_blkno / partial-count buffers.
+	 * NOTE: Reads for regular files go through the UBC (ubc_uiomove(9),
+	 * ufs_read model) so they are coherent with mmap(2) stores, which
+	 * live in the vnode's VM pages: a buffered read must return the
+	 * latest mapped store, not the media content the chain layer still
+	 * holds.  genfs_getpages() faults missing pages in through
+	 * VOP_BMAP/VOP_STRATEGY (hammer2_strategy_read), so holes and
+	 * compression are handled by the existing pager read path.
+	 *
+	 * The logical buffer cache cannot be mixed with UBC reads: NetBSD
+	 * buffers are private-pool memory (buf_alloc), disjoint from the
+	 * VM pages, so data written through a buffer is invisible to the
+	 * page cache (and vice versa) until pageout.  The write path must
+	 * use UBC too (hammer2_write_file), and pageout (hammer2_gop_write,
+	 * marked HAMMER2_IO_PAGER) funnels the dirty pages back through
+	 * the logical buffer cache into the chain layer.
+	 *
+	 * Symlinks (readlink) deliberately stay on the buffer path.
 	 */
+	if (vp->v_type == VREG) {
+		const int advice = IO_ADV_DECODE(ioflag);
+
+		while (uio->uio_resid > 0 &&
+		    (hammer2_off_t)uio->uio_offset < isize) {
+			vsize_t bytelen = isize - uio->uio_offset;
+
+			if (bytelen > uio->uio_resid)
+				bytelen = uio->uio_resid;
+			error = ubc_uiomove(&vp->v_uobj, uio, bytelen, advice,
+			    UBC_READ | UBC_PARTIALOK | UBC_VNODE_FLAGS(vp));
+			if (error)
+				break;
+		}
+		/* XXX atime not updated */
+		hammer2_mtx_unlock(&ip->truncate_lock);
+		return (error);
+	}
 
 	/*
-	 * UIO read loop.
+	 * UIO read loop (buffer cache path, symlinks).
 	 *
 	 * WARNING! Assumes that the kernel interlocks size changes at the
 	 *	    vnode level.
@@ -1002,7 +1027,113 @@ hammer2_write_file(hammer2_inode_t *ip, struct uio *uio, int ioflag,
 	}
 	hammer2_mtx_unlock(&ip->lock);
 
-	/* UIO write loop. */
+	/*
+	 * UBC write path for regular files (ufs_write model).
+	 *
+	 * Data is copied straight into the vnode's VM pages so it is
+	 * coherent with mmap(2) stores in both directions (NetBSD
+	 * buffer-cache memory is a private pool, disjoint from the page
+	 * cache, so the old buffer path was invisible to mmaps until
+	 * pageout, and mapped stores were invisible to buffered reads).
+	 * Dirty pages reach the chain layer through the pager:
+	 * genfs_do_putpages -> hammer2_gop_write (HAMMER2_IO_PAGER) ->
+	 * the logical-buffer-cache loop below.
+	 *
+	 * Pageout-originated writes (HAMMER2_IO_PAGER) and symlinks stay
+	 * on the logical buffer cache: the pages handed to us by
+	 * genfs_do_putpages are PG_BUSY, so faulting them in again via
+	 * ubc_uiomove is not an option.
+	 */
+	if (vp->v_type == VREG && (ioflag & HAMMER2_IO_PAGER) == 0) {
+		const int advice = IO_ADV_DECODE(ioflag);
+		const int fshift = ilog2(MAXPHYS);
+		const off_t origoff = uio->uio_offset;
+
+		while (uio->uio_resid > 0) {
+			vsize_t bytelen;
+			off_t oldoff, newoff;
+
+			lblksize = hammer2_calc_logical(ip, uio->uio_offset,
+			    &lbase, NULL);
+			KKASSERT(lblksize <= MAXBSIZE);
+			loff = (int)(uio->uio_offset - lbase);
+			oldoff = uio->uio_offset;
+			bytelen = lblksize - loff;
+			if (bytelen > uio->uio_resid)
+				bytelen = uio->uio_resid;
+			newoff = oldoff + bytelen;
+
+			/*
+			 * hammer2_extend_file() already advanced v_size to
+			 * cover extending writes; these guards only cover
+			 * writes that do not go through it.
+			 */
+			if ((off_t)vp->v_size < newoff)
+				uvm_vnp_setwritesize(vp, newoff);
+
+			/*
+			 * Faults load missing pages through genfs_getpages()
+			 * / hammer2_strategy_read (partial-block
+			 * read-modify-write, hole zero-fill, past-EOF
+			 * zero-fill), then the data overwrites them.
+			 */
+			error = ubc_uiomove(&vp->v_uobj, uio, bytelen, advice,
+			    UBC_WRITE | UBC_VNODE_FLAGS(vp));
+			if ((off_t)vp->v_size < newoff)
+				uvm_vnp_setsize(vp, newoff);
+			if (error)
+				break;
+			modified = 1;
+
+			/*
+			 * Write-behind pacing.  H2 cannot preallocate
+			 * logical blocks (compression unknown until
+			 * strategy time), so without pacing a large write
+			 * would dirty an unbounded number of pages before
+			 * any media allocation happens.
+			 */
+			if (ioflag & IO_DIRECT) {
+				rw_enter(vp->v_uobj.vmobjlock, RW_WRITER);
+				error = VOP_PUTPAGES(vp, trunc_page(oldoff),
+				    round_page(uio->uio_offset),
+				    PGO_CLEANIT | PGO_SYNCIO);
+				/* genfs_do_putpages() releases the object lock. */
+				if (error)
+					break;
+			} else if (!async &&
+			    (oldoff >> fshift) != (uio->uio_offset >> fshift)) {
+				rw_enter(vp->v_uobj.vmobjlock, RW_WRITER);
+				error = VOP_PUTPAGES(vp,
+				    (oldoff >> fshift) << fshift,
+				    (uio->uio_offset >> fshift) << fshift,
+				    PGO_CLEANIT | PGO_SYNCIO);
+				/* genfs_do_putpages() releases the object lock. */
+				if (error)
+					break;
+			}
+		}
+
+		if (error == 0 && (ioflag & IO_SYNC)) {
+			rw_enter(vp->v_uobj.vmobjlock, RW_WRITER);
+			error = VOP_PUTPAGES(vp, trunc_page(origoff),
+			    round_page(uio->uio_offset),
+			    PGO_CLEANIT | PGO_SYNCIO);
+			/* genfs_do_putpages() releases the object lock. */
+		}
+	} else {
+		/*
+		 * NetBSD: pageout writes must run synchronously (IO_SYNC):
+		 * gop_write marks the pages clean as soon as VOP_WRITE
+		 * returns, so an async strategy failure under memory
+		 * pressure would silently drop the data.  With IO_SYNC,
+		 * bwrite reports the error and genfs_do_putpages leaves
+		 * the pages dirty for a later retry (the pagedaemon also
+		 * runs strategy with nowait memory allocations, see
+		 * hammer2_strategy.c).
+		 */
+		ioflag |= IO_SYNC;
+	/* UIO write loop (logical buffer cache: pageout + symlinks). */
+
 	while (uio->uio_resid > 0) {
 		/*
 		 * Upstream calls bwillwrite() here to apply buffer-cache
@@ -1090,14 +1221,17 @@ hammer2_write_file(hammer2_inode_t *ip, struct uio *uio, int ioflag,
 		 *	    map.
 		 */
 		/* No cluster_write() in NetBSD. */
-		if (ioflag & IO_SYNC)
-			bwrite(bp);
-		else if ((ioflag & IO_DIRECT) && endofblk)
+		if (ioflag & IO_SYNC) {
+			error = bwrite(bp);
+			if (error)
+				break;
+		} else if ((ioflag & IO_DIRECT) && endofblk)
 			bawrite(bp);
 		else if (async)
 			bawrite(bp);
 		else
 			bawrite(bp); /* XXX chlock: originally bdwrite */
+	}
 	}
 
 	/*

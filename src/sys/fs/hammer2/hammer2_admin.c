@@ -36,6 +36,7 @@
  */
 
 #include "hammer2.h"
+#include <uvm/uvm.h>
 
 #define H2XOPDESCRIPTOR(label)					\
 	hammer2_xop_desc_t hammer2_##label##_desc = {		\
@@ -127,7 +128,21 @@ hammer2_xop_alloc(hammer2_inode_t *ip, int flags)
 {
 	hammer2_xop_t *xop;
 
-	xop = pool_get(&hammer2_pool_xops, PR_WAITOK | PR_ZERO);
+	/*
+	 * NetBSD: the pagedaemon can reach xop allocation through the
+	 * strategy path (putpages -> gop_write -> VOP_WRITE -> strategy),
+	 * and a PR_WAITOK pool growth waits for free pages only the
+	 * pagedaemon itself can free -- a self-deadlock.  Never wait in
+	 * that context; callers handle the NULL return (the strategy
+	 * paths fail the single buffer, genfs_do_putpages() re-dirties
+	 * the page and it is retried from a context that may wait).
+	 */
+	if (curlwp == uvm.pagedaemon_lwp)
+		xop = pool_get(&hammer2_pool_xops, PR_NOWAIT | PR_ZERO);
+	else
+		xop = pool_get(&hammer2_pool_xops, PR_WAITOK | PR_ZERO);
+	if (xop == NULL)
+		return (NULL);
 	KKASSERT(xop->head.cluster.array[0].chain == NULL);
 
 	xop->head.ip1 = ip;
@@ -336,9 +351,33 @@ hammer2_xop_start(hammer2_xop_head_t *xop, hammer2_xop_desc_t *desc)
 	hammer2_assert_cluster(&ip->cluster);
 	xop->desc = desc;
 
-	if (desc == &hammer2_strategy_write_desc)
+	if (desc == &hammer2_strategy_write_desc) {
+		/*
+		 * NetBSD: pagedaemon context must not wait for memory
+		 * (see hammer2_xop_alloc()).  On failure, fail this one
+		 * buffer with ENOMEM -- genfs_do_putpages() re-dirties
+		 * the page and the write is retried later.
+		 */
+		const int mflags = (curlwp == uvm.pagedaemon_lwp) ?
+		    (M_NOWAIT | M_ZERO) : (M_WAITOK | M_ZERO);
+
 		xop->scratch = hmalloc(hammer2_get_logical(), M_HAMMER2,
-		    M_WAITOK | M_ZERO);
+		    mflags);
+		if (xop->scratch == NULL) {
+			struct buf *bp = ((hammer2_xop_strategy_t *)xop)->bp;
+			int j;
+
+			for (j = 0; j < ip->cluster.nchains; ++j) {
+				if (ip->cluster.array[j].chain) {
+					hammer2_xop_feed(xop, NULL, j, ENOMEM);
+					hammer2_xop_retire(xop, 1LLU << j);
+				}
+			}
+			bp->b_error = ENOMEM;
+			biodone(bp);
+			return;
+		}
+	}
 
 	/*
 	 * Register the dependent inodes in the pmp ipdep hash exactly

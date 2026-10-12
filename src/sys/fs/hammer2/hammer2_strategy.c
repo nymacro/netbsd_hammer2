@@ -45,6 +45,7 @@
  */
 
 #include "hammer2.h"
+#include <uvm/uvm.h>
 #include "hammer2_lz4.h"
 #include "hammer2_xxhash.h"
 
@@ -227,6 +228,14 @@ hammer2_strategy_read(struct vop_strategy_args *ap)
 	KKASSERT(((int)lbase & HAMMER2_PBUFMASK) == 0);
 
 	xop = hammer2_xop_alloc(ip, HAMMER2_XOP_STRATEGY);
+	if (xop == NULL) {
+		/* pagedaemon context under memory pressure; see
+		 * hammer2_xop_alloc().  genfs_do_putpages() re-dirties
+		 * the page and the read is retried later. */
+		bp->b_error = ENOMEM;
+		biodone(bp);
+		return (0);
+	}
 	xop->bp = bp;
 	xop->lbase = lbase;
 	hammer2_xop_start(&xop->head, &hammer2_strategy_read_desc);
@@ -409,6 +418,7 @@ hammer2_strategy_write(struct vop_strategy_args *ap)
 	struct vnode *vp = ap->a_vp;
 	struct buf *bp = ap->a_bp;
 	hammer2_key_t lbase;
+	int pdctx;
 
 	lbase = (hammer2_key_t)bp->b_lblkno * hammer2_get_logical();
 	KKASSERT(((int)lbase & HAMMER2_PBUFMASK) == 0);
@@ -420,11 +430,19 @@ hammer2_strategy_write(struct vop_strategy_args *ap)
 	 * places it at the strategy entry, which normally runs without
 	 * the vnode lock held).  An IO_SYNC bwrite, however, executes
 	 * VOP_STRATEGY inline in the writer, which still holds vp
-	 * exclusively — in that case skip the wait: waiting with the
+	 * exclusively -- in that case skip the wait: waiting with the
 	 * vp lock held livelocks hammer2_vfs_sync_pmp()'s restart
 	 * loop against its vn_lock(LK_NOWAIT).
+	 *
+	 * NetBSD: the pagedaemon reaches this via putpages -> gop_write
+	 * -> VOP_WRITE.  It must never wait here at all -- neither for
+	 * memory (hammer2_xop_start's scratch) nor for in-flight write
+	 * pressure to drain: the pages it would wait for can only be
+	 * freed by itself.  Skip both waits and let the allocation
+	 * failure path fail this one buffer with ENOMEM instead.
 	 */
-	if (VOP_ISLOCKED(vp) == 0)
+	pdctx = (curlwp == uvm.pagedaemon_lwp);
+	if (!pdctx && VOP_ISLOCKED(vp) == 0)
 		hammer2_pfs_memory_wait(pmp);
 
 	atomic_set_int(&ip->flags, HAMMER2_INODE_DIRTYDATA);
@@ -434,10 +452,19 @@ hammer2_strategy_write(struct vop_strategy_args *ap)
 
 	xop = hammer2_xop_alloc(ip,
 	    HAMMER2_XOP_MODIFYING | HAMMER2_XOP_STRATEGY);
+	if (xop == NULL) {
+		/* pagedaemon context under memory pressure. */
+		hammer2_trans_done(pmp, HAMMER2_TRANS_BUFCACHE);
+		hammer2_lwinprog_drop(pmp);
+		bp->b_error = ENOMEM;
+		biodone(bp);
+		return (0);
+	}
 	xop->bp = bp;
 	xop->lbase = lbase;
 	hammer2_xop_start(&xop->head, &hammer2_strategy_write_desc);
-	hammer2_lwinprog_wait(pmp, hammer2_flush_pipe);
+	if (!pdctx)
+		hammer2_lwinprog_wait(pmp, hammer2_flush_pipe);
 	hammer2_xop_retire(&xop->head, HAMMER2_XOPMASK_VOP);
 
 	return (0);

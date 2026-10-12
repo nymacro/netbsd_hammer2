@@ -62,9 +62,20 @@
  */
 
 #ifndef _FS_HAMMER2_HAMMER2_H_
+
 #define _FS_HAMMER2_HAMMER2_H_
 
 #define __KAUTH_PRIVATE
+
+/*
+ * NetBSD: private ioflag bit used to mark VOP_WRITE calls originating
+ * from hammer2_gop_write() (genfs_do_putpages pageout).  Never set by
+ * userland (unlike IO_ALTSEMANTICS, which O_ALT_IO controls); high bit
+ * outside the MI IO_* namespace, same convention as IO_ASYNC in
+ * hammer2_strategy.c.  Pageout writes take the logical-buffer-cache
+ * path in hammer2_write_file(), real write(2)s take the UBC path.
+ */
+#define	HAMMER2_IO_PAGER	0x20000000
 
 #include <sys/param.h>
 #include <sys/systm.h>

@@ -408,6 +408,15 @@ hammer2_ioctl_pfs_delete(hammer2_inode_t *ip, void *data)
 	}
 
 	/*
+	 * Refuse while a `hammer2 send` session is streaming this PFS
+	 * (hammer2_send.c pin; also keyed by device+label).
+	 */
+	if (hammer2_send_pin_count(hmp, pfs->name)) {
+		hammer2_lk_unlock(&hammer2_mntlk);
+		return (EBUSY);
+	}
+
+	/*
 	 * Ok, we found the pmp and we have the index.  Permanently remove
 	 * the PFS from the cluster.
 	 */
@@ -1139,8 +1148,19 @@ hammer2_ioctl_impl(struct vnode *vp, unsigned long com, void *data,
 			error = hammer2_ioctl_growfs(ip, data);
 		break;
 	case HAMMER2IOC_VOLUME_LIST:
+		error = hammer2_ioctl_volume_list(ip, data);
+		break;
+	case HAMMER2IOC_SEND_START:
 		if (error == 0)
-			error = hammer2_ioctl_volume_list(ip, data);
+			error = hammer2_send_start(ip, data);
+		break;
+	case HAMMER2IOC_SEND_NEXT:
+		if (error == 0)
+			error = hammer2_send_next(ip, data);
+		break;
+	case HAMMER2IOC_SEND_FINISH:
+		if (error == 0)
+			error = hammer2_send_finish(ip, data);
 		break;
 	case HAMMER2IOC_VOLUME_LIST2:
 		if (error == 0)

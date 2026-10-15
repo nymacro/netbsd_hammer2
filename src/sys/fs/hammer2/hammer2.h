@@ -1400,6 +1400,14 @@ void hammer2_io_dedup_assert(hammer2_dev_t *, hammer2_off_t, unsigned int);
 int hammer2_ioctl_impl(struct vnode *, unsigned long, void *, int,
     kauth_cred_t);
 
+/* hammer2_send.c */
+void hammer2_send_init(void);
+void hammer2_send_done(void);
+int hammer2_send_start(hammer2_inode_t *, void *);
+int hammer2_send_next(hammer2_inode_t *, void *);
+int hammer2_send_finish(hammer2_inode_t *, void *);
+int hammer2_send_pin_count(hammer2_dev_t *, const char *);
+
 /* hammer2_ondisk.c */
 int hammer2_open_devvp(struct mount *, const hammer2_devvp_list_t *);
 int hammer2_close_devvp(const hammer2_devvp_list_t *);

@@ -462,3 +462,51 @@ put_hammer2_mounts(int ac, char **av)
 		free(av[ac]);
 	free(av);
 }
+
+/*
+ * Return 1 if `devpath' backs any mounted hammer2 filesystem, 0 if not,
+ * -1 if devpath cannot be stat'ed.  Used by tools that require
+ * exclusive offline access to a volume (recv writes raw blocks under a
+ * mounted filesystem's cache would corrupt it).
+ *
+ * Mount-table device names and the caller's path may use different
+ * node classes (block vs character) or /dev prefixes, so compare the
+ * path basename first, then fall back to stat(2) rdev identity.
+ */
+static const char *
+last_path_component(const char *path)
+{
+	const char *p = strrchr(path, '/');
+
+	return (p ? p + 1 : path);
+}
+
+int
+hammer2_volume_is_mounted(const char *devpath)
+{
+	struct statvfs *fs;
+	struct stat st, mst;
+	const char *dname;
+	int n, i, rv;
+
+	if (stat(devpath, &st) < 0)
+		return (-1);
+
+	rv = 0;
+	dname = last_path_component(devpath);
+	n = getmntinfo(&fs, MNT_NOWAIT);
+	for (i = 0; i < n; ++i) {
+		if (strcmp(fs[i].f_fstypename, "hammer2") != 0)
+			continue;
+		if (strcmp(dname,
+			   last_path_component(fs[i].f_mntfromname)) == 0) {
+			rv = 1;
+			continue;
+		}
+		if (stat(fs[i].f_mntfromname, &mst) == 0 &&
+		    major(st.st_rdev) == major(mst.st_rdev) &&
+		    minor(st.st_rdev) == minor(mst.st_rdev))
+			rv = 1;
+	}
+	return (rv);
+}

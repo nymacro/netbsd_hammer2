@@ -370,6 +370,7 @@ hammer2_init(void)
 	    "h2xopspool", &pool_allocator_nointr, IPL_NONE);
 
 	hammer2_lk_init(&hammer2_mntlk, "h2_mnt");
+	hammer2_send_init();
 
 	TAILQ_INIT(&hammer2_mntlist);
 	TAILQ_INIT(&hammer2_pfslist);
@@ -396,6 +397,7 @@ hammer2_reinit(void)
 static void
 hammer2_done(void)
 {
+	hammer2_send_done();
 	hammer2_lk_destroy(&hammer2_mntlk);
 
 	pool_destroy(&hammer2_pool_inode);

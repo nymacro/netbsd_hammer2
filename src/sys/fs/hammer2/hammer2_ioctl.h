@@ -192,6 +192,40 @@ struct hammer2_ioc_volume_list2 {
 typedef struct hammer2_ioc_volume_list2 hammer2_ioc_volume_list2_t;
 
 /*
+ * send - serialize a PFS as a blockref/payload record stream (zfs send
+ * analog).  The walk is performed in-kernel over the live chain topology.
+ *
+ * SEND_START resolves <label> under the device's super-root, pins it
+ * against hammer2 pfs-delete for the duration of the session, and returns
+ * the stream header facts.  SEND_NEXT returns the next record in
+ * post-order (children before parents; the last record is the PFS root
+ * inode) plus its payload copyout'd to <payload>.  SEND_FINISH releases
+ * the pin and the walk state.  A session is keyed by (device, label);
+ * only one session per label may be active.
+ */
+#define HAMMER2_SENDF_SKIP_PAYLOAD	0x00000001	/* brefs only (-i index) */
+
+#define HAMMER2_SENDREC_EOF		0x0001		/* no more records */
+#define HAMMER2_SENDREC_LEAF		0x0002		/* shareable leaf */
+
+struct hammer2_ioc_send {
+	char		label[NAME_MAX+1];	/* in: source PFS label */
+	uint32_t	flags;			/* in: HAMMER2_SENDF_* */
+	uint32_t	rec_flags;		/* out: HAMMER2_SENDREC_* */
+	uint32_t	rec_size;		/* out: payload bytes */
+	uint32_t	pad;
+	struct uuid	pfs_clid;		/* out: source PFS cluster id */
+	struct uuid	pfs_fsid;		/* out: source PFS instance id */
+	uint64_t	mirror_tid;		/* out: source volhdr mirror_tid */
+	uint64_t	volu_size;		/* out: volume-set size */
+	hammer2_blockref_t root_bref;		/* out: PFS root blockref */
+	hammer2_blockref_t bref;		/* out: current record blockref */
+	void		*payload;		/* in: user payload buffer */
+};
+
+typedef struct hammer2_ioc_send hammer2_ioc_send_t;
+
+/*
  * Ioctl list.
  */
 #define HAMMER2IOC_VERSION_GET		_IOWR('h', 64, struct hammer2_ioc_version)
@@ -216,5 +250,11 @@ typedef struct hammer2_ioc_volume_list2 hammer2_ioc_volume_list2_t;
 #define HAMMER2IOC_GROWFS		_IOWR('h', 96, struct hammer2_ioc_growfs)
 #define HAMMER2IOC_VOLUME_LIST		_IOWR('h', 97, struct hammer2_ioc_volume_list)
 #define HAMMER2IOC_VOLUME_LIST2		_IOWR('h', 197, struct hammer2_ioc_volume_list2)
+#define HAMMER2IOC_SEND_START		_IOWR('h', 98, struct hammer2_ioc_send)
+#define HAMMER2IOC_SEND_NEXT		_IOWR('h', 99, struct hammer2_ioc_send)
+#define HAMMER2IOC_SEND_FINISH		_IOWR('h', 100, struct hammer2_ioc_send)
+#define HAMMER2IOC_SEND_START		_IOWR('h', 98, struct hammer2_ioc_send)
+#define HAMMER2IOC_SEND_NEXT		_IOWR('h', 99, struct hammer2_ioc_send)
+#define HAMMER2IOC_SEND_FINISH		_IOWR('h', 100, struct hammer2_ioc_send)
 
 #endif /* !_FS_HAMMER2_IOCTL_H_ */

@@ -13,10 +13,8 @@
  *
  * 1. Redistributions of source code must retain the above copyright
  *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in
- *    the documentation and/or other materials provided with the
- *    distribution.
+ * 2. Redistributions in binary form must reproduce the same copyright
+ *    notice in the binary distribution.
  *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
  * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
@@ -33,10 +31,22 @@
  */
 
 /*
- * hammer2 send - serialize a PFS (snapshot) as a stream of blockrefs and
- * media payloads, similar to zfs send.  The source is read directly from
- * the volume(s), so the filesystem must be quiescent (unmounted, or a
- * snapshot PFS) while the stream is being produced.
+ * hammer2 send - serialize a PFS (typically a snapshot) as a stream of
+ * blockrefs and media payloads, similar to zfs send.
+ *
+ * The topology walk runs IN THE KERNEL (HAMMER2IOC_SEND_* ioctls,
+ * hammer2_send.c): the source PFS is pinned for the duration of the
+ * session (concurrent `hammer2 pfs-delete` fails with EBUSY), every
+ * emitted block is check-verified by the kernel, and the walked
+ * topology is a point-in-time COW view.  The device therefore does not
+ * need to be unmounted - the first argument is any path on the mounted
+ * hammer2 filesystem (mount point, or any file within it).
+ *
+ * This file only implements the stream framing (512B header + records,
+ * see hammer2_stream.h) and the incremental -i dedup logic: a first
+ * SKIP_PAYLOAD pump pass over the from-generation PFS builds the leaf
+ * index, then unchanged leaves in the to-generation walk are emitted as
+ * REF records instead of payloads.
  */
 
 #include <err.h>
@@ -45,235 +55,8 @@
 #include <string.h>
 #include <unistd.h>
 
-#include <openssl/sha.h>
-
 #include "hammer2.h"
 #include "hammer2_stream.h"
-
-static ssize_t
-read_phys(hammer2_off_t data_off, void *buf, size_t bytes)
-{
-	hammer2_off_t io_off = data_off & ~HAMMER2_OFF_MASK_RADIX;
-	int fd = hammer2_get_volume_fd(io_off);
-	hammer2_off_t off;
-
-	if (fd < 0)
-		return (-1);
-	off = io_off - hammer2_get_volume_offset(io_off);
-	return (pread(fd, buf, bytes, off));
-}
-
-static size_t
-bref_radix_bytes(const hammer2_blockref_t *bref)
-{
-	int radix = bref->data_off & HAMMER2_OFF_MASK_RADIX;
-
-	if (radix == 0)
-		return (0);
-	return ((size_t)1 << radix);
-}
-
-static int
-read_media_bref(const hammer2_blockref_t *bref, void *buf)
-{
-	size_t bytes = bref_radix_bytes(bref);
-
-	if (bytes == 0 || bytes > HAMMER2_PBUFSIZE)
-		return (-1);
-	if (read_phys(bref->data_off, buf, bytes) != (ssize_t)bytes)
-		return (-1);
-	return (0);
-}
-
-/*
- * Verify a bref's check code against `bytes' of media data.
- * Returns 0 on success, -1 on mismatch/unsupported.
- */
-static int
-test_check(const hammer2_blockref_t *bref, const void *data, size_t bytes)
-{
-	uint32_t cv;
-	uint64_t cv64;
-	SHA256_CTX hash_ctx;
-	union {
-		uint8_t digest[SHA256_DIGEST_LENGTH];
-		uint64_t digest64[SHA256_DIGEST_LENGTH / 8];
-	} u;
-
-	switch (HAMMER2_DEC_CHECK(bref->methods)) {
-	case HAMMER2_CHECK_NONE:
-	case HAMMER2_CHECK_DISABLED:
-		return (0);
-	case HAMMER2_CHECK_ISCSI32:
-		cv = hammer2_icrc32(data, bytes);
-		if (bref->check.iscsi32.value == cv)
-			return (0);
-		break;
-	case HAMMER2_CHECK_XXHASH64:
-		cv64 = XXH64(data, bytes, XXH_HAMMER2_SEED);
-		if (bref->check.xxhash64.value == cv64)
-			return (0);
-		break;
-	case HAMMER2_CHECK_SHA192:
-		SHA256_Init(&hash_ctx);
-		SHA256_Update(&hash_ctx, data, bytes);
-		SHA256_Final(u.digest, &hash_ctx);
-		u.digest64[2] ^= u.digest64[3];
-		if (memcmp(u.digest, bref->check.sha192.data,
-			   sizeof(bref->check.sha192.data)) == 0)
-			return (0);
-		break;
-	case HAMMER2_CHECK_FREEMAP:
-		cv = hammer2_icrc32(data, bytes);
-		if (bref->check.freemap.icrc32 == cv)
-			return (0);
-		break;
-	default:
-		break;
-	}
-	return (-1);
-}
-
-/*
- * The blockref tree of a PFS contains only these types.  Data blocks and
- * dirent name blocks may be compressed (their check code covers the stored
- * bytes); inode and indirect blocks are always stored raw.
- */
-static int
-is_leaf_bref(const hammer2_blockref_t *bref, const void *data)
-{
-	if (bref->type == HAMMER2_BREF_TYPE_DATA ||
-	    bref->type == HAMMER2_BREF_TYPE_DIRENT)
-		return (1);
-	if (bref->type == HAMMER2_BREF_TYPE_INODE &&
-	    ((const hammer2_inode_data_t *)data)->meta.op_flags &
-	    HAMMER2_OPFLAG_DIRECTDATA)
-		return (1);
-	return (0);
-}
-
-static int
-has_check_method(uint8_t methods)
-{
-	switch (HAMMER2_DEC_CHECK(methods)) {
-	case HAMMER2_CHECK_ISCSI32:
-	case HAMMER2_CHECK_XXHASH64:
-	case HAMMER2_CHECK_SHA192:
-	case HAMMER2_CHECK_FREEMAP:
-		return (1);
-	default:
-		return (0);
-	}
-}
-
-/*
- * Iterate the child blockrefs of a media block.
- * Returns the number of children and sets *slotsp.
- */
-static int
-get_slots(const hammer2_blockref_t *bref, const void *data, size_t bytes,
-	  const hammer2_blockref_t **slotsp)
-{
-	const hammer2_inode_data_t *ipdata;
-	const hammer2_blockref_t *slots;
-	int count;
-
-	switch (bref->type) {
-	case HAMMER2_BREF_TYPE_INODE:
-		ipdata = data;
-		if (ipdata->meta.op_flags & HAMMER2_OPFLAG_DIRECTDATA) {
-			slots = NULL;
-			count = 0;
-		} else {
-			slots = &ipdata->u.blockset.blockref[0];
-			count = HAMMER2_SET_COUNT;
-		}
-		break;
-	case HAMMER2_BREF_TYPE_INDIRECT:
-		slots = &((const hammer2_media_data_t *)data)->npdata[0];
-		count = (int)(bytes / HAMMER2_BLOCKREF_BYTES);
-		break;
-	default:
-		slots = NULL;
-		count = 0;
-		break;
-	}
-	*slotsp = slots;
-	return (count);
-}
-
-/*
- * Seen-block set (dedup: a physical block may be referenced multiple
- * times).  Keyed by data_off including the radix bits.
- */
-#define SEEN_HBITS	14
-#define SEEN_HSIZE	(1 << SEEN_HBITS)
-
-typedef struct seen_entry {
-	struct seen_entry *next;
-	hammer2_off_t data_off;
-} seen_entry_t;
-
-static seen_entry_t *SeenHash[SEEN_HSIZE];
-
-static inline uint32_t
-seen_hash(hammer2_off_t data_off)
-{
-	return (uint32_t)(data_off * 2654435761U) >> (32 - SEEN_HBITS);
-}
-
-static int
-seen_find(hammer2_off_t data_off)
-{
-	seen_entry_t *e;
-
-	for (e = SeenHash[seen_hash(data_off)]; e; e = e->next)
-		if (e->data_off == data_off)
-			return (1);
-	return (0);
-}
-
-static void
-seen_add(hammer2_off_t data_off)
-{
-	seen_entry_t *e = malloc(sizeof(*e));
-
-	if (e == NULL)
-		err(1, "send: out of memory");
-	e->data_off = data_off;
-	e->next = SeenHash[seen_hash(data_off)];
-	SeenHash[seen_hash(data_off)] = e;
-}
-
-/*
- * Independent seen-set for the from-generation index walk (the walk must
- * not consume the emit walk's set: blocks unchanged between generations
- * have identical data_off and would be skipped from the stream).
- */
-static seen_entry_t *FSeenHash[SEEN_HSIZE];
-
-static void
-fseen_add(hammer2_off_t data_off)
-{
-	seen_entry_t *e = malloc(sizeof(*e));
-
-	if (e == NULL)
-		err(1, "send: out of memory");
-	e->data_off = data_off;
-	e->next = FSeenHash[seen_hash(data_off)];
-	FSeenHash[seen_hash(data_off)] = e;
-}
-
-static int
-fseen_find(hammer2_off_t data_off)
-{
-	seen_entry_t *e;
-
-	for (e = FSeenHash[seen_hash(data_off)]; e; e = e->next)
-		if (e->data_off == data_off)
-			return (1);
-	return (0);
-}
 
 /*
  * From-generation leaf index for incremental sends.  Keyed by the bref
@@ -289,6 +72,10 @@ typedef struct leaf_entry {
 } leaf_entry_t;
 
 static leaf_entry_t *LeafHash[LEAF_HSIZE];
+static uint64_t IndexLeaves;
+static uint64_t EmitRecords;
+static uint64_t EmitPayloadBytes;
+static uint64_t EmitRefBytes;
 
 static void
 leaf_key(const hammer2_blockref_t *bref, hammer2_blockref_t *key)
@@ -337,9 +124,19 @@ leaf_find(const hammer2_blockref_t *bref)
 	return (0);
 }
 
-static uint64_t EmitRecords;
-static uint64_t EmitPayloadBytes;
-static uint64_t EmitRefBytes;
+static int
+has_check_method(uint8_t methods)
+{
+	switch (HAMMER2_DEC_CHECK(methods)) {
+	case HAMMER2_CHECK_ISCSI32:
+	case HAMMER2_CHECK_XXHASH64:
+	case HAMMER2_CHECK_SHA192:
+	case HAMMER2_CHECK_FREEMAP:
+		return (1);
+	default:
+		return (0);
+	}
+}
 
 static void
 write_record(FILE *fp, const hammer2_blockref_t *bref, uint32_t flags,
@@ -366,192 +163,128 @@ write_record(FILE *fp, const hammer2_blockref_t *bref, uint32_t flags,
 	}
 }
 
+/*
+ * Pump a full send session for `label' (brefs + payloads into (*fp) when
+ * fp is non-NULL, brefs only otherwise) and apply the caller callback to
+ * each record.
+ */
+typedef void (*send_rec_fn)(FILE *, const hammer2_ioc_send_t *,
+			    const void *, void *);
+
 static void
-emit_node(FILE *fp, const hammer2_blockref_t *bref, int depth)
+emit_record(FILE *fp, const hammer2_ioc_send_t *ioc, const void *data,
+	    void *arg __unused)
 {
-	hammer2_media_data_t media;
-	const hammer2_blockref_t *slots;
-	size_t bytes;
-	int count, i, leaf;
-
-	if (depth > 16)
-		errx(1, "send: topology too deep (corrupt media?)");
-
-	switch (bref->type) {
-	case HAMMER2_BREF_TYPE_EMPTY:
-	case HAMMER2_BREF_TYPE_INVALID:
-		return;
-	case HAMMER2_BREF_TYPE_INODE:
-	case HAMMER2_BREF_TYPE_INDIRECT:
-	case HAMMER2_BREF_TYPE_DATA:
-	case HAMMER2_BREF_TYPE_DIRENT:
-		break;
-	default:
-		errx(1, "send: unexpected bref type %d at %016llx",
-		    bref->type, (long long)bref->data_off);
-	}
-
-	bytes = bref_radix_bytes(bref);
-	if (bytes == 0) {
-		/*
-		 * No media reference (empty slot, embedded dirent name,
-		 * or a zero-fill hole).  The parent's embedded copy of
-		 * this bref carries everything.
-		 */
-		return;
-	}
-
-	if (seen_find(bref->data_off))
-		return;
-	seen_add(bref->data_off);
-
-	if (read_media_bref(bref, &media))
-		errx(1, "send: read failed at %016llx",
-		    (long long)bref->data_off);
-
-	if (test_check(bref, &media, bytes))
-		errx(1, "send: check code mismatch at %016llx (%s)",
-		    (long long)bref->data_off,
-		    hammer2_breftype_to_str(bref->type));
-
-	count = get_slots(bref, &media, bytes, &slots);
-	for (i = 0; i < count; ++i)
-		emit_node(fp, &slots[i], depth + 1);
-
-	leaf = is_leaf_bref(bref, &media);
-	if (leaf && has_check_method(bref->methods) && leaf_find(bref)) {
+	if ((ioc->rec_flags & HAMMER2_SENDREC_LEAF) &&
+	    has_check_method(ioc->bref.methods) && leaf_find(&ioc->bref)) {
 		/* Unchanged leaf: reference the destination copy. */
-		write_record(fp, bref, HAMMER2_STREAM_RECF_REF, NULL, 0);
+		write_record(fp, &ioc->bref, HAMMER2_STREAM_RECF_REF, NULL, 0);
 	} else {
-		write_record(fp, bref, 0, &media, bytes);
+		write_record(fp, &ioc->bref, 0, data, ioc->rec_size);
 	}
-}
-
-/*
- * Find a PFS root inode bref by label, starting from the super-root.
- * Recurses through the super-root's blockset and any indirect blocks.
- * If labelsp is non-NULL, collects all PFS labels encountered.
- */
-static int
-find_pfs(const hammer2_blockref_t *bref, const char *label,
-	 hammer2_blockref_t *resp, char ***labelsp, int *nlabelsp,
-	 int depth)
-{
-	hammer2_media_data_t media;
-	const hammer2_blockref_t *slots;
-	size_t bytes;
-	int count, i;
-
-	if (depth > 4)
-		return (0);
-	bytes = bref_radix_bytes(bref);
-	if (bytes == 0)
-		return (0);
-	if (read_media_bref(bref, &media))
-		errx(1, "send: read failed at %016llx",
-		    (long long)bref->data_off);
-
-	if (bref->type == HAMMER2_BREF_TYPE_INODE &&
-	    media.ipdata.meta.op_flags & HAMMER2_OPFLAG_PFSROOT) {
-		const char *name = (const char *)media.ipdata.filename;
-		int len = media.ipdata.meta.name_len;
-
-		if (labelsp) {
-			*labelsp = realloc(*labelsp,
-				(*nlabelsp + 1) * sizeof(char *));
-			if (*labelsp == NULL)
-				err(1, "send: out of memory");
-			(*labelsp)[*nlabelsp] = strndup(name, len);
-			if ((*labelsp)[*nlabelsp] == NULL)
-				err(1, "send: out of memory");
-			++*nlabelsp;
-		}
-		if (len == (int)strlen(label) &&
-		    memcmp(name, label, len) == 0) {
-			*resp = *bref;
-			return (1);
-		}
-	}
-
-	count = get_slots(bref, &media, bytes, &slots);
-	for (i = 0; i < count; ++i)
-		if (find_pfs(&slots[i], label, resp, labelsp, nlabelsp,
-			     depth + 1))
-			return (1);
-	return (0);
 }
 
 static void
-pick_sroot(const hammer2_volume_data_t *voldata, hammer2_blockref_t *resp)
+index_record(FILE *fp __unused, const hammer2_ioc_send_t *ioc,
+	     const void *data __unused, void *arg __unused)
 {
-	const hammer2_blockref_t *bref;
-	int i;
-
-	bzero(resp, sizeof(*resp));
-	for (i = 0; i < HAMMER2_SET_COUNT; ++i) {
-		bref = &voldata->sroot_blockset.blockref[i];
-		if (bref->type != HAMMER2_BREF_TYPE_INODE ||
-		    bref->data_off == 0)
-			continue;
-		if (resp->data_off == 0 || resp->mirror_tid < bref->mirror_tid)
-			*resp = *bref;
-	}
-	if (resp->data_off == 0)
-		errx(1, "send: no super-root in volume header");
-}
-
-/*
- * Walk the from-generation tree building the leaf index.
- */
-static uint64_t IndexLeaves;
-
-static void
-index_tree(const hammer2_blockref_t *bref, int depth)
-{
-	hammer2_media_data_t media;
-	const hammer2_blockref_t *slots;
-	size_t bytes;
-	int count, i;
-
-	if (depth > 16)
-		return;
-	bytes = bref_radix_bytes(bref);
-	if (bytes == 0)
-		return;
-	if (fseen_find(bref->data_off))
-		return;
-	fseen_add(bref->data_off);
-	if (read_media_bref(bref, &media))
-		errx(1, "send: read failed at %016llx",
-		    (long long)bref->data_off);
-
-	if (is_leaf_bref(bref, &media) && has_check_method(bref->methods)) {
-		leaf_add(bref);
+	if ((ioc->rec_flags & HAMMER2_SENDREC_LEAF) &&
+	    has_check_method(ioc->bref.methods)) {
+		leaf_add(&ioc->bref);
 		++IndexLeaves;
 	}
+}
 
-	count = get_slots(bref, &media, bytes, &slots);
-	for (i = 0; i < count; ++i)
-		index_tree(&slots[i], depth + 1);
+static void
+send_session(int fd, const char *label, const char *fromlabel,
+	     uint32_t flags, int incr, const hammer2_ioc_send_t *fromp,
+	     FILE *fp, send_rec_fn fn, void *arg,
+	     hammer2_ioc_send_t *startp)
+{
+	hammer2_stream_header_t hdr;
+	hammer2_ioc_send_t ioc;
+	void *buf;
+	int error;
+
+	buf = malloc(HAMMER2_PBUFSIZE);
+	if (buf == NULL)
+		err(1, "send: out of memory");
+
+	bzero(&ioc, sizeof(ioc));
+	strlcpy(ioc.label, label, sizeof(ioc.label));
+	ioc.flags = flags;
+	ioc.payload = buf;
+	if (ioctl(fd, HAMMER2IOC_SEND_START, &ioc) < 0) {
+		error = errno;
+		free(buf);
+		if (error == ENOENT)
+			errx(1, "send: PFS \"%s\" not found", label);
+		if (error == EINVAL)
+			errx(1, "send: \"%s\" is not a PFS root", label);
+		if (error == EBUSY)
+			errx(1, "send: PFS \"%s\" is already being sent",
+			    label);
+		errc(1, error, "send: SEND_START");
+	}
+
+	if (startp)
+		*startp = ioc;
+
+	if (fp) {
+		/*
+		 * SEND_START returns the header facts up front, so the
+		 * header is written first in the stream, before any
+		 * record.  recv requires the header first.
+		 */
+		bzero(&hdr, sizeof(hdr));
+		bcopy(HAMMER2_STREAM_MAGIC, hdr.magic, sizeof(hdr.magic));
+		strlcpy(hdr.label, label, sizeof(hdr.label));
+		hdr.version = HAMMER2_STREAM_VERSION;
+		hdr.pfs_clid = ioc.pfs_clid;
+		hdr.pfs_fsid = ioc.pfs_fsid;
+		hdr.mirror_tid = ioc.mirror_tid;
+		hdr.volu_size = ioc.volu_size;
+		if (incr) {
+			hdr.flags |= HAMMER2_STREAM_FLAG_INCR;
+			strlcpy(hdr.fromlabel, fromlabel, sizeof(hdr.fromlabel));
+			hdr.from_modify_tid = fromp->root_bref.modify_tid;
+			hdr.from_key = fromp->root_bref.key;
+		}
+		hdr.check = hammer2_icrc32(&hdr,
+					   sizeof(hdr) - sizeof(hdr.check));
+		if (fwrite(&hdr, sizeof(hdr), 1, fp) != 1)
+			err(1, "send: stream write");
+	}
+
+	for (;;) {
+		if (ioctl(fd, HAMMER2IOC_SEND_NEXT, &ioc) < 0) {
+			error = errno;
+			free(buf);
+			ioctl(fd, HAMMER2IOC_SEND_FINISH, &ioc);
+			errc(1, error, "send: SEND_NEXT");
+		}
+		if (ioc.rec_flags & HAMMER2_SENDREC_EOF)
+			break;
+		fn(fp, &ioc, buf, arg);
+	}
+
+	if (ioctl(fd, HAMMER2IOC_SEND_FINISH, &ioc) < 0)
+		warn("send: SEND_FINISH");
+	free(buf);
 }
 
 int
 cmd_send(int ac, char **av)
 {
-	hammer2_volume_data_t *voldata;
-	hammer2_blockref_t sroot_bref;
-	hammer2_blockref_t pfs_bref;
-	hammer2_blockref_t from_bref;
-	hammer2_stream_header_t hdr;
-	hammer2_media_data_t media;
-	char **labels = NULL;
-	int nlabels = 0;
-	const char *devpath = NULL;
+	hammer2_ioc_send_t start, from_root;
+	const char *path = NULL;
 	const char *label = NULL;
 	const char *fromlabel = NULL;
 	FILE *fp = stdout;
-	int incr = 0;
-	int i;
+	int fd, incr = 0, i;
+
+	bzero(&start, sizeof(start));
+	bzero(&from_root, sizeof(from_root));
 
 	for (i = 0; i < ac; ++i) {
 		if (strcmp(av[i], "-v") == 0) {
@@ -561,16 +294,16 @@ cmd_send(int ac, char **av)
 				errx(1, "send: -i requires a label");
 			fromlabel = av[++i];
 			incr = 1;
-		} else if (devpath == NULL) {
-			devpath = av[i];
+		} else if (path == NULL) {
+			path = av[i];
 		} else if (label == NULL) {
 			label = av[i];
 		} else {
 			errx(1, "send: too many arguments");
 		}
 	}
-	if (devpath == NULL || label == NULL)
-		errx(1, "send: requires device path and PFS label");
+	if (path == NULL || label == NULL)
+		errx(1, "send: requires a mounted hammer2 path and PFS label");
 	if (incr && strcmp(fromlabel, label) == 0)
 		errx(1, "send: from and to labels must differ");
 
@@ -578,65 +311,35 @@ cmd_send(int ac, char **av)
 		errx(1, "send: refusing to write binary stream to a "
 		    "terminal (redirect stdout)");
 
-	hammer2_init_volumes(devpath, 1);
-	voldata = hammer2_read_root_volume_header();
-	if (voldata == NULL)
-		errx(1, "send: no valid volume header on %s", devpath);
+	fd = hammer2_ioctl_handle(path);
+	if (fd < 0)
+		return (1);
 
-	pick_sroot(voldata, &sroot_bref);
-	if (read_media_bref(&sroot_bref, &media))
-		errx(1, "send: cannot read super-root");
-	if (test_check(&sroot_bref, &media, bref_radix_bytes(&sroot_bref)))
-		errx(1, "send: super-root check code mismatch");
-
-	bzero(&pfs_bref, sizeof(pfs_bref));
-	if (!find_pfs(&sroot_bref, label, &pfs_bref, &labels, &nlabels, 0)) {
-		fprintf(stderr, "send: PFS \"%s\" not found, available:",
-		    label);
-		for (i = 0; i < nlabels; ++i)
-			fprintf(stderr, " %s", labels[i]);
-		fprintf(stderr, "\n");
-		exit(1);
-	}
-	if (read_media_bref(&pfs_bref, &media))
-		errx(1, "send: cannot read PFS root");
-	if ((media.ipdata.meta.op_flags & HAMMER2_OPFLAG_PFSROOT) == 0)
-		errx(1, "send: \"%s\" is not a PFS root", label);
-
-	bzero(&hdr, sizeof(hdr));
-	bcopy(HAMMER2_STREAM_MAGIC, hdr.magic, sizeof(hdr.magic));
-	strlcpy(hdr.label, label, sizeof(hdr.label));
-	hdr.pfs_clid = media.ipdata.meta.pfs_clid;
-	hdr.pfs_fsid = media.ipdata.meta.pfs_fsid;
-	hdr.mirror_tid = voldata->mirror_tid;
-	hdr.volu_size = hammer2_get_total_size();
-
+	/*
+	 * Incremental: index the from-generation PFS first (brefs only),
+	 * then emit the to-generation walk with REF records for unchanged
+	 * leaves.  The two sessions use distinct kernel walk states, so
+	 * the emit dedup does not consume the index walk (unchanged blocks
+	 * have identical data_off and would be silently dropped).
+	 */
 	if (incr) {
-		bzero(&from_bref, sizeof(from_bref));
-		if (!find_pfs(&sroot_bref, fromlabel, &from_bref, NULL,
-			      NULL, 0))
-			errx(1, "send: from-PFS \"%s\" not found",
-			    fromlabel);
-		if (read_media_bref(&from_bref, &media))
-			errx(1, "send: cannot read from-PFS root");
-
-		index_tree(&from_bref, 0);
-
-		hdr.flags |= HAMMER2_STREAM_FLAG_INCR;
-		strlcpy(hdr.fromlabel, fromlabel, sizeof(hdr.fromlabel));
-		hdr.from_modify_tid = from_bref.modify_tid;
-		hdr.from_key = from_bref.key;
+		/*
+		 * Index the from-generation PFS first (brefs only); its
+		 * root bref feeds the incremental stream header.
+		 */
+		send_session(fd, fromlabel, NULL, HAMMER2_SENDF_SKIP_PAYLOAD,
+		    0, NULL, NULL, index_record, NULL, &from_root);
 	}
 
-	hdr.version = HAMMER2_STREAM_VERSION;
-	hdr.check = hammer2_icrc32(&hdr, sizeof(hdr) - sizeof(hdr.check));
-	if (fwrite(&hdr, sizeof(hdr), 1, fp) != 1)
-		err(1, "send: stream write");
+	/*
+	 * The to-session writes the stream header (from the SEND_START
+	 * facts) followed by the records; stdout is a stream (often a
+	 * pipe), and recv requires the header first.
+	 */
+	send_session(fd, label, fromlabel, 0, incr, &from_root, fp,
+	    emit_record, NULL, &start);
 
-	emit_node(fp, &pfs_bref, 0);
-
-	if (fflush(fp) != 0)
-		err(1, "send: stream write");
+	close(fd);
 
 	fprintf(stderr, "send: PFS \"%s\"", label);
 	if (incr)
@@ -648,6 +351,6 @@ cmd_send(int ac, char **av)
 	    (uintmax_t)EmitRefBytes);
 	if (VerboseOpt)
 		fprintf(stderr, "send: source mirror_tid %ju\n",
-		    (uintmax_t)hdr.mirror_tid);
+		    (uintmax_t)start.mirror_tid);
 	return (0);
 }

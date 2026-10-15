@@ -538,11 +538,9 @@ Dump inode.
 Dump in-memory chain topology.
 Unsupported unless HAMMER2_INVARIANTS is enabled.
 ." ==== send ====
-.It Cm send Op Fl i Ar fromlabel Ar devpath Ar label
+.It Cm send Op Fl i Ar fromlabel Ar path Ar label
 Serialize the PFS
 .Ar label
-on the offline volume(s)
-.Ar devpath
 as a stream of media blockrefs and payloads on stdout, similar to
 .Xr zfs 8 Ns ' Cm send .
 The stream is a full copy of the PFS tree; with
@@ -553,11 +551,26 @@ are included and unchanged leaf blocks are referenced
 (the destination must already hold the from-generation; see
 .Cm recv Fl u ) .
 .Pp
-The source is read directly from the media, so it must be quiescent
-while the stream is produced: use an unmounted filesystem or a snapshot
-PFS (see
-.Cm snapshot ) .
-Every payload's check code is verified while reading.
+The topology walk is performed in-kernel via the
+.Dv HAMMER2IOC_SEND_*
+ioctls; the first argument
+.Ar path
+is any path on the mounted hammer2 filesystem (typically its mount
+point).  The source PFS is pinned for the duration of the session:
+a concurrent
+.Cm pfs-delete
+of it fails with EBUSY, and the walked topology is a point-in-time COW
+view, so the volume may stay mounted read-write and even be actively
+written while the send of a snapshot PFS is in progress.  Only one send
+session per PFS label may be active at a time.  Sending a live (non-snapshot)
+PFS is permitted but the resulting stream reflects whichever block
+generation the walk observed; a snapshot PFS
+(see
+.Cm snapshot )
+is the recommended source.
+Every payload's check code is verified while reading; a concurrent
+modification that invalidates a block fails the send with I/O error
+rather than producing a corrupt stream.
 The stream is written to stdout; diagnostics go to stderr.
 ." ==== recv ====
 .It Cm recv Op Fl u Ar label Ar devpath
@@ -587,7 +600,10 @@ shared (the way COW snapshots share blocks), and the PFS keeps its
 label while its contents are replaced by the stream's generation.
 The diverged blocks of the previous generation are not reclaimed.
 .Pp
-The destination must be an offline single volume with a free
+The destination volume must not be mounted (recv writes raw blocks and
+commits the volume header itself; a mounted filesystem would race with
+the commit).
+It must be a single volume with a free
 super-root blockset slot (at most 3 PFS entries) for
 .Cm recv ,
 or the PFS named with

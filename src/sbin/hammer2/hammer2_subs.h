@@ -93,6 +93,7 @@ uint32_t calculate_crc32c(uint32_t, const void *, size_t);
 
 char **get_hammer2_mounts(int *acp);
 void put_hammer2_mounts(int ac, char **av);
+int hammer2_volume_is_mounted(const char *devpath);
 
 void hammer2_init_ondisk(hammer2_ondisk_t *fsp);
 void hammer2_install_volume(hammer2_volume_t *vol, int fd, int id,

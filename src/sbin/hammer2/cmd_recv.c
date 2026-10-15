@@ -776,6 +776,15 @@ cmd_recv(int ac, char **av)
 	if (update && strlen(ulabel) >= sizeof(hdr.label))
 		errx(1, "recv: -u label too long");
 
+	/*
+	 * recv writes raw blocks and commits the volume header itself;
+	 * it requires exclusive offline access to the destination
+	 * volume.  A mounted filesystem (read-only or not) would race
+	 * with the commit and corrupt both.
+	 */
+	if (hammer2_volume_is_mounted(devpath) > 0)
+		errx(1, "recv: destination volume %s is mounted", devpath);
+
 	if (fread(&hdr, sizeof(hdr), 1, stdin) != 1)
 		errx(1, "recv: cannot read stream header");
 	if (memcmp(hdr.magic, HAMMER2_STREAM_MAGIC, sizeof(hdr.magic)) != 0)

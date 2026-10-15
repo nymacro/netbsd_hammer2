@@ -324,7 +324,7 @@ hammer2_verify_volumes_common(const hammer2_ondisk_t *fsp,
 			     (intmax_t)vol->size);
 		/* check volume size vs block device size */
 		size = check_volume(vol->fd);
-		printf("checkvolu header %d %016jx/%016jx\n", i, vol->size, size);
+		fprintf(stderr, "checkvolu header %d %016jx/%016jx\n", i, vol->size, size);
 		if (vol->size > size)
 			errx(1, "%s's size 0x%016jx exceeds device size 0x%016jx",
 			     path, (intmax_t)vol->size, size);

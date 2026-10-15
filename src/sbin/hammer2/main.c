@@ -281,6 +281,16 @@ main(int ac, char **av)
 		}
 	} else if (strcmp(av[0], "stat") == 0) {
 		ecode = cmd_stat(ac - 1, (const char **)(void *)&av[1]);
+	} else if (strcmp(av[0], "send") == 0) {
+		/*
+		 * Serialize a PFS (snapshot) as a stream on stdout.
+		 */
+		ecode = cmd_send(ac - 1, &av[1]);
+	} else if (strcmp(av[0], "recv") == 0) {
+		/*
+		 * Deserialize a stream onto a destination volume.
+		 */
+		ecode = cmd_recv(ac - 1, &av[1]);
 	} else if (strcmp(av[0], "show") == 0) {
 		/*
 		 * Raw dump of filesystem.  Use -v to check all crc's, and
@@ -468,6 +478,14 @@ usage(int code)
 			"Snapshot a PFS or directory\n"
 		"    snapshot-debug <path> [<label>]   "
 			"Snapshot without filesystem sync\n"
+		"    send [-v] [-i <from>] <dev> <label> > stream\n"
+		"                                      "
+			"Serialize PFS <label> to stdout (zfs send)\n"
+		"    recv [-v] [-u <label>] <dev> < stream\n"
+		"                                      "
+			"Deserialize a stream onto volume (zfs recv);\n"
+		"                                      "
+			"-u updates existing PFS <label> incrementally\n"
 		"    stat [<path>...]                  "
 			"Return inode quota & config\n"
 		"    growfs [<path>...]                "

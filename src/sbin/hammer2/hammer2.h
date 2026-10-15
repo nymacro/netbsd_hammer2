@@ -130,6 +130,8 @@ int cmd_emergency_mode(const char *sel_path, int enable,
 			int ac, const char **av);
 int cmd_growfs(const char *sel_path, int ac, const char **av);
 int cmd_show(const char *devpath, const char *chspec, int which);
+int cmd_send(int ac, char **av);
+int cmd_recv(int ac, char **av);
 int is_supported_volume_list(const char *f);
 int cmd_volume_list(int ac, char **av);
 int cmd_volume_list2(int ac, char **av);

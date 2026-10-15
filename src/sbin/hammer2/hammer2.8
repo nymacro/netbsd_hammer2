@@ -537,6 +537,62 @@ Dump inode.
 .It Cm dumpchain Op path Op chnflags
 Dump in-memory chain topology.
 Unsupported unless HAMMER2_INVARIANTS is enabled.
+." ==== send ====
+.It Cm send Op Fl i Ar fromlabel Ar devpath Ar label
+Serialize the PFS
+.Ar label
+on the offline volume(s)
+.Ar devpath
+as a stream of media blockrefs and payloads on stdout, similar to
+.Xr zfs 8 Ns ' Cm send .
+The stream is a full copy of the PFS tree; with
+.Fl i Ar fromlabel
+only the blocks that changed relative to the PFS
+.Ar fromlabel
+are included and unchanged leaf blocks are referenced
+(the destination must already hold the from-generation; see
+.Cm recv Fl u ) .
+.Pp
+The source is read directly from the media, so it must be quiescent
+while the stream is produced: use an unmounted filesystem or a snapshot
+PFS (see
+.Cm snapshot ) .
+Every payload's check code is verified while reading.
+The stream is written to stdout; diagnostics go to stderr.
+." ==== recv ====
+.It Cm recv Op Fl u Ar label Ar devpath
+Deserialize a stream produced by
+.Cm send
+from stdin onto the offline volume
+.Ar devpath ,
+creating a new PFS named after the stream, similar to
+.Xr zfs 8 Ns ' Cm recv .
+Payload blocks are reallocated on the destination (linearly from the
+allocator region, like
+.Xr newfs_hammer2 8 )
+and the super-root is extended with a dirent for the received PFS;
+the volume headers are committed last, so a crash at any earlier point
+leaves the destination in its previous consistent state.
+The freemap is not modified; received blocks live below the volume's
+allocator-begin offset, which the kernel allocator and
+.Cm bulkfree
+never touch.
+.Pp
+With
+.Fl u Ar label
+an incremental stream updates the existing destination PFS
+.Ar label
+in place: unchanged leaf blocks are located in the destination and
+shared (the way COW snapshots share blocks), and the PFS keeps its
+label while its contents are replaced by the stream's generation.
+The diverged blocks of the previous generation are not reclaimed.
+.Pp
+The destination must be an offline single volume with a free
+super-root blockset slot (at most 3 PFS entries) for
+.Cm recv ,
+or the PFS named with
+.Fl u
+for incremental updates.
 .El
 .Sh SYSCTLS
 .Bl -tag -width indent

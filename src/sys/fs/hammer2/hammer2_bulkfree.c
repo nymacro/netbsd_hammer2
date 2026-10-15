@@ -63,6 +63,13 @@ typedef struct hammer2_bulkfree_info {
 	long			count_inodes_scanned;
 	long			count_dirents_scanned;
 	long			count_dedup_factor;
+	/*
+	 * Byte-accurate dedup accounting (port addition): DATA-bref bytes
+	 * scanned and bytes shared with an earlier-scanned blockref in the
+	 * same pass, allowing an exact shared/total savings ratio.
+	 */
+	long			count_data_bytes_total;
+	long			count_data_bytes_shared;
 	long			count_bytes_scanned;
 	long			count_chains_scanned;
 	long			count_chains_reported;
@@ -739,6 +746,16 @@ hammer2_bulkfree_pass(hammer2_dev_t *hmp, hammer2_chain_t *vchain,
 		    cbinfo.count_linadjusts);
 		hprintf("    dedup factor       %ld\n",
 		    cbinfo.count_dedup_factor);
+		if (cbinfo.count_data_bytes_total) {
+			long pct = cbinfo.count_data_bytes_shared * 10000 /
+				   cbinfo.count_data_bytes_total;
+
+			hprintf("    data dedup ratio   %ld/%ld bytes "
+			    "(%ld.%02ld%% shared)\n",
+			    cbinfo.count_data_bytes_shared,
+			    cbinfo.count_data_bytes_total,
+			    pct / 100, pct % 100);
+		}
 		hprintf("    max saved chains   %ld\n", cbinfo.list_count_max);
 	}
 
@@ -1306,13 +1323,36 @@ h2_bulkfree_test(hammer2_bulkfree_info_t *cbinfo, hammer2_blockref_t *bref,
 	n = hammer2_icrc32(&bref->data_off, sizeof(bref->data_off));
 	dedup = cbinfo->dedup + (n & (HAMMER2_DEDUP_HEUR_MASK & ~7));
 
+	/*
+	 * Byte-accurate dedup accounting (port addition): a pri==1 test is
+	 * one encounter per blockref per topology traversal.  First sight
+	 * of a DATA bref accumulates its bytes in the total; a repeat
+	 * encounter (shared storage) accumulates them in the shared count.
+	 * Both accumulate across sub-loop iterations (the heuristic is
+	 * cleared per iteration, so each iteration re-counts the full
+	 * topology) - the shared/total ratio is unaffected.
+	 */
+	if (pri == 1 && bref->type == HAMMER2_BREF_TYPE_DATA) {
+		long bytes = (long)1 <<
+		    (bref->data_off & HAMMER2_OFF_MASK_RADIX);
+
+		cbinfo->count_data_bytes_total += bytes;
+	}
+
 	for (i = best = 0; i < 8; ++i) {
 		if (dedup[i].data_off == bref->data_off) {
 			if (dedup[i].ticks < (uint32_t)pri)
 				dedup[i].ticks = pri;
-			if (pri == 1)
-				cbinfo->count_dedup_factor += dedup[i].ticks;
-			return (dedup[i].saved_error | HAMMER2_ERROR_EOF);
+			if (pri == 1) {
+				cbinfo->count_dedup_factor +=
+				    dedup[i].ticks;
+				if (bref->type == HAMMER2_BREF_TYPE_DATA)
+					cbinfo->count_data_bytes_shared +=
+					    (long)1 << (bref->data_off &
+					        HAMMER2_OFF_MASK_RADIX);
+			}
+			return (dedup[i].saved_error |
+			    HAMMER2_ERROR_EOF);
 		}
 		if (dedup[i].ticks < dedup[best].ticks)
 			best = i;

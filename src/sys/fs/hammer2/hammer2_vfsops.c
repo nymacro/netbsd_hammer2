@@ -1664,6 +1664,14 @@ again:
 	 * that is disappearing under it.  The mount lock is held.
 	 */
 	hmp->bulkfree_quit = 1;
+
+	/*
+	 * Reap `hammer2 send` sessions of this device (a killed sender
+	 * must not wedge the unmount with held chain references, nor
+	 * leak a pin keyed by this hammer2_dev_t into a future mount).
+	 */
+	hammer2_send_purge_dev(hmp);
+
 	hammer2_pfsfree_scan(hmp, 0);
 
 	/*

@@ -561,13 +561,15 @@ a concurrent
 .Cm pfs-delete
 of it fails with EBUSY, and the walked topology is a point-in-time COW
 view, so the volume may stay mounted read-write and even be actively
-written while the send of a snapshot PFS is in progress.  Only one send
-session per PFS label may be active at a time.  Sending a live (non-snapshot)
-PFS is permitted but the resulting stream reflects whichever block
-generation the walk observed; a snapshot PFS
+written while the send of a snapshot PFS is in progress.  Sending a
+live (non-snapshot) PFS is permitted but the resulting stream reflects
+whichever block generation the walk observed; a snapshot PFS
 (see
 .Cm snapshot )
 is the recommended source.
+Only one send session per PFS label may be active at a time; the session
+is owned by the sending process and is reaped when that process exits or
+when the device is unmounted.
 Every payload's check code is verified while reading; a concurrent
 modification that invalidates a block fails the send with I/O error
 rather than producing a corrupt stream.
@@ -597,7 +599,11 @@ an incremental stream updates the existing destination PFS
 .Ar label
 in place: unchanged leaf blocks are located in the destination and
 shared (the way COW snapshots share blocks), and the PFS keeps its
-label while its contents are replaced by the stream's generation.
+label while its contents are replaced by the stream's generation
+(the destination PFS must be an earlier generation of the same stream
+lineage, matched by the root inode's
+.Dv modify_tid ;
+the destination label may differ from the stream's from-label).
 The diverged blocks of the previous generation are not reclaimed.
 .Pp
 The destination volume must not be mounted (recv writes raw blocks and

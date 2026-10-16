@@ -1407,6 +1407,7 @@ int hammer2_send_start(hammer2_inode_t *, void *);
 int hammer2_send_next(hammer2_inode_t *, void *);
 int hammer2_send_finish(hammer2_inode_t *, void *);
 int hammer2_send_pin_count(hammer2_dev_t *, const char *);
+void hammer2_send_purge_dev(hammer2_dev_t *);
 
 /* hammer2_ondisk.c */
 int hammer2_open_devvp(struct mount *, const hammer2_devvp_list_t *);

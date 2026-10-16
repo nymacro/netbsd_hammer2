@@ -253,8 +253,5 @@ typedef struct hammer2_ioc_send hammer2_ioc_send_t;
 #define HAMMER2IOC_SEND_START		_IOWR('h', 98, struct hammer2_ioc_send)
 #define HAMMER2IOC_SEND_NEXT		_IOWR('h', 99, struct hammer2_ioc_send)
 #define HAMMER2IOC_SEND_FINISH		_IOWR('h', 100, struct hammer2_ioc_send)
-#define HAMMER2IOC_SEND_START		_IOWR('h', 98, struct hammer2_ioc_send)
-#define HAMMER2IOC_SEND_NEXT		_IOWR('h', 99, struct hammer2_ioc_send)
-#define HAMMER2IOC_SEND_FINISH		_IOWR('h', 100, struct hammer2_ioc_send)
 
 #endif /* !_FS_HAMMER2_IOCTL_H_ */

@@ -306,6 +306,12 @@ cmd_send(int ac, char **av)
 		errx(1, "send: requires a mounted hammer2 path and PFS label");
 	if (incr && strcmp(fromlabel, label) == 0)
 		errx(1, "send: from and to labels must differ");
+	if (strlen(label) >= HAMMER2_STREAM_LABELSIZE)
+		errx(1, "send: PFS label too long (max %d)",
+		    HAMMER2_STREAM_LABELSIZE - 1);
+	if (incr && strlen(fromlabel) >= HAMMER2_STREAM_LABELSIZE)
+		errx(1, "send: from label too long (max %d)",
+		    HAMMER2_STREAM_LABELSIZE - 1);
 
 	if (isatty(fileno(fp)))
 		errx(1, "send: refusing to write binary stream to a "

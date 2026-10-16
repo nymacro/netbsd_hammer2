@@ -49,9 +49,13 @@
  *   stream.  Held chain references keep the walked topology COW-frozen
  *   (point-in-time view), the same guarantee snapshots rely on.
  *
- * One session is keyed by (device, label).  The session state survives
- * across SEND_NEXT ioctls (frames hold referenced chain nodes); it is
- * reclaimed by a later SEND_START if the owning process is gone.
+ * One session is keyed by (device, label); only the owning process may
+ * drive it.  The session state survives across SEND_NEXT ioctls (frames
+ * hold referenced chain nodes); it is reclaimed when the owning process
+ * exits (reaped by a later SEND_START or an explicit SEND_FINISH from
+ * any process) and unconditionally at device teardown
+ * (hammer2_send_purge_dev, from hammer2_unmount_helper) so a killed
+ * sender can never wedge an unmount or leak chain references.
  */
 
 #include "hammer2.h"
@@ -95,6 +99,9 @@ struct hammer2_send_state {
 	pid_t			pid;		/* owning process */
 	uint32_t		flags;		/* HAMMER2_SENDF_* */
 	char			label[NAME_MAX+1];
+	int			ready;		/* START finished setup */
+	int			active;		/* NEXT walk in progress */
+	int			dead;		/* FINISH while active; free on release */
 	int			done;		/* walk complete */
 	int			error;		/* sticky walk error */
 	int			depth;		/* frame stack depth */
@@ -137,7 +144,7 @@ static hammer2_lk_t hammer2_send_lk;
 
 #define HAMMER2_SEND_MAX_DEPTH	16
 
-static void hammer2_send_teardown(hammer2_send_state_t *st);
+static void hammer2_send_free(hammer2_send_state_t *, int have_mntlk);
 
 void
 hammer2_send_init(void)
@@ -299,7 +306,11 @@ hammer2_send_emit_block(hammer2_send_state_t *st,
 	int error, leaf;
 
 	bytes = (size_t)1 << (bref->data_off & HAMMER2_OFF_MASK_RADIX);
-	KKASSERT(bytes != 0 && bytes <= HAMMER2_PBUFSIZE);
+	if ((bref->data_off & HAMMER2_OFF_MASK_RADIX) < HAMMER2_RADIX_MIN ||
+	    (bref->data_off & HAMMER2_OFF_MASK_RADIX) > HAMMER2_RADIX_MAX) {
+		return (EIO);
+	}
+	KKASSERT(bytes <= HAMMER2_PBUFSIZE);
 
 	leaf = 0;
 	if (bref->type == HAMMER2_BREF_TYPE_DATA ||
@@ -490,8 +501,30 @@ hammer2_send_state_find(hammer2_dev_t *hmp, const char *label)
 	return (NULL);
 }
 
+/*
+ * Return 1 if the process exists (a process executing one of our
+ * ioctls is alive; NULL from proc_find means it has fully exited, so
+ * none of its threads can be inside a send walk any more).
+ */
+static int
+hammer2_send_proc_alive(pid_t pid)
+{
+	struct proc *p;
+
+	mutex_enter(&proc_lock);
+	p = proc_find(pid);
+	mutex_exit(&proc_lock);
+	return (p != NULL);
+}
+
+/*
+ * Release a session's resources and its pin.  The session must already
+ * have been removed from hammer2_send_states (unreachable).  May sleep;
+ * hammer2_send_lk must NOT be held.  With have_mntlk the caller already
+ * holds hammer2_mntlk (device teardown path).
+ */
 static void
-hammer2_send_teardown(hammer2_send_state_t *st)
+hammer2_send_free(hammer2_send_state_t *st, int have_mntlk)
 {
 	hammer2_send_frame_t *f;
 	hammer2_send_seen_t *e;
@@ -512,46 +545,96 @@ hammer2_send_teardown(hammer2_send_state_t *st)
 	if (st->rec_data)
 		hfree(st->rec_data, M_HAMMER2, HAMMER2_PBUFSIZE);
 
-	hammer2_lk_ex(&hammer2_mntlk);
+	if (!have_mntlk)
+		hammer2_lk_ex(&hammer2_mntlk);
 	hammer2_send_pin_del(st->hmp, st->label);
-	hammer2_lk_unlock(&hammer2_mntlk);
+	if (!have_mntlk)
+		hammer2_lk_unlock(&hammer2_mntlk);
 
-	TAILQ_REMOVE(&hammer2_send_states, st, entry);
 	hfree(st, M_HAMMER2, sizeof(*st));
 }
 
 /*
- * Reclaim sessions whose owning process is gone.  Caller holds
- * hammer2_send_lk.  Note: teardown drops sessions' chain references
- * and takes hammer2_mntlk, so no chain locks may be held here.
+ * Free a list of sessions previously removed from hammer2_send_states
+ * (by reap or a failed START).  Must be called without send_lk held.
  */
 static void
-hammer2_send_reap(hammer2_dev_t *hmp, const char *label, pid_t pid)
+hammer2_send_free_list(hammer2_send_state_list_t *freelist)
+{
+	hammer2_send_state_t *st;
+
+	while ((st = TAILQ_FIRST(freelist)) != NULL) {
+		TAILQ_REMOVE(freelist, st, entry);
+		hammer2_send_free(st, 0);
+	}
+}
+
+/*
+ * Reclaim sessions whose owning process is gone.  Removed sessions are
+ * queued on *freelist for the caller to hammer2_send_free() after
+ * dropping hammer2_send_lk.  Caller holds hammer2_send_lk.
+ */
+static void
+hammer2_send_reap(hammer2_dev_t *hmp, const char *label, pid_t pid,
+    hammer2_send_state_list_t *freelist)
 {
 	hammer2_send_state_t *st, *next;
-	struct proc *p;
 
 	TAILQ_FOREACH_SAFE(st, &hammer2_send_states, entry, next) {
 		if (st->hmp != hmp || strcmp(st->label, label) != 0)
 			continue;
 		if (st->pid == pid)
 			continue;
-		mutex_enter(&proc_lock);
-		p = proc_find(st->pid);
-		mutex_exit(&proc_lock);
-		if (p != NULL)
+		if (hammer2_send_proc_alive(st->pid))
 			continue;
-		hammer2_send_teardown(st);
+		TAILQ_REMOVE(&hammer2_send_states, st, entry);
+		TAILQ_INSERT_TAIL(freelist, st, entry);
+	}
+}
+
+/*
+ * Purge every session of a device being torn down (called from
+ * hammer2_unmount_helper) so a killed sender cannot wedge the unmount
+ * with held chain references or leak a stale pin keyed by a
+ * soon-to-be-reused hammer2_dev_t pointer.  Callers hold
+ * hammer2_mntlk inconsistently, so detect it.
+ */
+void
+hammer2_send_purge_dev(hammer2_dev_t *hmp)
+{
+	hammer2_send_state_list_t freelist;
+	hammer2_send_state_t *st, *next;
+	int have_mntlk;
+
+	TAILQ_INIT(&freelist);
+	hammer2_lk_ex(&hammer2_send_lk);
+	TAILQ_FOREACH_SAFE(st, &hammer2_send_states, entry, next) {
+		if (st->hmp != hmp)
+			continue;
+		TAILQ_REMOVE(&hammer2_send_states, st, entry);
+		TAILQ_INSERT_TAIL(&freelist, st, entry);
+	}
+	hammer2_lk_unlock(&hammer2_send_lk);
+
+	have_mntlk = mutex_owned(&hammer2_mntlk);
+	while ((st = TAILQ_FIRST(&freelist)) != NULL) {
+		TAILQ_REMOVE(&freelist, st, entry);
+		hammer2_send_free(st, have_mntlk);
 	}
 }
 
 /*
  * HAMMER2IOC_SEND_START - resolve the PFS, pin it, initialize the walk.
+ *
+ * The session is inserted into the list up-front (as a !ready
+ * placeholder) so the one-session-per-(device,label) invariant holds
+ * even when two sends of the same label race the PFS lookup.
  */
 int
 hammer2_send_start(hammer2_inode_t *ip, void *data)
 {
 	hammer2_ioc_send_t *send = data;
+	hammer2_send_state_list_t freelist;
 	hammer2_send_state_t *st;
 	hammer2_dev_t *hmp = ip->pmp->pfs_hmps[0];
 	hammer2_chain_t *chain, *parent;
@@ -562,6 +645,8 @@ hammer2_send_start(hammer2_inode_t *ip, void *data)
 
 	if (hmp == NULL)
 		return (EINVAL);
+	if (hmp->nvolumes != 1)
+		return (EOPNOTSUPP);
 
 	send->label[sizeof(send->label) - 1] = 0;
 	len = strlen(send->label);
@@ -571,15 +656,38 @@ hammer2_send_start(hammer2_inode_t *ip, void *data)
 		return (EINVAL);
 
 	/*
-	 * Reclaim dead sessions; refuse a duplicate for a live owner.
+	 * Allocate the session up front, then reserve the (device,label)
+	 * key under the lock before the (sleeping) PFS lookup, so a
+	 * concurrent START of the same label fails EBUSY instead of
+	 * creating a second session.
 	 */
+	st = hmalloc(sizeof(*st), M_HAMMER2, M_WAITOK | M_ZERO);
+	st->hmp = hmp;
+	st->pid = curproc->p_pid;
+	st->flags = send->flags;
+	strlcpy(st->label, send->label, sizeof(st->label));
+	SLIST_INIT(&st->frames);
+	st->rec_data = hmalloc(HAMMER2_PBUFSIZE, M_HAMMER2, M_WAITOK);
+
+	TAILQ_INIT(&freelist);
 	hammer2_lk_ex(&hammer2_send_lk);
-	hammer2_send_reap(hmp, send->label, curproc->p_pid);
+	hammer2_send_reap(hmp, send->label, curproc->p_pid, &freelist);
 	if (hammer2_send_state_find(hmp, send->label) != NULL) {
 		hammer2_lk_unlock(&hammer2_send_lk);
-		return (EBUSY);
+		/*
+		 * The reservation was never pinned; do NOT go through
+		 * hammer2_send_free(), whose pin_del is keyed by
+		 * (device,label) and would release the LIVE session's
+		 * pin.
+		 */
+		hfree(st->rec_data, M_HAMMER2, HAMMER2_PBUFSIZE);
+		hfree(st, M_HAMMER2, sizeof(*st));
+		error = EBUSY;
+		goto out;
 	}
+	TAILQ_INSERT_TAIL(&hammer2_send_states, st, entry);
 	hammer2_lk_unlock(&hammer2_send_lk);
+	hammer2_send_free_list(&freelist);
 
 	/*
 	 * Pin the PFS label against pfs-delete for the session.  The
@@ -630,23 +738,21 @@ hammer2_send_start(hammer2_inode_t *ip, void *data)
 			hammer2_chain_drop(parent);
 		}
 		hammer2_inode_unlock(hmp->spmp->iroot);
-		hammer2_lk_ex(&hammer2_mntlk);
-		hammer2_send_pin_del(hmp, send->label);
-		hammer2_lk_unlock(&hammer2_mntlk);
+
+		/*
+		 * Abandon the reservation (also drops the pin taken
+		 * above).
+		 */
+		hammer2_lk_ex(&hammer2_send_lk);
+		TAILQ_REMOVE(&hammer2_send_states, st, entry);
+		hammer2_lk_unlock(&hammer2_send_lk);
+		hammer2_send_free(st, 0);
 		return (error);
 	}
 
 	/*
-	 * Capture the stream header facts and build the session.
+	 * Capture the stream header facts and build the walk.
 	 */
-	st = hmalloc(sizeof(*st), M_HAMMER2, M_WAITOK | M_ZERO);
-	st->hmp = hmp;
-	st->pid = curproc->p_pid;
-	st->flags = send->flags;
-	strlcpy(st->label, send->label, sizeof(st->label));
-	SLIST_INIT(&st->frames);
-	st->rec_data = hmalloc(HAMMER2_PBUFSIZE, M_HAMMER2, M_WAITOK);
-
 	st->root_bref = chain->bref;
 	st->pfs_clid = chain->data->ipdata.meta.pfs_clid;
 	st->pfs_fsid = chain->data->ipdata.meta.pfs_fsid;
@@ -667,7 +773,7 @@ hammer2_send_start(hammer2_inode_t *ip, void *data)
 	hammer2_inode_unlock(hmp->spmp->iroot);
 
 	hammer2_lk_ex(&hammer2_send_lk);
-	TAILQ_INSERT_TAIL(&hammer2_send_states, st, entry);
+	st->ready = 1;
 	hammer2_lk_unlock(&hammer2_send_lk);
 
 	send->rec_flags = 0;
@@ -679,11 +785,18 @@ hammer2_send_start(hammer2_inode_t *ip, void *data)
 	send->volu_size = st->volu_size;
 
 	return (0);
+out:
+	hammer2_send_free_list(&freelist);
+	return (error);
 }
 
 /*
  * HAMMER2IOC_SEND_NEXT - return the next record.  EOF is reported via
  * HAMMER2_SENDREC_EOF (rec_size 0, bref zeroed).
+ *
+ * hammer2_send_lk only guards the session lookup/flags; the walk and
+ * the copyout run WITHOUT any lock (the session is pinned by the
+ * active flag, and a concurrent FINISH defers its free via ->dead).
  */
 int
 hammer2_send_next(hammer2_inode_t *ip, void *data)
@@ -691,7 +804,7 @@ hammer2_send_next(hammer2_inode_t *ip, void *data)
 	hammer2_ioc_send_t *send = data;
 	hammer2_send_state_t *st;
 	hammer2_dev_t *hmp = ip->pmp->pfs_hmps[0];
-	int error;
+	int dead, error;
 
 	if (hmp == NULL)
 		return (EINVAL);
@@ -699,41 +812,53 @@ hammer2_send_next(hammer2_inode_t *ip, void *data)
 
 	hammer2_lk_ex(&hammer2_send_lk);
 	st = hammer2_send_state_find(hmp, send->label);
-	if (st == NULL || st->pid != curproc->p_pid) {
+	if (st == NULL || st->pid != curproc->p_pid ||
+	    st->dead || !st->ready) {
 		hammer2_lk_unlock(&hammer2_send_lk);
 		return (ENOENT);
 	}
-	if (st->done) {
+	if (st->active) {
 		hammer2_lk_unlock(&hammer2_send_lk);
-		send->rec_flags = HAMMER2_SENDREC_EOF;
-		send->rec_size = 0;
-		return (0);
+		return (EBUSY);
 	}
-	if (st->error) {
+	st->active = 1;
+	hammer2_lk_unlock(&hammer2_send_lk);
+
+	if (st->done) {
+		error = 0;
+	} else if (st->error) {
 		error = st->error;
 	} else {
 		error = hammer2_send_walk(st);
 		if (error)
 			st->error = error;
 	}
-	hammer2_lk_unlock(&hammer2_send_lk);
-	if (error)
-		return (error);
-
-	send->bref = st->rec_bref;
-	send->rec_flags = st->rec_flags;
-	send->rec_size = st->rec_size;
-	if (st->rec_size) {
-		error = copyout(st->rec_data, send->payload, st->rec_size);
-		if (error)
-			return (error);
+	if (error == 0) {
+		send->bref = st->rec_bref;
+		send->rec_flags = st->rec_flags;
+		send->rec_size = st->rec_size;
+		if (st->rec_size)
+			error = copyout(st->rec_data, send->payload,
+			    st->rec_size);
 	}
 
-	return (0);
+	hammer2_lk_ex(&hammer2_send_lk);
+	st->active = 0;
+	dead = st->dead;
+	if (dead)
+		TAILQ_REMOVE(&hammer2_send_states, st, entry);
+	hammer2_lk_unlock(&hammer2_send_lk);
+	if (dead)
+		hammer2_send_free(st, 0);
+
+	return (error);
 }
 
 /*
- * HAMMER2IOC_SEND_FINISH - release the session and its pin.
+ * HAMMER2IOC_SEND_FINISH - release the session and its pin.  Only the
+ * owning process may finish a live session (another process gets
+ * EBUSY); a dead owner's session may be finished by anyone (also
+ * reaped by the next SEND_START and at device teardown).
  */
 int
 hammer2_send_finish(hammer2_inode_t *ip, void *data)
@@ -741,6 +866,7 @@ hammer2_send_finish(hammer2_inode_t *ip, void *data)
 	hammer2_ioc_send_t *send = data;
 	hammer2_send_state_t *st;
 	hammer2_dev_t *hmp = ip->pmp->pfs_hmps[0];
+	int error = 0;
 
 	if (hmp == NULL)
 		return (EINVAL);
@@ -749,11 +875,23 @@ hammer2_send_finish(hammer2_inode_t *ip, void *data)
 	hammer2_lk_ex(&hammer2_send_lk);
 	st = hammer2_send_state_find(hmp, send->label);
 	if (st == NULL) {
+		error = ENOENT;
+	} else if (st->pid != curproc->p_pid &&
+		   hammer2_send_proc_alive(st->pid)) {
+		error = EBUSY;
+	} else if (st->active) {
+		/*
+		 * A walk is in progress in the owning process; defer
+		 * the release to the walk's epilogue.
+		 */
+		st->dead = 1;
+	} else {
+		TAILQ_REMOVE(&hammer2_send_states, st, entry);
 		hammer2_lk_unlock(&hammer2_send_lk);
-		return (ENOENT);
+		hammer2_send_free(st, 0);
+		return (0);
 	}
-	hammer2_send_teardown(st);
 	hammer2_lk_unlock(&hammer2_send_lk);
 
-	return (0);
+	return (error);
 }

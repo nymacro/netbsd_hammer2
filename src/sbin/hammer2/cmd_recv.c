@@ -464,6 +464,12 @@ find_dest_pfs(hammer2_blockref_t *bref, const char *label,
 		const char *name = (const char *)media.ipdata.filename;
 		int len = media.ipdata.meta.name_len;
 
+		/*
+		 * PFS roots are leaves of the super-root namespace: never
+		 * descend into a PFS's own file tree (that would walk
+		 * every unrelated PFS's media and make recv fail on
+		 * corruption in a PFS we are not interested in).
+		 */
 		if (len == (int)strlen(label) &&
 		    memcmp(name, label, len) == 0) {
 			*resp = *bref;
@@ -471,6 +477,7 @@ find_dest_pfs(hammer2_blockref_t *bref, const char *label,
 				PfsIndirect = 1;
 			return (1);
 		}
+		return (0);
 	}
 
 	if (bref->type == HAMMER2_BREF_TYPE_INODE) {
@@ -495,49 +502,9 @@ find_dest_pfs(hammer2_blockref_t *bref, const char *label,
 	return (0);
 }
 
-static void
-collect_dest_labels(hammer2_blockref_t *bref, char ***labelsp, int *nlabelsp,
-		    int depth)
-{
-	hammer2_media_data_t media;
-	size_t bytes;
-	int i;
-
-	if (depth > 4)
-		return;
-	bytes = bref_radix_bytes(bref);
-	if (bytes == 0)
-		return;
-	if (read_phys(bref->data_off, &media, bytes) != (ssize_t)bytes)
-		return;
-
-	if (bref->type == HAMMER2_BREF_TYPE_INODE &&
-	    media.ipdata.meta.op_flags & HAMMER2_OPFLAG_PFSROOT) {
-		*labelsp = realloc(*labelsp,
-			(*nlabelsp + 1) * sizeof(char *));
-		if (*labelsp == NULL)
-			err(1, "recv: out of memory");
-		(*labelsp)[*nlabelsp] = strndup(
-		    (const char *)media.ipdata.filename,
-		    media.ipdata.meta.name_len);
-		if ((*labelsp)[*nlabelsp] == NULL)
-			err(1, "recv: out of memory");
-		++*nlabelsp;
-		if (media.ipdata.meta.op_flags & HAMMER2_OPFLAG_DIRECTDATA)
-			return;
-		for (i = 0; i < HAMMER2_SET_COUNT; ++i)
-			collect_dest_labels(
-			    &media.ipdata.u.blockset.blockref[i],
-			    labelsp, nlabelsp, depth + 1);
-	} else if (bref->type == HAMMER2_BREF_TYPE_INDIRECT) {
-		int count = (int)(bytes / HAMMER2_BLOCKREF_BYTES);
-
-		for (i = 0; i < count; ++i)
-			collect_dest_labels(&media.npdata[i], labelsp,
-			    nlabelsp, depth + 1);
-	}
-}
-
+/*
+ * Build the destination from-generation leaf index (-u).
+ */
 /*
  * Build the destination from-generation leaf index (-u).
  */
@@ -746,8 +713,6 @@ cmd_recv(int ac, char **av)
 	hammer2_blockref_t *slots;
 	hammer2_tid_t new_tid;
 	hammer2_off_t sroot_off;
-	char **labels = NULL;
-	int nlabels = 0;
 	const char *devpath = NULL;
 	const char *ulabel = NULL;
 	int sroot_slot = -1;
@@ -837,21 +802,24 @@ cmd_recv(int ac, char **av)
 			errx(1, "recv: PFS \"%s\" is not in the super-root "
 			    "blockset, cannot update", ulabel);
 		pfs_slot = PfsSlot;
-		if (dest_pfs_bref.key != hdr.from_key ||
-		    dest_pfs_bref.modify_tid != hdr.from_modify_tid)
+		/*
+		 * Generation check: the destination PFS must be an
+		 * earlier generation of the same stream lineage, matched
+		 * by the root inode's modify_tid (the label may differ -
+		 * the PFS keeps its label; per-block REF identity
+		 * enforces content agreement).
+		 */
+		if (dest_pfs_bref.modify_tid != hdr.from_modify_tid)
 			errx(1, "recv: destination PFS \"%s\" does not "
 			    "match the stream's from-generation "
-			    "(key %016llx/%016llx mtid %ju/%ju)",
+			    "(mtid %ju/%ju)",
 			    ulabel,
-			    (long long)dest_pfs_bref.key,
-			    (long long)hdr.from_key,
 			    (uintmax_t)dest_pfs_bref.modify_tid,
 			    (uintmax_t)hdr.from_modify_tid);
 	} else {
 		if (update)
 			errx(1, "recv: destination has no PFS \"%s\" to "
 			    "update", ulabel);
-		collect_dest_labels(&sroot_bref, &labels, &nlabels, 0);
 	}
 
 	if (update)
@@ -980,6 +948,17 @@ cmd_recv(int ac, char **av)
 
 	{
 		int fd = hammer2_get_root_volume_fd();
+
+		/*
+		 * Durability ordering: the received blocks and the new
+		 * super-root must be on stable storage BEFORE the
+		 * volume header commit, otherwise a power loss could
+		 * persist the header while payload blocks are still
+		 * missing (the committed filesystem would reference
+		 * garbage).
+		 */
+		if (fsync(fd))
+			err(1, "recv: fsync (pre-commit) failed");
 
 		for (i = HAMMER2_NUM_VOLHDRS - 1; i >= 0; --i) {
 			hammer2_off_t off = (hammer2_off_t)i *

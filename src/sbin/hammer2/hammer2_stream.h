@@ -68,6 +68,8 @@
 #define HAMMER2_STREAM_MAGIC	"H2SEND01"
 #define HAMMER2_STREAM_VERSION	1
 
+#define HAMMER2_STREAM_LABELSIZE 64	/* header label/fromlabel size */
+
 #define HAMMER2_STREAM_RECMAGIC	0x48325243	/* "H2RC" */
 
 #define HAMMER2_STREAM_FLAG_INCR	0x0001	/* incremental stream */
@@ -81,8 +83,8 @@ struct hammer2_stream_header {
 	char	magic[8];			/* HAMMER2_STREAM_MAGIC */
 	uint32_t version;
 	uint32_t flags;				/* STREAM_FLAG_* */
-	char	label[64];			/* source PFS label (to) */
-	char	fromlabel[64];			/* from-generation label (-i) */
+	char	label[HAMMER2_STREAM_LABELSIZE];		/* source PFS label (to) */
+	char	fromlabel[HAMMER2_STREAM_LABELSIZE];	/* from-generation label (-i) */
 	uuid_t	pfs_clid;			/* source PFS cluster id */
 	uuid_t	pfs_fsid;			/* source PFS private id */
 	hammer2_tid_t mirror_tid;		/* source volhdr mirror_tid */

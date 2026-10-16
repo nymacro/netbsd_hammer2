@@ -63,38 +63,15 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <stddef.h>
+
 #include <openssl/sha.h>
 
 #include "hammer2.h"
 #include "hammer2_stream.h"
+#include "recv_freemap.h"
 
 #define RECV_MAX_DEPTH	16
-
-static ssize_t
-read_phys(hammer2_off_t data_off, void *buf, size_t bytes)
-{
-	hammer2_off_t io_off = data_off & ~HAMMER2_OFF_MASK_RADIX;
-	int fd = hammer2_get_volume_fd(io_off);
-	hammer2_off_t off;
-
-	if (fd < 0)
-		return (-1);
-	off = io_off - hammer2_get_volume_offset(io_off);
-	return (pread(fd, buf, bytes, off));
-}
-
-static int
-write_phys(hammer2_off_t data_off, const void *buf, size_t bytes)
-{
-	hammer2_off_t io_off = data_off & ~HAMMER2_OFF_MASK_RADIX;
-	int fd = hammer2_get_volume_fd(io_off);
-	hammer2_off_t off;
-
-	if (fd < 0)
-		return (-1);
-	off = io_off - hammer2_get_volume_offset(io_off);
-	return (pwrite(fd, buf, bytes, off) == (ssize_t)bytes ? 0 : -1);
-}
 
 static size_t
 bref_radix_bytes(const hammer2_blockref_t *bref)
@@ -347,11 +324,14 @@ is_leaf_bref(const hammer2_blockref_t *bref, const void *data)
  * Linear allocator, newfs_hammer2 style: power-of-2 sized, size-aligned,
  * skipping the 4MB freemap/volhdr reserve at every 1GB boundary.  All
  * received blocks land below the final allocator_beg, so neither the
- * kernel allocator nor bulkfree will ever hand them out again.
+ * kernel allocator nor bulkfree will ever hand them out again.  This is
+ * only valid for a pristine destination (no on-media freemap); a used
+ * destination is allocated from its freemap instead (recv_freemap.c).
  */
 static hammer2_off_t AllocBase;
 static uint64_t AllocBytes;
 static hammer2_off_t VoluEnd;
+static struct recv_freemap *Freemap;
 
 static int
 recv_alloc(int radix, hammer2_off_t *offp)
@@ -360,6 +340,8 @@ recv_alloc(int radix, hammer2_off_t *offp)
 
 	if (radix < HAMMER2_RADIX_MIN || radix > HAMMER2_RADIX_MAX)
 		return (-1);
+	if (Freemap != NULL)
+		return (recv_freemap_alloc(Freemap, radix, offp));
 	if (AllocBase & (bytes - 1))
 		AllocBase = (AllocBase + bytes - 1) &
 		    ~((hammer2_off_t)bytes - 1);
@@ -452,12 +434,15 @@ find_dest_pfs(hammer2_blockref_t *bref, const char *label,
 	bytes = bref_radix_bytes(bref);
 	if (bytes == 0)
 		return (0);
-	if (read_phys(bref->data_off, &media, bytes) != (ssize_t)bytes)
-		errx(1, "recv: read failed at %016llx",
-		    (long long)bref->data_off);
+	if (bytes > HAMMER2_PBUFSIZE)
+		errx(1, "recv: bogus block size at %016jx",
+		    (intmax_t)bref->data_off);
+	if (recv_read_phys(bref->data_off, &media, bytes) != (ssize_t)bytes)
+		errx(1, "recv: read failed at %016jx",
+		    (intmax_t)bref->data_off);
 	if (test_check(bref, &media, bytes))
-		errx(1, "recv: destination check code mismatch at %016llx",
-		    (long long)bref->data_off);
+		errx(1, "recv: destination check code mismatch at %016jx",
+		    (intmax_t)bref->data_off);
 
 	if (bref->type == HAMMER2_BREF_TYPE_INODE &&
 	    media.ipdata.meta.op_flags & HAMMER2_OPFLAG_PFSROOT) {
@@ -505,9 +490,6 @@ find_dest_pfs(hammer2_blockref_t *bref, const char *label,
 /*
  * Build the destination from-generation leaf index (-u).
  */
-/*
- * Build the destination from-generation leaf index (-u).
- */
 static uint64_t IndexLeaves;
 
 static void
@@ -523,12 +505,15 @@ index_dest_tree(hammer2_blockref_t *bref, int depth)
 	bytes = bref_radix_bytes(bref);
 	if (bytes == 0)
 		return;
-	if (read_phys(bref->data_off, &media, bytes) != (ssize_t)bytes)
-		errx(1, "recv: read failed at %016llx",
-		    (long long)bref->data_off);
+	if (bytes > HAMMER2_PBUFSIZE)
+		errx(1, "recv: bogus block size at %016jx",
+		    (intmax_t)bref->data_off);
+	if (recv_read_phys(bref->data_off, &media, bytes) != (ssize_t)bytes)
+		errx(1, "recv: read failed at %016jx",
+		    (intmax_t)bref->data_off);
 	if (test_check(bref, &media, bytes))
-		errx(1, "recv: destination check code mismatch at %016llx",
-		    (long long)bref->data_off);
+		errx(1, "recv: destination check code mismatch at %016jx",
+		    (intmax_t)bref->data_off);
 
 	if (is_leaf_bref(bref, &media) && bref->data_off) {
 		leaf_add(bref);
@@ -553,6 +538,9 @@ read_record(FILE *fp, hammer2_stream_record_t *rec, void *buf)
 			errx(1, "recv: truncated stream record");
 		return (0);
 	}
+	if (rec->hcheck != hammer2_icrc32(rec,
+	    offsetof(hammer2_stream_record_t, hcheck)))
+		errx(1, "recv: record header crc mismatch (corrupt stream)");
 	if (rec->magic != HAMMER2_STREAM_RECMAGIC)
 		errx(1, "recv: bad record magic (corrupt stream)");
 	if (rec->flags & ~HAMMER2_STREAM_RECF_REF)
@@ -591,10 +579,10 @@ process_record(const hammer2_stream_record_t *rec, void *buf,
 			errx(1, "recv: REF record without media reference");
 		le = leaf_find(&bref);
 		if (le == NULL)
-			errx(1, "recv: referenced block %016llx not found "
+			errx(1, "recv: referenced block %016jx not found "
 			    "in destination PFS (stream does not match "
 			    "destination state)",
-			    (long long)bref.data_off);
+			    (intmax_t)bref.data_off);
 		bref.data_off = le->data_off;
 		map_add(rec->bref.data_off, &bref);
 		++RecvRefRecords;
@@ -606,8 +594,8 @@ process_record(const hammer2_stream_record_t *rec, void *buf,
 		errx(1, "recv: record size %u does not match bref radix "
 		    "(%zu bytes)", rec->size, bytes);
 	if (test_check(&bref, buf, bytes))
-		errx(1, "recv: stream check code mismatch at %016llx",
-		    (long long)bref.data_off);
+		errx(1, "recv: stream check code mismatch at %016jx",
+		    (intmax_t)bref.data_off);
 	if (map_find(bref.data_off) != NULL) {
 		/*
 		 * Duplicate reference (dedup): the physical block is
@@ -622,9 +610,9 @@ process_record(const hammer2_stream_record_t *rec, void *buf,
 		nsub = substitute_slots(&bref, buf, bytes);
 		if (nsub < 0)
 			errx(1, "recv: dangling child reference in %s "
-			    "block at %016llx",
+			    "block at %016jx",
 			    hammer2_breftype_to_str(bref.type),
-			    (long long)bref.data_off);
+			    (intmax_t)bref.data_off);
 		if (nsub > 0) {
 			/*
 			 * Store rewritten interior blocks uncompressed;
@@ -644,9 +632,9 @@ process_record(const hammer2_stream_record_t *rec, void *buf,
 
 	if (recv_alloc(bref.data_off & HAMMER2_OFF_MASK_RADIX, &new_off))
 		errx(1, "recv: out of space on destination volume");
-	if (write_phys(new_off & ~HAMMER2_OFF_MASK_RADIX, buf, bytes))
-		err(1, "recv: write failed at %016llx",
-		    (long long)new_off);
+	if (recv_write_phys(new_off & ~HAMMER2_OFF_MASK_RADIX, buf, bytes))
+		err(1, "recv: write failed at %016jx",
+		    (intmax_t)new_off);
 
 	bref.data_off = new_off;
 	map_add(rec->bref.data_off, &bref);
@@ -723,7 +711,7 @@ cmd_recv(int ac, char **av)
 
 	for (i = 0; i < ac; ++i) {
 		if (strcmp(av[i], "-v") == 0) {
-			
+			/* -v is a global option, handled in main() */
 		} else if (strcmp(av[i], "-u") == 0) {
 			if (i + 1 >= ac)
 				errx(1, "recv: -u requires the destination "
@@ -783,7 +771,7 @@ cmd_recv(int ac, char **av)
 	voldata = *volp;
 
 	pick_sroot(&voldata, &sroot_bref, &sroot_slot);
-	if (read_phys(sroot_bref.data_off, &media,
+	if (recv_read_phys(sroot_bref.data_off, &media,
 		      bref_radix_bytes(&sroot_bref)) !=
 	    (ssize_t)bref_radix_bytes(&sroot_bref))
 		errx(1, "recv: cannot read destination super-root");
@@ -833,6 +821,16 @@ cmd_recv(int ac, char **av)
 		    ~HAMMER2_PBUFMASK64;
 
 	/*
+	 * A destination that already carries a freemap has been mounted
+	 * read-write, so its [allocator_beg, ...) region may hold live
+	 * allocations and a stale freemap.  Allocate from the freemap and
+	 * commit a COW'd copy of it.  A pristine volume has no freemap and
+	 * stays on the linear allocator.
+	 */
+	if (recv_freemap_present(&voldata))
+		Freemap = recv_freemap_init(&voldata, AllocBase, VoluEnd, 0);
+
+	/*
 	 * Process the stream.  Nothing on the destination is modified
 	 * until the final volume header commit.
 	 */
@@ -859,7 +857,7 @@ cmd_recv(int ac, char **av)
 		size_t ulen = strlen(ulabel);
 
 		if (bl != HAMMER2_INODE_BYTES ||
-		    read_phys(root_bref.data_off & ~HAMMER2_OFF_MASK_RADIX,
+		    recv_read_phys(root_bref.data_off & ~HAMMER2_OFF_MASK_RADIX,
 			      &media, bl) != (ssize_t)bl)
 			errx(1, "recv: cannot re-read received PFS root");
 		bzero(media.ipdata.filename,
@@ -869,7 +867,7 @@ cmd_recv(int ac, char **av)
 		media.ipdata.meta.name_key = dirhash(ulabel, ulen);
 		root_bref.key = media.ipdata.meta.name_key;
 		calc_check(&root_bref, &media, bl);
-		if (write_phys(root_bref.data_off & ~HAMMER2_OFF_MASK_RADIX,
+		if (recv_write_phys(root_bref.data_off & ~HAMMER2_OFF_MASK_RADIX,
 			       &media, bl))
 			err(1, "recv: PFS root relabel write failed");
 	}
@@ -885,12 +883,12 @@ cmd_recv(int ac, char **av)
 	root_bref.mirror_tid = new_tid;
 	if (recv_alloc(HAMMER2_RADIX_MIN, &sroot_off))
 		errx(1, "recv: out of space for super-root");
-	if (read_phys(sroot_bref.data_off, &media,
+	if (bref_radix_bytes(&sroot_bref) != HAMMER2_INODE_BYTES)
+		errx(1, "recv: super-root bref has unexpected size");
+	if (recv_read_phys(sroot_bref.data_off, &media,
 		      bref_radix_bytes(&sroot_bref)) !=
 	    (ssize_t)bref_radix_bytes(&sroot_bref))
 		errx(1, "recv: cannot re-read destination super-root");
-	if (bref_radix_bytes(&sroot_bref) != HAMMER2_INODE_BYTES)
-		errx(1, "recv: super-root bref has unexpected size");
 
 	if (update) {
 		media.ipdata.u.blockset.blockref[pfs_slot] = root_bref;
@@ -916,22 +914,33 @@ cmd_recv(int ac, char **av)
 	sroot_new.data_off = sroot_off | HAMMER2_RADIX_MIN;
 	sroot_new.mirror_tid = new_tid;
 	calc_check(&sroot_new, &media, HAMMER2_INODE_BYTES);
-	if (write_phys(sroot_off, &media, HAMMER2_INODE_BYTES))
+	if (recv_write_phys(sroot_off, &media, HAMMER2_INODE_BYTES))
 		err(1, "recv: super-root write failed");
 
-	/*
-	 * Advance the allocator past everything we placed, rounded up to
-	 * the next 4MB segment so the freemap init marks the whole
-	 * partial segment as allocated.
-	 */
-	voldata.allocator_beg = (AllocBase + HAMMER2_SEGMASK64) &
-	    ~HAMMER2_SEGMASK64;
-	if (voldata.allocator_beg > VoluEnd)
-		voldata.allocator_beg = VoluEnd;
-	if (voldata.allocator_free > AllocBytes)
-		voldata.allocator_free -= AllocBytes;
-	else
-		voldata.allocator_free = 0;
+	if (Freemap != NULL) {
+		/*
+		 * The received blocks and the COW'd freemap tree are written
+		 * now, before the header commit; allocator_beg is unchanged
+		 * and allocator_free / freemap_tid are updated by the flush.
+		 */
+		if (recv_freemap_flush(Freemap, new_tid) != 0)
+			err(1, "recv: freemap commit failed");
+	} else {
+		/*
+		 * Fresh destination: advance allocator_beg past everything
+		 * we placed, rounded up to the next 4MB segment so the
+		 * freemap leaf created on the next mount marks the whole
+		 * partial segment as allocated.
+		 */
+		voldata.allocator_beg = (AllocBase + HAMMER2_SEGMASK64) &
+		    ~HAMMER2_SEGMASK64;
+		if (voldata.allocator_beg > VoluEnd)
+			voldata.allocator_beg = VoluEnd;
+		if (voldata.allocator_free > AllocBytes)
+			voldata.allocator_free -= AllocBytes;
+		else
+			voldata.allocator_free = 0;
+	}
 
 	voldata.sroot_blockset.blockref[sroot_slot] = sroot_new;
 	voldata.mirror_tid = new_tid;
@@ -975,17 +984,17 @@ cmd_recv(int ac, char **av)
 	}
 
 	fprintf(stderr, "recv: PFS \"%s\"%s%s: %ju blocks (%ju payload "
-	    "bytes), %ju refs, allocator_beg %016llx, mirror_tid %ju\n",
+	    "bytes), %ju refs, allocator_beg %016jx, mirror_tid %ju\n",
 	    hdr.label,
 	    update ? " (updated" : "",
 	    update ? ")" : "",
 	    (uintmax_t)RecvRecords,
 	    (uintmax_t)RecvPayloadBytes,
 	    (uintmax_t)RecvRefRecords,
-	    (long long)voldata.allocator_beg,
+	    (intmax_t)voldata.allocator_beg,
 	    (uintmax_t)voldata.mirror_tid);
 	if (VerboseOpt)
-		fprintf(stderr, "recv: root bref at %016llx\n",
-		    (long long)root_bref.data_off);
+		fprintf(stderr, "recv: root bref at %016jx\n",
+		    (intmax_t)root_bref.data_off);
 	return (rcode);
 }

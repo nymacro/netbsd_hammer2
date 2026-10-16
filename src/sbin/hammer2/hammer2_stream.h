@@ -68,7 +68,7 @@
 #define HAMMER2_STREAM_MAGIC	"H2SEND01"
 #define HAMMER2_STREAM_VERSION	1
 
-#define HAMMER2_STREAM_LABELSIZE 64	/* header label/fromlabel size */
+#define HAMMER2_STREAM_LABELSIZE	64	/* header label/fromlabel size */
 
 #define HAMMER2_STREAM_RECMAGIC	0x48325243	/* "H2RC" */
 
@@ -80,25 +80,27 @@
  * Stream header, 512 bytes, followed by a trailing icrc32.
  */
 struct hammer2_stream_header {
-	char	magic[8];			/* HAMMER2_STREAM_MAGIC */
-	uint32_t version;
-	uint32_t flags;				/* STREAM_FLAG_* */
-	char	label[HAMMER2_STREAM_LABELSIZE];		/* source PFS label (to) */
-	char	fromlabel[HAMMER2_STREAM_LABELSIZE];	/* from-generation label (-i) */
-	uuid_t	pfs_clid;			/* source PFS cluster id */
-	uuid_t	pfs_fsid;			/* source PFS private id */
-	hammer2_tid_t mirror_tid;		/* source volhdr mirror_tid */
-	hammer2_tid_t from_modify_tid;		/* -i: from PFS root bref */
-	hammer2_key_t from_key;			/* -i: from PFS root bref */
-	hammer2_off_t volu_size;		/* source volume-set size */
-	char	reserved[300];
-	uint32_t check;				/* icrc32 of preceding bytes */
+	char		magic[8];			/* HAMMER2_STREAM_MAGIC */
+	uint32_t	version;
+	uint32_t	flags;				/* STREAM_FLAG_* */
+	char		label[HAMMER2_STREAM_LABELSIZE];	/* source PFS label (to) */
+	char		fromlabel[HAMMER2_STREAM_LABELSIZE];	/* from-generation label (-i) */
+	uuid_t		pfs_clid;			/* source PFS cluster id */
+	uuid_t		pfs_fsid;			/* source PFS private id */
+	hammer2_tid_t	mirror_tid;			/* source volhdr mirror_tid */
+	hammer2_tid_t	from_modify_tid;		/* -i: from PFS root bref */
+	hammer2_key_t	from_key;			/* -i: from PFS root bref */
+	hammer2_off_t	volu_size;			/* source volume-set size */
+	char		reserved[300];
+	uint32_t	check;				/* icrc32 of preceding bytes */
 } __packed;
 
 typedef struct hammer2_stream_header hammer2_stream_header_t;
 
 /*
- * Record header, 144 bytes, followed by `size' payload bytes.
+ * Record header, 148 bytes, followed by `size' payload bytes.  The header
+ * is self-protected by `hcheck' (icrc32 over the header up to but excluding
+ * hcheck itself); `check' covers the payload.
  */
 struct hammer2_stream_record {
 	uint32_t magic;			/* HAMMER2_STREAM_RECMAGIC */
@@ -106,6 +108,7 @@ struct hammer2_stream_record {
 	uint32_t size;			/* payload bytes (0 if none) */
 	uint32_t check;			/* icrc32 of payload */
 	hammer2_blockref_t bref;	/* source blockref, 128 bytes */
+	uint32_t hcheck;		/* icrc32 of header (through bref) */
 } __packed;
 
 typedef struct hammer2_stream_record hammer2_stream_record_t;
@@ -113,6 +116,6 @@ typedef struct hammer2_stream_record hammer2_stream_record_t;
 _Static_assert(sizeof(hammer2_stream_header_t) == 512,
     "hammer2_stream_header size != 512");
 _Static_assert(sizeof(hammer2_stream_record_t) ==
-    16 + HAMMER2_BLOCKREF_BYTES, "hammer2_stream_record size mismatch");
+    20 + HAMMER2_BLOCKREF_BYTES, "hammer2_stream_record size mismatch");
 
 #endif /* !HAMMER2_HAMMER2_STREAM_H_ */

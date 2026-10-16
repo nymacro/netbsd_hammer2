@@ -582,16 +582,21 @@ from stdin onto the offline volume
 .Ar devpath ,
 creating a new PFS named after the stream, similar to
 .Xr zfs 8 Ns ' Cm recv .
-Payload blocks are reallocated on the destination (linearly from the
-allocator region, like
-.Xr newfs_hammer2 8 )
-and the super-root is extended with a dirent for the received PFS;
-the volume headers are committed last, so a crash at any earlier point
-leaves the destination in its previous consistent state.
-The freemap is not modified; received blocks live below the volume's
-allocator-begin offset, which the kernel allocator and
+Payload blocks are reallocated on the destination and the super-root is
+extended with a dirent for the received PFS; the volume headers are
+committed last, so a crash at any earlier point leaves the destination
+in its previous consistent state.
+On a freshly created volume
+.Pq Xr newfs_hammer2 8
+the allocator-begin offset is advanced past the received blocks, which
+live below it and are therefore never handed out by the kernel allocator
+or
 .Cm bulkfree
-never touch.
+again.
+On a volume that has already been mounted read-write the received blocks
+are instead allocated from, and recorded in, the destination's on-media
+freemap, and a COW copy of the freemap tree is committed with the volume
+header; such a destination must have enough free space.
 .Pp
 With
 .Fl u Ar label
@@ -610,7 +615,7 @@ The destination volume must not be mounted (recv writes raw blocks and
 commits the volume header itself; a mounted filesystem would race with
 the commit).
 It must be a single volume with a free
-super-root blockset slot (at most 3 PFS entries) for
+super-root blockset slot (at most 4 PFS entries) for
 .Cm recv ,
 or the PFS named with
 .Fl u

@@ -50,6 +50,7 @@
  */
 
 #include <err.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -150,6 +151,8 @@ write_record(FILE *fp, const hammer2_blockref_t *bref, uint32_t flags,
 	rec.size = size;
 	rec.check = size ? hammer2_icrc32(data, size) : 0;
 	rec.bref = *bref;
+	rec.hcheck = hammer2_icrc32(&rec,
+	    offsetof(hammer2_stream_record_t, hcheck));
 
 	if (fwrite(&rec, sizeof(rec), 1, fp) != 1)
 		err(1, "send: stream write");
@@ -288,7 +291,7 @@ cmd_send(int ac, char **av)
 
 	for (i = 0; i < ac; ++i) {
 		if (strcmp(av[i], "-v") == 0) {
-			; /* handled globally (VerboseOpt) */
+			/* -v is a global option, handled in main() */
 		} else if (strcmp(av[i], "-i") == 0) {
 			if (i + 1 >= ac)
 				errx(1, "send: -i requires a label");

@@ -247,10 +247,14 @@ hammer2_send_testcheck(const hammer2_blockref_t *bref, const void *data,
 		SHA256_Init(&hash_ctx);
 		SHA256_Update(&hash_ctx, data, bytes);
 		SHA256_Final(u.digest, &hash_ctx);
-		u.digest64[0] ^= u.digest64[4];
-		u.digest64[1] ^= u.digest64[5];
-		u.digest64[2] ^= u.digest64[6];
-		u.digest64[3] ^= u.digest64[7];
+		/*
+		 * Fold word 3 into word 2, then compare the first 24
+		 * bytes (192 bits).  This must match the fold used by
+		 * hammer2_chain_calc_check/testcheck and the userland
+		 * fsck/recover/debug code, else valid SHA192 blocks
+		 * fail verification.
+		 */
+		u.digest64[2] ^= u.digest64[3];
 		if (memcmp(u.digest, bref->check.sha192.data,
 			   sizeof(bref->check.sha192.data)) == 0)
 			return (0);
@@ -598,6 +602,11 @@ hammer2_send_reap(hammer2_dev_t *hmp, const char *label, pid_t pid,
  * with held chain references or leak a stale pin keyed by a
  * soon-to-be-reused hammer2_dev_t pointer.  Callers hold
  * hammer2_mntlk inconsistently, so detect it.
+ *
+ * Invariant: no session may be mid-walk (->active) here.  An unmount
+ * cannot proceed while a sender holds a live fd on the filesystem, so
+ * only abandoned (owner-exited) sessions are normally seen.  Report
+ * a violation rather than free a live walk silently.
  */
 void
 hammer2_send_purge_dev(hammer2_dev_t *hmp)
@@ -619,6 +628,20 @@ hammer2_send_purge_dev(hammer2_dev_t *hmp)
 	have_mntlk = mutex_owned(&hammer2_mntlk);
 	while ((st = TAILQ_FIRST(&freelist)) != NULL) {
 		TAILQ_REMOVE(&freelist, st, entry);
+		/*
+		 * Defensive: freeing a session with a walk in progress
+		 * would use-after-free the walker's state, and freeing one
+		 * whose owner is still alive would drop its pin under it.
+		 * Neither can happen for a quiesced unmount; report if it
+		 * does.
+		 */
+		if (st->active)
+			hprintf("hammer2_send_purge_dev: purging ACTIVE "
+			    "session \"%s\"\n", st->label);
+		else if (hammer2_send_proc_alive(st->pid))
+			hprintf("hammer2_send_purge_dev: purging session "
+			    "\"%s\" of live pid %d\n",
+			    st->label, (int)st->pid);
 		hammer2_send_free(st, have_mntlk);
 	}
 }

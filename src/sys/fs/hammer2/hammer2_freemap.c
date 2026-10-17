@@ -885,8 +885,20 @@ hammer2_freemap_adjust(hammer2_dev_t *hmp, hammer2_blockref_t *bref, int how)
 		bytes = (size_t)1 << radix;
 	else
 		bytes = 0;
-	KKASSERT(radix != 0);
-	KKASSERT(radix <= HAMMER2_RADIX_MAX);
+
+	/*
+	 * Recovery walks hostile media: a SIGKILLed commit (e.g. a killed
+	 * recv) can leave stale/garbage blockrefs in the topology that the
+	 * recovery scan then feeds us (radix 0, oversize, or below the
+	 * first usable segment).  Skip them with a warning instead of
+	 * tripping diagnostic assertions -- recovery must not panic on
+	 * the very media state it exists to repair.
+	 */
+	if (radix == 0 || radix > HAMMER2_RADIX_MAX) {
+		hprintf("skip: bad radix %d at data_off %016llx\n",
+		    radix, (long long)bref->data_off);
+		return;
+	}
 
 	data_off &= ~HAMMER2_OFF_MASK_RADIX;
 
@@ -899,7 +911,11 @@ hammer2_freemap_adjust(hammer2_dev_t *hmp, hammer2_blockref_t *bref, int how)
 	if (data_off < hmp->voldata.allocator_beg)
 		return;
 
-	KKASSERT((data_off & HAMMER2_ZONE_MASK64) >= HAMMER2_ZONE_SEG);
+	if ((data_off & HAMMER2_ZONE_MASK64) < HAMMER2_ZONE_SEG) {
+		hprintf("skip: data_off %016llx below first segment\n",
+		    (long long)data_off);
+		return;
+	}
 
 	/* Lookup the level1 freemap chain.  The chain must exist. */
 	key = H2FMBASE(data_off, HAMMER2_FREEMAP_LEVEL1_RADIX);
@@ -919,7 +935,9 @@ hammer2_freemap_adjust(hammer2_dev_t *hmp, hammer2_blockref_t *bref, int how)
 		    (long long)bref->data_off);
 		goto done;
 	}
-	if (chain->error) {
+	/* DORECOVER with a lookup miss falls through to the leaf-create
+	 * branch below; guard the error check against chain == NULL. */
+	if (chain && chain->error) {
 		hprintf("error %d at data_off %016llx\n",
 		    chain->error, (long long)bref->data_off);
 		hammer2_chain_unlock(chain);
@@ -941,15 +959,30 @@ hammer2_freemap_adjust(hammer2_dev_t *hmp, hammer2_blockref_t *bref, int how)
 		    HAMMER2_FREEMAP_LEVELN_PSIZE, mtid, 0, 0);
 		if (error == 0) {
 			error = hammer2_chain_modify(chain, mtid, 0, 0);
-			KKASSERT(error == 0);
-			bzero(&chain->data->bmdata[0],
-			    HAMMER2_FREEMAP_LEVELN_PSIZE);
-			chain->bref.check.freemap.bigmask = (uint32_t)-1;
-			chain->bref.check.freemap.avail = l1size;
-			/* bref.methods should already be inherited. */
-			hammer2_freemap_init(hmp, key, chain);
+			if (error == 0) {
+				bzero(&chain->data->bmdata[0],
+				    HAMMER2_FREEMAP_LEVELN_PSIZE);
+				chain->bref.check.freemap.bigmask =
+				    (uint32_t)-1;
+				chain->bref.check.freemap.avail = l1size;
+				/* bref.methods should already be inherited. */
+				hammer2_freemap_init(hmp, key, chain);
+			}
 		}
-		/* XXX handle error */
+	}
+	/*
+	 * The leaf is unavailable (lookup error, or the DORECOVER leaf
+	 * create/modify failed -- e.g. ENOSPC while recovering a full
+	 * corrupt volume).  Skip the bitmap adjust; the block stays
+	 * accounted for by the next bulkfree pass.  Recovery must not
+	 * panic on the media state it is repairing.
+	 */
+	if (chain == NULL || chain->error || chain->data == NULL) {
+		if (chain) {
+			hammer2_chain_unlock(chain);
+			hammer2_chain_drop(chain);
+		}
+		goto done;
 	}
 
 #if FREEMAP_DEBUG

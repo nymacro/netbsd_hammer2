@@ -429,7 +429,19 @@ hammer2_pfsalloc(hammer2_chain_t *chain, const hammer2_inode_data_t *ripdata,
 {
 	hammer2_pfs_t *pmp = NULL;
 	hammer2_inode_t *iroot;
+	char namebuf[sizeof(ripdata->filename) + 1];
 	int i, j;
+
+	/*
+	 * The on-media filename field is 64 bytes and a corrupt or
+	 * interrupted-commit inode (e.g. a SIGKILLed recv's in-flight
+	 * root-inode copy) may lack the NUL terminator -- never run
+	 * strlen()/hstrdup() on it unbounded.
+	 */
+	if (ripdata) {
+		bcopy(ripdata->filename, namebuf, sizeof(ripdata->filename));
+		namebuf[sizeof(ripdata->filename)] = 0;
+	}
 
 	/*
 	 * Locate or create the PFS based on the cluster id.  If ripdata
@@ -447,8 +459,7 @@ hammer2_pfsalloc(hammer2_chain_t *chain, const hammer2_inode_data_t *ripdata,
 			    sizeof(pmp->pfs_clid)) == 0)
 				break;
 			else if (force_local && pmp->pfs_names[0] &&
-			    strcmp(pmp->pfs_names[0],
-			    (const char *)ripdata->filename) == 0)
+			    strcmp(pmp->pfs_names[0], namebuf) == 0)
 				break;
 		}
 	}
@@ -499,6 +510,77 @@ hammer2_pfsalloc(hammer2_chain_t *chain, const hammer2_inode_data_t *ripdata,
 		hammer2_inode_unlock(iroot);
 	}
 
+	/*
+	 * Upstream absorbs multiple super-root entries with the same
+	 * pfs_clid as cluster members (a PFS can legitimately span
+	 * devices).  This port is single-node -- cluster nchains is
+	 * asserted == 1 everywhere -- so only the FIRST claim on a
+	 * pfs_clid is kept and any further claim is skipped with a
+	 * warning.  Two situations produce duplicates:
+	 *
+	 * (1) an interrupted COW commit (e.g. a SIGKILLed recv, or any
+	 *     PFS snapshot operation killed between the chain copy and
+	 *     the super-root update) leaves the committed blockset
+	 *     referencing two copies of the same PFS root on one device;
+	 * (2) the same PFS clid exists on two devices mounted at the
+	 *     same time (e.g. a send/recv source and destination mounted
+	 *     together for verification).
+	 *
+	 * In both cases mount-time recovery and the next flush/bulkfree
+	 * reconcile the media from the kept copy.
+	 */
+	if (ripdata && chain && pmp->iroot && iroot->cluster.nchains > 0) {
+		hammer2_chain_t *oldc = iroot->cluster.array[0].chain;
+
+		if (pmp->mp) {
+			/* mounted PFS: keep the live association */
+			hprintf("duplicate PFS root \"%s\" (pfs_clid "
+			    "already claimed by a mounted PFS); skipping "
+			    "mirror_tid %016llx\n",
+			    (const char *)ripdata->filename,
+			    (long long)chain->bref.mirror_tid);
+			goto done;
+		}
+		/*
+		 * Unmounted: keep the newer of the two copies.  A killed
+		 * commit leaves the older copy in the blockset; a second
+		 * device carrying the same PFS replaces the association
+		 * so label lookups and pfs-delete on that device work.
+		 */
+		if (chain->bref.mirror_tid > oldc->bref.mirror_tid) {
+			hprintf("duplicate PFS root \"%s\": replacing "
+			    "older copy (mirror_tid %016llx) with %016llx\n",
+			    (const char *)ripdata->filename,
+			    (long long)oldc->bref.mirror_tid,
+			    (long long)chain->bref.mirror_tid);
+			chain->pmp = pmp;
+			hammer2_chain_ref(chain);
+			iroot->cluster.array[0].chain = chain;
+			pmp->pfs_types[0] = (force_local) ?
+			    HAMMER2_PFSTYPE_MASTER : ripdata->meta.pfs_type;
+			/* pfs_names[] entries come from hstrdup()
+			 * (kmem_strdup) -- free with the matching
+			 * hstrfree(), not free(9) */
+			if (pmp->pfs_names[0])
+				hstrfree(pmp->pfs_names[0]);
+			pmp->pfs_names[0] = hstrdup(namebuf);
+			pmp->pfs_hmps[0] = chain->hmp;
+			hammer2_spin_ex(&pmp->blockset_spin);
+			pmp->pfs_iroot_blocksets[0] =
+			    chain->data->ipdata.u.blockset;
+			hammer2_spin_unex(&pmp->blockset_spin);
+			oldc->pmp = NULL;
+			hammer2_chain_drop(oldc);
+		} else {
+			hprintf("duplicate PFS root \"%s\": keeping newer "
+			    "copy (mirror_tid %016llx), skipping %016llx\n",
+			    (const char *)ripdata->filename,
+			    (long long)oldc->bref.mirror_tid,
+			    (long long)chain->bref.mirror_tid);
+		}
+		goto done;
+	}
+
 	/* Stop here if no chain is passed in. */
 	if (chain == NULL)
 		goto done;
@@ -530,7 +612,7 @@ hammer2_pfsalloc(hammer2_chain_t *chain, const hammer2_inode_data_t *ripdata,
 			pmp->pfs_types[j] = HAMMER2_PFSTYPE_MASTER;
 		else
 			pmp->pfs_types[j] = ripdata->meta.pfs_type;
-		pmp->pfs_names[j] = hstrdup((const char *)ripdata->filename);
+		pmp->pfs_names[j] = hstrdup(namebuf);
 		pmp->pfs_hmps[j] = chain->hmp;
 		hammer2_spin_ex(&pmp->blockset_spin);
 		pmp->pfs_iroot_blocksets[j] = chain->data->ipdata.u.blockset;

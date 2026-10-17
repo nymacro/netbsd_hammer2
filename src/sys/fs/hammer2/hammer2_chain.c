@@ -69,7 +69,6 @@ static hammer2_chain_t *hammer2_combined_find(hammer2_chain_t *,
     hammer2_blockref_t *, int, hammer2_key_t *, hammer2_key_t, hammer2_key_t,
     hammer2_blockref_t **);
 static hammer2_chain_t *hammer2_chain_lastdrop(hammer2_chain_t *, int);
-static void hammer2_chain_load_data(hammer2_chain_t *);
 static int hammer2_chain_testcheck(hammer2_chain_t *, void *);
 
 /*
@@ -882,7 +881,7 @@ hammer2_chain_lock(hammer2_chain_t *chain, int how)
  * Once chain->data is set it cannot be disposed of until all locks are
  * released.
  */
-static void
+void
 hammer2_chain_load_data(hammer2_chain_t *chain)
 {
 	hammer2_dev_t *hmp;

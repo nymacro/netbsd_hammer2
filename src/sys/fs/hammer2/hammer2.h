@@ -1252,6 +1252,7 @@ void hammer2_chain_unhold(hammer2_chain_t *);
 void hammer2_chain_drop_unhold(hammer2_chain_t *);
 void hammer2_chain_rehold(hammer2_chain_t *);
 int hammer2_chain_lock(hammer2_chain_t *, int);
+void hammer2_chain_load_data(hammer2_chain_t *);
 //void hammer2_chain_lock_unhold(hammer2_chain_t *chain, int how);
 void hammer2_chain_unlock(hammer2_chain_t *);
 //void hammer2_chain_unlock_hold(hammer2_chain_t *chain);

@@ -1905,20 +1905,40 @@ hammer2_recovery_scan(hammer2_dev_t *hmp, hammer2_chain_t *parent,
 		/*
 		 * Must instantiate data for DIRECTDATA test and also
 		 * for recursion.
+		 *
+		 * chain_scan() returned parent already locked (the scan
+		 * protocol keeps the returned chain locked until the
+		 * next iteration unlocks it), so we MUST NOT re-lock it
+		 * here: upstream's mtx_lock_ex is explicitly recursive
+		 * ("Recursion is allowed", sys/mutex2.h) but the NetBSD
+		 * rwlock shim is not -- a recursive exclusive acquire
+		 * aborts ("locking against myself", seen as a mount-time
+		 * lockdebug panic when recovery actually walks a tree,
+		 * e.g. after a SIGKILLed send/recv commit).  Load the
+		 * data directly under the lock we already hold.
 		 */
-		hammer2_chain_lock(parent, HAMMER2_RESOLVE_ALWAYS);
+		if (parent->data == NULL)
+			hammer2_chain_load_data(parent);
+		if (parent->data == NULL) {
+			/* corrupt / unreadable inode: report and stop
+			 * walking this branch (the scan protocol owns
+			 * the lock and will unlock it) */
+			return (parent->error ?
+			    parent->error : HAMMER2_ERROR_EIO);
+		}
 		ripdata = &parent->data->ipdata;
 		if (ripdata->meta.op_flags & HAMMER2_OPFLAG_DIRECTDATA) {
 			/* not applicable to recovery scan */
-			hammer2_chain_unlock(parent);
 			return (0);
 		}
-		hammer2_chain_unlock(parent);
 		break;
 	case HAMMER2_BREF_TYPE_INDIRECT:
-		/* Must instantiate data for recursion. */
-		hammer2_chain_lock(parent, HAMMER2_RESOLVE_ALWAYS);
-		hammer2_chain_unlock(parent);
+		/*
+		 * Must instantiate data for recursion.  See the INODE
+		 * case: parent is already locked, do not re-lock.
+		 */
+		if (parent->data == NULL)
+			hammer2_chain_load_data(parent);
 		break;
 	case HAMMER2_BREF_TYPE_DIRENT:
 	case HAMMER2_BREF_TYPE_DATA:

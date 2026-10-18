@@ -433,10 +433,13 @@ hammer2_pfsalloc(hammer2_chain_t *chain, const hammer2_inode_data_t *ripdata,
 	int i, j;
 
 	/*
-	 * The on-media filename field is 64 bytes and a corrupt or
-	 * interrupted-commit inode (e.g. a SIGKILLed recv's in-flight
-	 * root-inode copy) may lack the NUL terminator -- never run
-	 * strlen()/hstrdup() on it unbounded.
+	 * The on-media filename field is 256 bytes and is documented as
+	 * UNTERMINATED -- meta.name_len is authoritative -- so never run
+	 * strlen()/hstrdup() on it unbounded.  Valid writers leave the
+	 * tail zero-filled (fresh inode blocks are zero-filled), but a
+	 * corrupt or interrupted-commit inode (e.g. a SIGKILLed recv's
+	 * in-flight root-inode copy) has no such guarantee.  Copy to a
+	 * bounded local first.
 	 */
 	if (ripdata) {
 		bcopy(ripdata->filename, namebuf, sizeof(ripdata->filename));
@@ -537,7 +540,7 @@ hammer2_pfsalloc(hammer2_chain_t *chain, const hammer2_inode_data_t *ripdata,
 			hprintf("duplicate PFS root \"%s\" (pfs_clid "
 			    "already claimed by a mounted PFS); skipping "
 			    "mirror_tid %016llx\n",
-			    (const char *)ripdata->filename,
+			    namebuf,
 			    (long long)chain->bref.mirror_tid);
 			goto done;
 		}
@@ -550,7 +553,7 @@ hammer2_pfsalloc(hammer2_chain_t *chain, const hammer2_inode_data_t *ripdata,
 		if (chain->bref.mirror_tid > oldc->bref.mirror_tid) {
 			hprintf("duplicate PFS root \"%s\": replacing "
 			    "older copy (mirror_tid %016llx) with %016llx\n",
-			    (const char *)ripdata->filename,
+			    namebuf,
 			    (long long)oldc->bref.mirror_tid,
 			    (long long)chain->bref.mirror_tid);
 			chain->pmp = pmp;
@@ -574,7 +577,7 @@ hammer2_pfsalloc(hammer2_chain_t *chain, const hammer2_inode_data_t *ripdata,
 		} else {
 			hprintf("duplicate PFS root \"%s\": keeping newer "
 			    "copy (mirror_tid %016llx), skipping %016llx\n",
-			    (const char *)ripdata->filename,
+			    namebuf,
 			    (long long)oldc->bref.mirror_tid,
 			    (long long)chain->bref.mirror_tid);
 		}
@@ -1349,9 +1352,22 @@ next_hmp:
 	chain = hammer2_chain_lookup(&parent, &key_next, lhc,
 	    lhc + HAMMER2_DIRHASH_LOMASK, &error, 0);
 	while (chain) {
+		/*
+		 * The on-media filename field is documented as unterminated
+		 * (meta.name_len is authoritative): compare against a bounded
+		 * copy, and never match a chain whose data failed its media
+		 * check (the data pointer then references the corrupt buffer).
+		 */
 		if (chain->bref.type == HAMMER2_BREF_TYPE_INODE &&
-		    strcmp(label, (char *)chain->data->ipdata.filename) == 0)
-			break;
+		    chain->error == 0 && chain->data != NULL) {
+			char namebuf[sizeof(chain->data->ipdata.filename) + 1];
+
+			bcopy(chain->data->ipdata.filename, namebuf,
+			    sizeof(chain->data->ipdata.filename));
+			namebuf[sizeof(chain->data->ipdata.filename)] = 0;
+			if (strcmp(label, namebuf) == 0)
+				break;
+		}
 		chain = hammer2_chain_next(&parent, chain, &key_next,
 		    lhc + HAMMER2_DIRHASH_LOMASK, &error, 0);
 	}
@@ -2001,10 +2017,14 @@ hammer2_recovery_scan(hammer2_dev_t *hmp, hammer2_chain_t *parent,
 		 */
 		if (parent->data == NULL)
 			hammer2_chain_load_data(parent);
-		if (parent->data == NULL) {
-			/* corrupt / unreadable inode: report and stop
-			 * walking this branch (the scan protocol owns
-			 * the lock and will unlock it) */
+		if (parent->data == NULL || parent->error) {
+			/*
+			 * Corrupt / unreadable / failed-check inode:
+			 * report and stop walking this branch (the scan
+			 * protocol owns the lock and will unlock it).
+			 * NOTE: a failed media check leaves data pointing
+			 * at the corrupt buffer -- never trust meta.
+			 */
 			return (parent->error ?
 			    parent->error : HAMMER2_ERROR_EIO);
 		}
@@ -2018,9 +2038,16 @@ hammer2_recovery_scan(hammer2_dev_t *hmp, hammer2_chain_t *parent,
 		/*
 		 * Must instantiate data for recursion.  See the INODE
 		 * case: parent is already locked, do not re-lock.
+		 * A failed media check leaves data pointing at the
+		 * corrupt buffer -- never walk garbage blockrefs.
 		 */
 		if (parent->data == NULL)
 			hammer2_chain_load_data(parent);
+		if (parent->data == NULL)
+			return (parent->error ?
+			    parent->error : HAMMER2_ERROR_EIO);
+		if (parent->error)
+			return (parent->error);
 		break;
 	case HAMMER2_BREF_TYPE_DIRENT:
 	case HAMMER2_BREF_TYPE_DATA:

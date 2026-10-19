@@ -4932,70 +4932,98 @@ hammer2_characterize_failed_chain(hammer2_chain_t *chain, uint64_t check,
 	//print_backtrace(-1);
 }
 
-static int
-hammer2_chain_testcheck(hammer2_chain_t *chain, void *bdata)
+/*
+ * Verify media data against the check code embedded in *bref.
+ *
+ * Shared by the chain layer (hammer2_chain_testcheck) and the send
+ * walker (hammer2_send.c) so the check algorithms exist in exactly one
+ * place.  Returns 1 on match, 0 on mismatch.  NONE/DISABLED and unknown
+ * check methods are treated as verified (mirroring upstream's policy of
+ * trusting blocks whose check method is not implemented); the send
+ * walker rejects unknown methods itself before calling this.
+ */
+int
+hammer2_bref_testcheck(const hammer2_blockref_t *bref, const void *bdata,
+    size_t bytes)
 {
 	uint32_t check32;
 	uint64_t check64;
+	SHA256_CTX hash_ctx;
+	union {
+		uint8_t digest[SHA256_DIGEST_LENGTH];
+		uint64_t digest64[SHA256_DIGEST_LENGTH/8];
+	} u;
+
+	switch (HAMMER2_DEC_CHECK(bref->methods)) {
+	case HAMMER2_CHECK_NONE:
+		return (1);
+	case HAMMER2_CHECK_DISABLED:
+		return (1);
+	case HAMMER2_CHECK_ISCSI32:
+		check32 = hammer2_icrc32(bdata, bytes);
+		return (bref->check.iscsi32.value == check32);
+	case HAMMER2_CHECK_XXHASH64:
+		check64 = XXH64(bdata, bytes, XXH_HAMMER2_SEED);
+		return (bref->check.xxhash64.value == check64);
+	case HAMMER2_CHECK_SHA192:
+		SHA256_Init(&hash_ctx);
+		SHA256_Update(&hash_ctx, bdata, bytes);
+		SHA256_Final(u.digest, &hash_ctx);
+		/*
+		 * Fold word 3 into word 2, then compare the first 24
+		 * bytes (192 bits).  The single shared implementation of
+		 * this fold lives here.
+		 */
+		u.digest64[2] ^= u.digest64[3];
+		return (bcmp(u.digest,
+			     bref->check.sha192.data,
+			     sizeof(bref->check.sha192.data)) == 0);
+	case HAMMER2_CHECK_FREEMAP:
+		return (bref->check.freemap.icrc32 ==
+			hammer2_icrc32(bdata, bytes));
+	default:
+		hprintf("unknown check type %02x\n", bref->methods);
+		return (1);
+	}
+}
+
+static int
+hammer2_chain_testcheck(hammer2_chain_t *chain, void *bdata)
+{
 	int r;
 
 	if (chain->flags & HAMMER2_CHAIN_NOTTESTED)
 		return (1);
 
+	r = hammer2_bref_testcheck(&chain->bref, bdata, chain->bytes);
+
 	switch (HAMMER2_DEC_CHECK(chain->bref.methods)) {
-	case HAMMER2_CHECK_NONE:
-		r = 1;
-		break;
-	case HAMMER2_CHECK_DISABLED:
-		r = 1;
-		break;
 	case HAMMER2_CHECK_ISCSI32:
-		check32 = hammer2_icrc32(bdata, chain->bytes);
-		r = (chain->bref.check.iscsi32.value == check32);
-		if (r == 0) {
-			hammer2_characterize_failed_chain(chain, check32,
-							  32, bdata);
-		}
 		hammer2_process_icrc32 += chain->bytes;
+		if (r == 0) {
+			hammer2_characterize_failed_chain(chain,
+			    hammer2_icrc32(bdata, chain->bytes), 32, bdata);
+		}
 		break;
 	case HAMMER2_CHECK_XXHASH64:
-		check64 = XXH64(bdata, chain->bytes, XXH_HAMMER2_SEED);
-		r = (chain->bref.check.xxhash64.value == check64);
-		if (r == 0) {
-			hammer2_characterize_failed_chain(chain, check64,
-							  64, bdata);
-		}
 		hammer2_process_xxhash64 += chain->bytes;
+		if (r == 0) {
+			hammer2_characterize_failed_chain(chain,
+			    XXH64(bdata, chain->bytes, XXH_HAMMER2_SEED),
+			    64, bdata);
+		}
 		break;
 	case HAMMER2_CHECK_SHA192:
-		{
-		SHA256_CTX hash_ctx;
-		union {
-			uint8_t digest[SHA256_DIGEST_LENGTH];
-			uint64_t digest64[SHA256_DIGEST_LENGTH/8];
-		} u;
-		SHA256_Init(&hash_ctx);
-		SHA256_Update(&hash_ctx, bdata, chain->bytes);
-		SHA256_Final(u.digest, &hash_ctx);
-		u.digest64[2] ^= u.digest64[3];
-			if (bcmp(u.digest,
-				 chain->bref.check.sha192.data,
-			         sizeof(chain->bref.check.sha192.data)) == 0) {
-				r = 1;
-			} else {
-				r = 0;
-				krateprintf(&krate_h2chk,
-					"chain %016jx.%02x meth=%02x "
-					"CHECK FAIL\n",
-					chain->bref.data_off,
-					chain->bref.type,
-					chain->bref.methods);
-			}
+		if (r == 0) {
+			krateprintf(&krate_h2chk,
+				"chain %016jx.%02x meth=%02x "
+				"CHECK FAIL\n",
+				chain->bref.data_off,
+				chain->bref.type,
+				chain->bref.methods);
 		}
 		break;
 	case HAMMER2_CHECK_FREEMAP:
-		r = (chain->bref.check.freemap.icrc32 ==
-		     hammer2_icrc32(bdata, chain->bytes));
 		if (r == 0) {
 			int did;
 
@@ -5023,9 +5051,10 @@ hammer2_chain_testcheck(hammer2_chain_t *chain, void *bdata)
 		}
 		break;
 	default:
-		hprintf("unknown check type %02x\n",
-			chain->bref.methods);
-		r = 1;
+		/*
+		 * Unknown check type: already reported by
+		 * hammer2_bref_testcheck(), treated as verified.
+		 */
 		break;
 	}
 

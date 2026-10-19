@@ -16,11 +16,7 @@ WARNS=	5
 CFLAGS+=	-I../../sys
 CFLAGS+=	-DZLIB_CONST
 
-# error: 'SHA256_xxx' is deprecated [-Werror,-Wdeprecated-declarations]
-CFLAGS+=	-Wno-deprecated-declarations
-
 DPADD+=		${LIBZ}
 LDADD+=		-lz
-LDADD+=		-lcrypto
 
 .include <bsd.prog.mk>

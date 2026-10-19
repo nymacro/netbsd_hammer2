@@ -47,6 +47,12 @@
  * recomputing their check codes.  Leaf payloads are copied verbatim,
  * compression and check codes intact.
  *
+ * All fields are LITTLE-ENDIAN on the wire, matching the on-media
+ * format (which is written in host byte order on the little-endian
+ * platforms this port runs on).  A big-endian implementation must
+ * byte-swap fields explicitly; it cannot inherit the on-media
+ * convention.
+ *
  * REF records (flag RECF_REF) appear only in incremental streams.  They
  * carry no payload; the bref is byte-identical to the corresponding leaf
  * bref in the source from-generation tree.  The receiver locates the
@@ -54,7 +60,13 @@
  * (all fields except data_off) and shares it, exactly the way COW
  * snapshots share blocks.
  *
- * All fields are host byte order, matching the on-media format.
+ * COMPATIBILITY POLICY: receivers must reject any stream version other
+ * than HAMMER2_STREAM_VERSION and any header/record flag bits they do
+ * not know.  New features therefore require a version bump, never a
+ * new flag bit under the same version.  The header's reserved space is
+ * available for future fields; senders must zero it (a zeroed reserved
+ * area keeps older readers of the same version working when a label
+ * field grows into it).
  */
 
 #ifndef HAMMER2_HAMMER2_STREAM_H_
@@ -68,7 +80,14 @@
 #define HAMMER2_STREAM_MAGIC	"H2SEND01"
 #define HAMMER2_STREAM_VERSION	1
 
-#define HAMMER2_STREAM_LABELSIZE	64	/* header label/fromlabel size */
+/*
+ * Label fields are 128 bytes so on-media PFS labels (up to
+ * HAMMER2_INODE_MAXNAME) below that size stream verbatim.  The fields
+ * are NUL-padded; labels longer than the field are rejected by the
+ * sender (the label is informational — the -u lineage is matched by
+ * pfs_clid + modify_tid, not by name).
+ */
+#define HAMMER2_STREAM_LABELSIZE	128	/* header label/fromlabel size */
 
 #define HAMMER2_STREAM_RECMAGIC	0x48325243	/* "H2RC" */
 
@@ -90,8 +109,9 @@ struct hammer2_stream_header {
 	hammer2_tid_t	mirror_tid;			/* source volhdr mirror_tid */
 	hammer2_tid_t	from_modify_tid;		/* -i: from PFS root bref */
 	hammer2_key_t	from_key;			/* -i: from PFS root bref */
+	uuid_t		from_pfs_clid;			/* -i: from PFS cluster id */
 	hammer2_off_t	volu_size;			/* source volume-set size */
-	char		reserved[300];
+	char		reserved[156];
 	uint32_t	check;				/* icrc32 of preceding bytes */
 } __packed;
 

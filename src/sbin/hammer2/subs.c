@@ -54,8 +54,11 @@
 #include <err.h>
 #include <uuid.h>
 
+#include <sys/sha2.h>
+
 #include <fs/hammer2/hammer2_disk.h>
 #include <fs/hammer2/hammer2_ioctl.h>
+#include <fs/hammer2/hammer2_xxhash.h>
 
 #include "hammer2_subs.h"
 
@@ -509,4 +512,138 @@ hammer2_volume_is_mounted(const char *devpath)
 			rv = 1;
 	}
 	return (rv);
+}
+
+/*
+ * Compute the check code for (data, bytes) per bref->methods and store
+ * it into bref->check.  The single shared implementation of the check
+ * algorithms (including the SHA192 word-fold) for the userland tools;
+ * the kernel's copy lives in hammer2_bref_testcheck() (chain.c) and
+ * must stay in sync with this one.
+ */
+void
+hammer2_check_calc(hammer2_blockref_t *bref, const void *data, size_t bytes)
+{
+	SHA256_CTX hash_ctx;
+	union {
+		uint8_t digest[SHA256_DIGEST_LENGTH];
+		uint64_t digest64[SHA256_DIGEST_LENGTH / 8];
+	} u;
+
+	switch (HAMMER2_DEC_CHECK(bref->methods)) {
+	case HAMMER2_CHECK_ISCSI32:
+		bref->check.iscsi32.value = hammer2_icrc32(data, bytes);
+		break;
+	case HAMMER2_CHECK_XXHASH64:
+		bref->check.xxhash64.value = XXH64(data, bytes,
+		    XXH_HAMMER2_SEED);
+		break;
+	case HAMMER2_CHECK_SHA192:
+		SHA256_Init(&hash_ctx);
+		SHA256_Update(&hash_ctx, data, bytes);
+		SHA256_Final(u.digest, &hash_ctx);
+		/*
+		 * Fold word 3 into word 2, then store the first 24
+		 * bytes (192 bits).
+		 */
+		u.digest64[2] ^= u.digest64[3];
+		bcopy(u.digest, bref->check.sha192.data,
+		    sizeof(bref->check.sha192.data));
+		break;
+	case HAMMER2_CHECK_FREEMAP:
+		bref->check.freemap.icrc32 = hammer2_icrc32(data, bytes);
+		break;
+	default:
+		break;
+	}
+}
+
+/*
+ * Verify media data against the check code in *bref.  Returns 0 on
+ * match (also for CHECK_NONE/DISABLED), -1 on mismatch or an unknown
+ * check method (stricter than the kernel, which trusts unknown
+ * methods).
+ */
+int
+hammer2_check_verify(const hammer2_blockref_t *bref, const void *data,
+    size_t bytes)
+{
+	hammer2_blockref_t cbref = *bref;
+
+	switch (HAMMER2_DEC_CHECK(bref->methods)) {
+	case HAMMER2_CHECK_NONE:
+	case HAMMER2_CHECK_DISABLED:
+		return (0);
+	case HAMMER2_CHECK_ISCSI32:
+	case HAMMER2_CHECK_XXHASH64:
+	case HAMMER2_CHECK_SHA192:
+	case HAMMER2_CHECK_FREEMAP:
+		hammer2_check_calc(&cbref, data, bytes);
+		return (memcmp(&cbref.check, &bref->check,
+		    sizeof(bref->check)) ? -1 : 0);
+	default:
+		return (-1);
+	}
+}
+
+/*
+ * Leaf-blockref index shared by `hammer2 send -i' (from-generation leaf
+ * index) and `hammer2 recv -u' (destination from-generation leaf
+ * index).  Keyed by bref identity: the bref with data_off zeroed (the
+ * receiver's copy of a block differs from the source's only in
+ * data_off).  The entry records the media location the block was
+ * indexed at, which recv's REF sharing needs and send ignores.
+ *
+ * Indexed leaves always carry a non-zero data_off, so a 0 return from
+ * hammer2_leaf_find() means "not indexed".
+ */
+#define HAMMER2_LEAF_HBITS	16
+#define HAMMER2_LEAF_HSIZE	(1 << HAMMER2_LEAF_HBITS)
+
+typedef struct hammer2_leaf_entry {
+	struct hammer2_leaf_entry *next;
+	hammer2_blockref_t key;		/* bref with data_off zeroed */
+	hammer2_off_t data_off;		/* media location */
+} hammer2_leaf_entry_t;
+
+static hammer2_leaf_entry_t *LeafHash[HAMMER2_LEAF_HSIZE];
+
+static inline uint32_t
+hammer2_leaf_hash(const hammer2_blockref_t *key)
+{
+	const uint8_t *p = (const uint8_t *)(const void *)key;
+	uint32_t h = 2166136261U;
+	int i;
+
+	for (i = 0; i < HAMMER2_BLOCKREF_BYTES; ++i)
+		h = (h ^ p[i]) * 16777619U;
+	return (h >> (32 - HAMMER2_LEAF_HBITS));
+}
+
+void
+hammer2_leaf_add(const hammer2_blockref_t *bref)
+{
+	hammer2_leaf_entry_t *e = malloc(sizeof(*e));
+
+	if (e == NULL)
+		err(1, "out of memory");
+	e->key = *bref;
+	e->key.data_off = 0;
+	e->data_off = bref->data_off;
+	e->next = LeafHash[hammer2_leaf_hash(&e->key)];
+	LeafHash[hammer2_leaf_hash(&e->key)] = e;
+}
+
+hammer2_off_t
+hammer2_leaf_find(const hammer2_blockref_t *bref)
+{
+	hammer2_leaf_entry_t *e;
+	hammer2_blockref_t key;
+
+	key = *bref;
+	key.data_off = 0;
+	for (e = LeafHash[hammer2_leaf_hash(&key)]; e; e = e->next)
+		if (memcmp(&e->key, &key, sizeof(key)) == 0)
+			return (e->data_off);
+	return (0);
 }

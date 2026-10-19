@@ -85,6 +85,27 @@ const char *counttostr(hammer2_off_t size);
 hammer2_off_t check_volume(int fd);
 hammer2_key_t dirhash(const char *aname, size_t len);
 
+/*
+ * Shared check-code helpers (subs.c): compute/verify the check code for
+ * media data.  Used by cmd_recv, cmd_debug and cmd_recover so the check
+ * algorithms (incl. the SHA192 word-fold) exist in exactly one place in
+ * userland.
+ */
+void hammer2_check_calc(hammer2_blockref_t *bref, const void *data,
+			size_t bytes);
+int hammer2_check_verify(const hammer2_blockref_t *bref, const void *data,
+			 size_t bytes);
+
+/*
+ * Shared leaf-blockref index (subs.c), keyed by bref identity (bref
+ * with data_off zeroed): `send -i' indexes the from-generation leaves,
+ * `recv -u' indexes the destination's from-generation leaves and shares
+ * REF records against it.  hammer2_leaf_find() returns the indexed
+ * media location, or 0 when the bref is not in the index.
+ */
+void hammer2_leaf_add(const hammer2_blockref_t *bref);
+hammer2_off_t hammer2_leaf_find(const hammer2_blockref_t *bref);
+
 #define hammer2_icrc32(buf, size)	iscsi_crc32((buf), (size))
 #define hammer2_icrc32c(buf, size, crc)	iscsi_crc32_ext((buf), (size), (crc))
 uint32_t iscsi_crc32(const void *, size_t);

@@ -65,7 +65,7 @@
 
 #include <stddef.h>
 
-#include <openssl/sha.h>
+#include <sys/sha2.h>
 
 #include "hammer2.h"
 #include "hammer2_stream.h"
@@ -81,87 +81,6 @@ bref_radix_bytes(const hammer2_blockref_t *bref)
 	if (radix == 0)
 		return (0);
 	return ((size_t)1 << radix);
-}
-
-/*
- * Compute and store the check code for (rewritten) media data.
- */
-static void
-calc_check(hammer2_blockref_t *bref, const void *data, size_t bytes)
-{
-	SHA256_CTX hash_ctx;
-	union {
-		uint8_t digest[SHA256_DIGEST_LENGTH];
-		uint64_t digest64[SHA256_DIGEST_LENGTH / 8];
-	} u;
-
-	switch (HAMMER2_DEC_CHECK(bref->methods)) {
-	case HAMMER2_CHECK_ISCSI32:
-		bref->check.iscsi32.value = hammer2_icrc32(data, bytes);
-		break;
-	case HAMMER2_CHECK_XXHASH64:
-		bref->check.xxhash64.value = XXH64(data, bytes,
-		    XXH_HAMMER2_SEED);
-		break;
-	case HAMMER2_CHECK_SHA192:
-		SHA256_Init(&hash_ctx);
-		SHA256_Update(&hash_ctx, data, bytes);
-		SHA256_Final(u.digest, &hash_ctx);
-		u.digest64[2] ^= u.digest64[3];
-		bcopy(u.digest, bref->check.sha192.data,
-		    sizeof(bref->check.sha192.data));
-		break;
-	case HAMMER2_CHECK_FREEMAP:
-		bref->check.freemap.icrc32 = hammer2_icrc32(data, bytes);
-		break;
-	default:
-		break;
-	}
-}
-
-static int
-test_check(const hammer2_blockref_t *bref, const void *data, size_t bytes)
-{
-	uint32_t cv;
-	uint64_t cv64;
-	SHA256_CTX hash_ctx;
-	union {
-		uint8_t digest[SHA256_DIGEST_LENGTH];
-		uint64_t digest64[SHA256_DIGEST_LENGTH / 8];
-	} u;
-
-	switch (HAMMER2_DEC_CHECK(bref->methods)) {
-	case HAMMER2_CHECK_NONE:
-	case HAMMER2_CHECK_DISABLED:
-		return (0);
-	case HAMMER2_CHECK_ISCSI32:
-		cv = hammer2_icrc32(data, bytes);
-		if (bref->check.iscsi32.value == cv)
-			return (0);
-		break;
-	case HAMMER2_CHECK_XXHASH64:
-		cv64 = XXH64(data, bytes, XXH_HAMMER2_SEED);
-		if (bref->check.xxhash64.value == cv64)
-			return (0);
-		break;
-	case HAMMER2_CHECK_SHA192:
-		SHA256_Init(&hash_ctx);
-		SHA256_Update(&hash_ctx, data, bytes);
-		SHA256_Final(u.digest, &hash_ctx);
-		u.digest64[2] ^= u.digest64[3];
-		if (memcmp(u.digest, bref->check.sha192.data,
-			   sizeof(bref->check.sha192.data)) == 0)
-			return (0);
-		break;
-	case HAMMER2_CHECK_FREEMAP:
-		cv = hammer2_icrc32(data, bytes);
-		if (bref->check.freemap.icrc32 == cv)
-			return (0);
-		break;
-	default:
-		break;
-	}
-	return (-1);
 }
 
 /*
@@ -248,64 +167,10 @@ map_add(hammer2_off_t old_off, const hammer2_blockref_t *newbref)
 }
 
 /*
- * Destination from-generation leaf index (for -u).  Keyed by the bref
- * with data_off zeroed, mapping to the destination data_off.
+ * Destination from-generation leaf index (for -u): hammer2_leaf_add()/
+ * hammer2_leaf_find() (subs.c), keyed by bref identity (bref with
+ * data_off zeroed, mapping to the destination data_off).
  */
-typedef struct leaf_entry {
-	struct leaf_entry *next;
-	hammer2_blockref_t key;		/* bref with data_off zeroed */
-	hammer2_off_t data_off;		/* destination media location */
-} leaf_entry_t;
-
-#define LEAF_HBITS	16
-#define LEAF_HSIZE	(1 << LEAF_HBITS)
-
-static leaf_entry_t *LeafHash[LEAF_HSIZE];
-
-static void
-leaf_key(const hammer2_blockref_t *bref, hammer2_blockref_t *key)
-{
-	*key = *bref;
-	key->data_off = 0;
-}
-
-static inline uint32_t
-leaf_hash(const hammer2_blockref_t *key)
-{
-	const uint8_t *p = (const uint8_t *)(const void *)key;
-	uint32_t h = 2166136261U;
-	int i;
-
-	for (i = 0; i < HAMMER2_BLOCKREF_BYTES; ++i)
-		h = (h ^ p[i]) * 16777619U;
-	return (h >> (32 - LEAF_HBITS));
-}
-
-static void
-leaf_add(const hammer2_blockref_t *bref)
-{
-	leaf_entry_t *e = malloc(sizeof(*e));
-
-	if (e == NULL)
-		err(1, "recv: out of memory");
-	leaf_key(bref, &e->key);
-	e->data_off = bref->data_off;
-	e->next = LeafHash[leaf_hash(&e->key)];
-	LeafHash[leaf_hash(&e->key)] = e;
-}
-
-static leaf_entry_t *
-leaf_find(const hammer2_blockref_t *bref)
-{
-	leaf_entry_t *e;
-	hammer2_blockref_t key;
-
-	leaf_key(bref, &key);
-	for (e = LeafHash[leaf_hash(&key)]; e; e = e->next)
-		if (memcmp(&e->key, &key, sizeof(key)) == 0)
-			return (e);
-	return (NULL);
-}
 
 static int
 is_leaf_bref(const hammer2_blockref_t *bref, const void *data)
@@ -423,7 +288,7 @@ static int PfsIndirect;
 
 static int
 find_dest_pfs(hammer2_blockref_t *bref, const char *label,
-	      hammer2_blockref_t *resp, int depth)
+	      hammer2_blockref_t *resp, struct uuid *clidp, int depth)
 {
 	hammer2_media_data_t media;
 	size_t bytes;
@@ -440,7 +305,7 @@ find_dest_pfs(hammer2_blockref_t *bref, const char *label,
 	if (recv_read_phys(bref->data_off, &media, bytes) != (ssize_t)bytes)
 		errx(1, "recv: read failed at %016jx",
 		    (intmax_t)bref->data_off);
-	if (test_check(bref, &media, bytes))
+	if (hammer2_check_verify(bref, &media, bytes))
 		errx(1, "recv: destination check code mismatch at %016jx",
 		    (intmax_t)bref->data_off);
 
@@ -458,6 +323,7 @@ find_dest_pfs(hammer2_blockref_t *bref, const char *label,
 		if (len == (int)strlen(label) &&
 		    memcmp(name, label, len) == 0) {
 			*resp = *bref;
+			*clidp = media.ipdata.meta.pfs_clid;
 			if (depth != 1)
 				PfsIndirect = 1;
 			return (1);
@@ -473,7 +339,7 @@ find_dest_pfs(hammer2_blockref_t *bref, const char *label,
 				PfsSlot = i;
 			if (find_dest_pfs(
 			    &media.ipdata.u.blockset.blockref[i],
-			    label, resp, depth + 1))
+			    label, resp, clidp, depth + 1))
 				return (1);
 		}
 	} else if (bref->type == HAMMER2_BREF_TYPE_INDIRECT) {
@@ -481,7 +347,7 @@ find_dest_pfs(hammer2_blockref_t *bref, const char *label,
 
 		for (i = 0; i < count; ++i)
 			if (find_dest_pfs(&media.npdata[i], label, resp,
-			    depth + 1))
+			    clidp, depth + 1))
 				return (1);
 	}
 	return (0);
@@ -511,12 +377,12 @@ index_dest_tree(hammer2_blockref_t *bref, int depth)
 	if (recv_read_phys(bref->data_off, &media, bytes) != (ssize_t)bytes)
 		errx(1, "recv: read failed at %016jx",
 		    (intmax_t)bref->data_off);
-	if (test_check(bref, &media, bytes))
+	if (hammer2_check_verify(bref, &media, bytes))
 		errx(1, "recv: destination check code mismatch at %016jx",
 		    (intmax_t)bref->data_off);
 
 	if (is_leaf_bref(bref, &media) && bref->data_off) {
-		leaf_add(bref);
+		hammer2_leaf_add(bref);
 		++IndexLeaves;
 	}
 
@@ -573,17 +439,17 @@ process_record(const hammer2_stream_record_t *rec, void *buf,
 	track_tid(bref.update_tid);
 
 	if (rec->flags & HAMMER2_STREAM_RECF_REF) {
-		leaf_entry_t *le;
+		hammer2_off_t dest_off;
 
 		if (bref.data_off == 0)
 			errx(1, "recv: REF record without media reference");
-		le = leaf_find(&bref);
-		if (le == NULL)
+		dest_off = hammer2_leaf_find(&bref);
+		if (dest_off == 0)
 			errx(1, "recv: referenced block %016jx not found "
 			    "in destination PFS (stream does not match "
 			    "destination state)",
 			    (intmax_t)bref.data_off);
-		bref.data_off = le->data_off;
+		bref.data_off = dest_off;
 		map_add(rec->bref.data_off, &bref);
 		++RecvRefRecords;
 		return (-1);
@@ -593,7 +459,22 @@ process_record(const hammer2_stream_record_t *rec, void *buf,
 	if (bytes == 0 || rec->size != bytes)
 		errx(1, "recv: record size %u does not match bref radix "
 		    "(%zu bytes)", rec->size, bytes);
-	if (test_check(&bref, buf, bytes))
+	/*
+	 * Only block types that can appear in a PFS tree are accepted;
+	 * anything else in a stream is corrupt or hand-crafted, and
+	 * writing it verbatim would plant garbage on the destination.
+	 */
+	switch (bref.type) {
+	case HAMMER2_BREF_TYPE_INODE:
+	case HAMMER2_BREF_TYPE_INDIRECT:
+	case HAMMER2_BREF_TYPE_DATA:
+	case HAMMER2_BREF_TYPE_DIRENT:
+		break;
+	default:
+		errx(1, "recv: unsupported bref type %s (%d) in stream",
+		    hammer2_breftype_to_str(bref.type), bref.type);
+	}
+	if (hammer2_check_verify(&bref, buf, bytes))
 		errx(1, "recv: stream check code mismatch at %016jx",
 		    (intmax_t)bref.data_off);
 	if (map_find(bref.data_off) != NULL) {
@@ -623,7 +504,7 @@ process_record(const hammer2_stream_record_t *rec, void *buf,
 			bref.methods = HAMMER2_ENC_CHECK(
 			    HAMMER2_DEC_CHECK(bref.methods)) |
 			    HAMMER2_ENC_COMP(HAMMER2_COMP_NONE);
-			calc_check(&bref, buf, bytes);
+			hammer2_check_calc(&bref, buf, bytes);
 		}
 		break;
 	default:
@@ -697,6 +578,7 @@ cmd_recv(int ac, char **av)
 	hammer2_blockref_t sroot_bref;
 	hammer2_blockref_t sroot_new;
 	hammer2_blockref_t dest_pfs_bref;
+	struct uuid dest_clid;
 	hammer2_blockref_t root_bref;
 	hammer2_blockref_t *slots;
 	hammer2_tid_t new_tid;
@@ -747,6 +629,14 @@ cmd_recv(int ac, char **av)
 	if (hdr.check != hammer2_icrc32(&hdr, sizeof(hdr) -
 					sizeof(hdr.check)))
 		errx(1, "recv: stream header crc mismatch");
+	/*
+	 * Unknown header flag bits are rejected, exactly like unknown
+	 * record flags: a sender that knows flag bits this receiver does
+	 * not MUST have bumped the stream version (which the version
+	 * check above already rejects).
+	 */
+	if (hdr.flags & ~HAMMER2_STREAM_FLAG_INCR)
+		errx(1, "recv: unknown stream header flags %08x", hdr.flags);
 	if (VerboseOpt)
 		fprintf(stderr, "recv: stream PFS \"%s\"%s%s flags %08x\n",
 		    hdr.label,
@@ -775,14 +665,15 @@ cmd_recv(int ac, char **av)
 		      bref_radix_bytes(&sroot_bref)) !=
 	    (ssize_t)bref_radix_bytes(&sroot_bref))
 		errx(1, "recv: cannot read destination super-root");
-	if (test_check(&sroot_bref, &media, bref_radix_bytes(&sroot_bref)))
+	if (hammer2_check_verify(&sroot_bref, &media, bref_radix_bytes(&sroot_bref)))
 		errx(1, "recv: destination super-root check mismatch");
 
 	bzero(&dest_pfs_bref, sizeof(dest_pfs_bref));
+	bzero(&dest_clid, sizeof(dest_clid));
 	PfsSlot = -1;
 	PfsIndirect = 0;
 	if (find_dest_pfs(&sroot_bref, update ? ulabel : hdr.label,
-			  &dest_pfs_bref, 0)) {
+			  &dest_pfs_bref, &dest_clid, 0)) {
 		if (!update)
 			errx(1, "recv: destination already has PFS \"%s\"",
 			    hdr.label);
@@ -790,6 +681,25 @@ cmd_recv(int ac, char **av)
 			errx(1, "recv: PFS \"%s\" is not in the super-root "
 			    "blockset, cannot update", ulabel);
 		pfs_slot = PfsSlot;
+		/*
+		 * Lineage check: the destination PFS (a full copy of the
+		 * stream's from-generation) must carry the from-PFS's
+		 * pfs_clid.  Snapshots carry a fresh pfs_clid per
+		 * snapshot, so the to-PFS's clid does NOT identify the
+		 * lineage — and a matching modify_tid alone would be a
+		 * 64-bit coincidence, not a lineage proof.
+		 */
+		uuid_t from_clid = hdr.from_pfs_clid;	/* unaligned in hdr */
+
+		if (!uuid_equal(&dest_clid, &from_clid, NULL)) {
+			char *dbuf = NULL, *fbuf = NULL;
+
+			errx(1, "recv: destination PFS \"%s\" belongs to a "
+			    "different PFS lineage (dest clid %s, stream "
+			    "from clid %s)", ulabel,
+			    hammer2_uuid_to_str(&dest_clid, &dbuf),
+			    hammer2_uuid_to_str(&from_clid, &fbuf));
+		}
 		/*
 		 * Generation check: the destination PFS must be an
 		 * earlier generation of the same stream lineage, matched
@@ -866,7 +776,7 @@ cmd_recv(int ac, char **av)
 		media.ipdata.meta.name_len = ulen;
 		media.ipdata.meta.name_key = dirhash(ulabel, ulen);
 		root_bref.key = media.ipdata.meta.name_key;
-		calc_check(&root_bref, &media, bl);
+		hammer2_check_calc(&root_bref, &media, bl);
 		if (recv_write_phys(root_bref.data_off & ~HAMMER2_OFF_MASK_RADIX,
 			       &media, bl))
 			err(1, "recv: PFS root relabel write failed");
@@ -913,7 +823,7 @@ cmd_recv(int ac, char **av)
 	sroot_new = sroot_bref;
 	sroot_new.data_off = sroot_off | HAMMER2_RADIX_MIN;
 	sroot_new.mirror_tid = new_tid;
-	calc_check(&sroot_new, &media, HAMMER2_INODE_BYTES);
+	hammer2_check_calc(&sroot_new, &media, HAMMER2_INODE_BYTES);
 	if (recv_write_phys(sroot_off, &media, HAMMER2_INODE_BYTES))
 		err(1, "recv: super-root write failed");
 

@@ -62,8 +62,6 @@
 #include "hammer2_ioctl.h"
 #include "hammer2_xxhash.h"
 
-#include <sys/sha2.h>
-
 /*
  * Walk frames: one per recursion level.  Each frame owns a referenced
  * (between calls UNLOCKED) chain and the chain_scan resume cursor.
@@ -214,55 +212,29 @@ hammer2_send_pin_del(hammer2_dev_t *hmp, const char *name)
 
 /*
  * Verify a block's check code against `bytes' of media data.
- * Mirrors hammer2_chain_testcheck() (chain.c) without a chain object.
- * Returns 0 on match, EIO on mismatch/unsupported.
+ *
+ * The check algorithms (including the SHA192 word-fold) live in the
+ * shared hammer2_bref_testcheck() (chain.c), also used by the chain
+ * layer on mount.  Unknown check methods are rejected here (stricter
+ * than the chain layer's trust-unknown policy) — a serializer must not
+ * emit blocks whose contents it cannot verify.
  */
 static int
 hammer2_send_testcheck(const hammer2_blockref_t *bref, const void *data,
     size_t bytes)
 {
-	SHA256_CTX hash_ctx;
-	union {
-		uint8_t		digest[SHA256_DIGEST_LENGTH];
-		uint64_t	digest64[SHA256_DIGEST_LENGTH / 8];
-	} u;
-	uint32_t cv;
-	uint64_t cv64;
-
 	switch (HAMMER2_DEC_CHECK(bref->methods)) {
 	case HAMMER2_CHECK_NONE:
 	case HAMMER2_CHECK_DISABLED:
-		return (0);
 	case HAMMER2_CHECK_ISCSI32:
-		cv = hammer2_icrc32(data, bytes);
-		if (bref->check.iscsi32.value == cv)
-			return (0);
-		break;
 	case HAMMER2_CHECK_XXHASH64:
-		cv64 = XXH64(data, bytes, XXH_HAMMER2_SEED);
-		if (bref->check.xxhash64.value == cv64)
-			return (0);
-		break;
 	case HAMMER2_CHECK_SHA192:
-		SHA256_Init(&hash_ctx);
-		SHA256_Update(&hash_ctx, data, bytes);
-		SHA256_Final(u.digest, &hash_ctx);
-		/*
-		 * Fold word 3 into word 2, then compare the first 24
-		 * bytes (192 bits).  This must match the fold used by
-		 * hammer2_chain_calc_check/testcheck and the userland
-		 * fsck/recover/debug code, else valid SHA192 blocks
-		 * fail verification.
-		 */
-		u.digest64[2] ^= u.digest64[3];
-		if (memcmp(u.digest, bref->check.sha192.data,
-			   sizeof(bref->check.sha192.data)) == 0)
-			return (0);
+	case HAMMER2_CHECK_FREEMAP:
 		break;
 	default:
-		break;
+		return (EIO);
 	}
-	return (EIO);
+	return (hammer2_bref_testcheck(bref, data, bytes) ? 0 : EIO);
 }
 
 static inline uint32_t

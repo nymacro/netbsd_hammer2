@@ -38,7 +38,6 @@
 
 #include "hammer2.h"
 
-#include <sys/sha2.h>
 
 #define GIG	(1024LL*1024*1024)
 #define nitems	__arraycount
@@ -444,14 +443,9 @@ show_bref(hammer2_volume_data_t *voldata, int tab, int bi,
 	uint8_t check_algo, comp_algo;
 	uint32_t cv;
 	uint64_t cv64;
+	hammer2_blockref_t cvbref;
 	static int init_tab = -1;
 	uuid_t uuid;
-
-	SHA256_CTX hash_ctx;
-	union {
-		uint8_t digest[SHA256_DIGEST_LENGTH];
-		uint64_t digest64[SHA256_DIGEST_LENGTH/8];
-	} u;
 
 	/* omit if smaller than mininum mirror_tid threshold */
 	if (bref->mirror_tid < show_min_mirror_tid)
@@ -607,6 +601,14 @@ show_bref(hammer2_volume_data_t *voldata, int tab, int bi,
 		strlcpy(comp_str, hammer2_compmode_to_str(comp_algo),
 			sizeof(comp_str));
 
+		/*
+		 * Compute the check value via the shared helper
+		 * (subs.c) so the check algorithms exist in exactly one
+		 * place in userland; this switch only formats the result.
+		 */
+		cvbref = *bref;
+		hammer2_check_calc(&cvbref, &media, bytes);
+
 		switch(check_algo) {
 		case HAMMER2_CHECK_NONE:
 			printf("meth=%s|%s ", check_str, comp_str);
@@ -615,7 +617,7 @@ show_bref(hammer2_volume_data_t *voldata, int tab, int bi,
 			printf("meth=%s|%s ", check_str, comp_str);
 			break;
 		case HAMMER2_CHECK_ISCSI32:
-			cv = hammer2_icrc32(&media, bytes);
+			cv = cvbref.check.iscsi32.value;
 			if (bref->check.iscsi32.value != cv) {
 				printf("(icrc %s|%s %08x/%08x failed) ",
 				       check_str, comp_str,
@@ -628,7 +630,7 @@ show_bref(hammer2_volume_data_t *voldata, int tab, int bi,
 			}
 			break;
 		case HAMMER2_CHECK_XXHASH64:
-			cv64 = XXH64(&media, bytes, XXH_HAMMER2_SEED);
+			cv64 = cvbref.check.xxhash64.value;
 			if (bref->check.xxhash64.value != cv64) {
 				printf("(xxhash64 %s|%s %016jx/%016jx failed) ",
 				       check_str, comp_str,
@@ -641,12 +643,9 @@ show_bref(hammer2_volume_data_t *voldata, int tab, int bi,
 			}
 			break;
 		case HAMMER2_CHECK_SHA192:
-			SHA256_Init(&hash_ctx);
-			SHA256_Update(&hash_ctx, (const uint8_t*)media.buf, bytes);
-			SHA256_Final(u.digest, &hash_ctx);
-			u.digest64[2] ^= u.digest64[3];
-			if (memcmp(u.digest, bref->check.sha192.data,
-			    sizeof(bref->check.sha192.data))) {
+			if (memcmp(cvbref.check.sha192.data,
+				    bref->check.sha192.data,
+				    sizeof(bref->check.sha192.data))) {
 				printf("(sha192 %s:%s failed) ",
 				       check_str, comp_str);
 				failed = 1;
@@ -655,7 +654,7 @@ show_bref(hammer2_volume_data_t *voldata, int tab, int bi,
 			}
 			break;
 		case HAMMER2_CHECK_FREEMAP:
-			cv = hammer2_icrc32(&media, bytes);
+			cv = cvbref.check.freemap.icrc32;
 			if (bref->check.freemap.icrc32 != cv) {
 				printf("(fcrc %s|%s %08x/%08x failed) ",
 					check_str, comp_str,

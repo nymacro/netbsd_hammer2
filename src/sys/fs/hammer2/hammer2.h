@@ -1281,6 +1281,7 @@ void hammer2_base_delete(hammer2_chain_t *, hammer2_blockref_t *, int,
 void hammer2_base_insert(hammer2_chain_t *, hammer2_blockref_t *, int,
     hammer2_chain_t *, hammer2_blockref_t *);
 void hammer2_chain_setcheck(hammer2_chain_t *, void *);
+int hammer2_bref_testcheck(const hammer2_blockref_t *, const void *, size_t);
 int hammer2_chain_inode_find(hammer2_pfs_t *, hammer2_key_t, int, int,
     hammer2_chain_t **, hammer2_chain_t **);
 hammer2_chain_t *hammer2_chain_bulksnap(hammer2_dev_t *);

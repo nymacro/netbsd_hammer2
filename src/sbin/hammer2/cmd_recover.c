@@ -70,7 +70,6 @@
 #define HTABLE_MASK	(HTABLE_SIZE - 1)
 #define DISPMODULO	(HTABLE_SIZE / 32768)
 
-#include <openssl/sha.h>
 
 #if 0
 typedef struct dirent_entry {
@@ -1493,14 +1492,7 @@ dump_file_data(int wfd, hammer2_off_t fsize,
 static int
 validate_crc(hammer2_blockref_t *bref, void *data, size_t bytes)
 {
-	uint32_t cv;
-	uint64_t cv64;
-	SHA256_CTX hash_ctx;
 	int success = 0;
-	union {
-		uint8_t digest[SHA256_DIGEST_LENGTH];
-		uint64_t digest64[SHA256_DIGEST_LENGTH/8];
-	} u;
 
 	switch(HAMMER2_DEC_CHECK(bref->methods)) {
 	case HAMMER2_CHECK_NONE:
@@ -1512,33 +1504,14 @@ validate_crc(hammer2_blockref_t *bref, void *data, size_t bytes)
 			success = 1;
 		break;
 	case HAMMER2_CHECK_ISCSI32:
-		cv = hammer2_icrc32(data, bytes);
-		if (bref->check.iscsi32.value == cv) {
-			success = 1;
-		}
-		break;
 	case HAMMER2_CHECK_XXHASH64:
-		cv64 = XXH64(data, bytes, XXH_HAMMER2_SEED);
-		if (bref->check.xxhash64.value == cv64) {
-			success = 1;
-		}
-		break;
 	case HAMMER2_CHECK_SHA192:
-		SHA256_Init(&hash_ctx);
-		SHA256_Update(&hash_ctx, data, bytes);
-		SHA256_Final(u.digest, &hash_ctx);
-		u.digest64[2] ^= u.digest64[3];
-		if (memcmp(u.digest, bref->check.sha192.data,
-			   sizeof(bref->check.sha192.data)) == 0)
-		{
-			success = 1;
-		}
-		break;
 	case HAMMER2_CHECK_FREEMAP:
-		cv = hammer2_icrc32(data, bytes);
-		if (bref->check.freemap.icrc32 == cv) {
-			success = 1;
-		}
+		/*
+		 * Shared check-code helper (subs.c) — the single
+		 * userland implementation of the check algorithms.
+		 */
+		success = (hammer2_check_verify(bref, data, bytes) == 0);
 		break;
 	}
 	return success;

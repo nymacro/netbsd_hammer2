@@ -60,70 +60,15 @@
 #include "hammer2_stream.h"
 
 /*
- * From-generation leaf index for incremental sends.  Keyed by the bref
- * with data_off zeroed (the receiver's copy of the block differs only in
+ * From-generation leaf index for incremental sends: hammer2_leaf_add()/
+ * hammer2_leaf_find() (subs.c), keyed by bref identity (bref with
+ * data_off zeroed — the receiver's copy of the block differs only in
  * data_off).
  */
-#define LEAF_HBITS	14
-#define LEAF_HSIZE	(1 << LEAF_HBITS)
-
-typedef struct leaf_entry {
-	struct leaf_entry *next;
-	hammer2_blockref_t bref;	/* stored with data_off zeroed */
-} leaf_entry_t;
-
-static leaf_entry_t *LeafHash[LEAF_HSIZE];
 static uint64_t IndexLeaves;
 static uint64_t EmitRecords;
 static uint64_t EmitPayloadBytes;
 static uint64_t EmitRefBytes;
-
-static void
-leaf_key(const hammer2_blockref_t *bref, hammer2_blockref_t *key)
-{
-	*key = *bref;
-	key->data_off = 0;
-}
-
-static inline uint32_t
-leaf_hash(const hammer2_blockref_t *key)
-{
-	const uint8_t *p = (const uint8_t *)(const void *)key;
-	uint32_t h = 2166136261U;
-	int i;
-
-	for (i = 0; i < HAMMER2_BLOCKREF_BYTES; ++i)
-		h = (h ^ p[i]) * 16777619U;
-	return (h >> (32 - LEAF_HBITS));
-}
-
-static void
-leaf_add(const hammer2_blockref_t *bref)
-{
-	leaf_entry_t *e;
-	hammer2_blockref_t key;
-
-	leaf_key(bref, &key);
-	e = malloc(sizeof(*e));
-	if (e == NULL)
-		err(1, "send: out of memory");
-	e->bref = key;
-	e->next = LeafHash[leaf_hash(&key)];
-	LeafHash[leaf_hash(&key)] = e;
-}
-
-static int
-leaf_find(const hammer2_blockref_t *bref)
-{
-	leaf_entry_t *e;
-	hammer2_blockref_t key;
-
-	leaf_key(bref, &key);
-	for (e = LeafHash[leaf_hash(&key)]; e; e = e->next)
-		if (memcmp(&e->bref, &key, sizeof(key)) == 0)
-			return (1);
-	return (0);
-}
 
 static int
 has_check_method(uint8_t methods)
@@ -179,7 +124,8 @@ emit_record(FILE *fp, const hammer2_ioc_send_t *ioc, const void *data,
 	    void *arg __unused)
 {
 	if ((ioc->rec_flags & HAMMER2_SENDREC_LEAF) &&
-	    has_check_method(ioc->bref.methods) && leaf_find(&ioc->bref)) {
+	    has_check_method(ioc->bref.methods) &&
+	    hammer2_leaf_find(&ioc->bref) != 0) {
 		/* Unchanged leaf: reference the destination copy. */
 		write_record(fp, &ioc->bref, HAMMER2_STREAM_RECF_REF, NULL, 0);
 	} else {
@@ -193,7 +139,7 @@ index_record(FILE *fp __unused, const hammer2_ioc_send_t *ioc,
 {
 	if ((ioc->rec_flags & HAMMER2_SENDREC_LEAF) &&
 	    has_check_method(ioc->bref.methods)) {
-		leaf_add(&ioc->bref);
+		hammer2_leaf_add(&ioc->bref);
 		++IndexLeaves;
 	}
 }
@@ -252,6 +198,15 @@ send_session(int fd, const char *label, const char *fromlabel,
 			strlcpy(hdr.fromlabel, fromlabel, sizeof(hdr.fromlabel));
 			hdr.from_modify_tid = fromp->root_bref.modify_tid;
 			hdr.from_key = fromp->root_bref.key;
+			/*
+			 * Lineage identity for recv -u: each snapshot
+			 * carries a fresh pfs_clid, so the to-PFS's clid
+			 * does NOT identify the lineage — the
+			 * from-generation's clid does, and the
+			 * destination (a full copy of the
+			 * from-generation) must carry it.
+			 */
+			hdr.from_pfs_clid = fromp->pfs_clid;
 		}
 		hdr.check = hammer2_icrc32(&hdr,
 					   sizeof(hdr) - sizeof(hdr.check));

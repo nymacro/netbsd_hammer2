@@ -127,10 +127,17 @@ recv_write_phys(hammer2_off_t data_off, const void *buf, size_t bytes)
 	int fd = hammer2_get_volume_fd(io_off);
 	hammer2_off_t off;
 
-	if (fd < 0)
+	if (fd < 0) {
+		errno = EBADF;
 		return (-1);
+	}
 	off = io_off - hammer2_get_volume_offset(io_off);
-	return (pwrite(fd, buf, bytes, off) == (ssize_t)bytes ? 0 : -1);
+	if (pwrite(fd, buf, bytes, off) != (ssize_t)bytes) {
+		if (errno == 0)
+			errno = EIO;
+		return (-1);
+	}
+	return (0);
 }
 
 static hammer2_blockref_t *

@@ -393,16 +393,30 @@ index_dest_tree(hammer2_blockref_t *bref, int depth)
 
 /*
  * Read one record.  Returns 1 on success, 0 on clean EOF.
+ *
+ * The header is read in BYTE units: fread(3) only short-counts at EOF or
+ * error, so a stream truncated mid-header is detected here immediately
+ * (a record-granular fread would consume the partial bytes and report a
+ * misleading clean EOF).  Record-boundary truncation (a stream ending
+ * exactly between records) remains detected by the root-last/PFSROOT
+ * check in the caller's loop.
  */
 static int
 read_record(FILE *fp, hammer2_stream_record_t *rec, void *buf)
 {
-	if (fread(rec, sizeof(*rec), 1, fp) != 1) {
-		if (ferror(fp))
-			err(1, "recv: stream read");
-		if (getchar() != EOF)
-			errx(1, "recv: truncated stream record");
-		return (0);
+	size_t got = 0;
+
+	while (got < sizeof(*rec)) {
+		size_t n = fread((char *)rec + got, 1,
+		    sizeof(*rec) - got, fp);
+		if (n == 0) {
+			if (ferror(fp))
+				err(1, "recv: stream read");
+			if (got != 0)
+				errx(1, "recv: truncated stream record");
+			return (0);
+		}
+		got += n;
 	}
 	if (rec->hcheck != hammer2_icrc32(rec,
 	    offsetof(hammer2_stream_record_t, hcheck)))

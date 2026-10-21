@@ -53,6 +53,14 @@
  * byte-swap fields explicitly; it cannot inherit the on-media
  * convention.
  *
+ * Header layout history:
+ * - v1: label[64], reserved[300].  Never shipped (the format was
+ *   developed with this layout internally).
+ * - v2: label[128], fromlabel[128] (from_pfs_clid carved out of the old
+ *   reserved space), reserved[156].  v1 readers would silently misparse
+ *   a v2 header (the CRC covers the whole 512B and still passes), hence
+ *   the bump.
+ *
  * REF records (flag RECF_REF) appear only in incremental streams.  They
  * carry no payload; the bref is byte-identical to the corresponding leaf
  * bref in the source from-generation tree.  The receiver locates the
@@ -78,7 +86,7 @@
 #include <fs/hammer2/hammer2_disk.h>
 
 #define HAMMER2_STREAM_MAGIC	"H2SEND01"
-#define HAMMER2_STREAM_VERSION	1
+#define HAMMER2_STREAM_VERSION	2
 
 /*
  * Label fields are 128 bytes so on-media PFS labels (up to

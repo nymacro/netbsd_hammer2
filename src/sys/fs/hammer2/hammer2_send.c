@@ -70,6 +70,7 @@ typedef struct hammer2_send_frame {
 	SLIST_ENTRY(hammer2_send_frame) entry;
 	hammer2_chain_t		*chain;		/* referenced */
 	hammer2_blockref_t	bref;		/* scan resume position */
+	hammer2_off_t		data_off;	/* chain bref at frame entry */
 	int			first;		/* chain_scan first flag */
 } hammer2_send_frame_t;
 
@@ -140,7 +141,14 @@ static hammer2_send_state_list_t hammer2_send_states;
 static hammer2_send_pin_list_t hammer2_send_pins;
 static hammer2_lk_t hammer2_send_lk;
 
-#define HAMMER2_SEND_MAX_DEPTH	16
+/*
+ * Sanity cap only -- frames are heap-allocated, so this is not a stack
+ * limit.  Real trees get deep: the topology itself nests directories
+ * (60+ levels in the test suite) plus indirect-block levels below each
+ * directory.  A corrupt cyclic topology (impossible by construction,
+ * hostile media aside) would loop here, hence the cap at all.
+ */
+#define HAMMER2_SEND_MAX_DEPTH	256
 
 static void hammer2_send_free(hammer2_send_state_t *, int have_mntlk);
 
@@ -346,9 +354,9 @@ hammer2_send_walk(hammer2_send_state_t *st)
 	for (;;) {
 		if (SLIST_EMPTY(&st->frames)) {
 			st->done = 1;
-			st->rec_bref.data_off = 0;
 			st->rec_size = 0;
 			st->rec_flags = HAMMER2_SENDREC_EOF;
+			bzero(&st->rec_bref, sizeof(st->rec_bref));
 			return (0);
 		}
 		f = SLIST_FIRST(&st->frames);
@@ -356,8 +364,30 @@ hammer2_send_walk(hammer2_send_state_t *st)
 		    HAMMER2_RESOLVE_ALWAYS | HAMMER2_RESOLVE_SHARED);
 		if (error == 0 && f->chain->error)
 			error = hammer2_error_to_errno(f->chain->error);
-		if (error)
+		if (error) {
+			/*
+			 * RESOLVE_ALWAYS acquires the lock before the load,
+			 * and a failed load (corrupt block, failed check)
+			 * only sets chain->error -- the lock stays held.
+			 * Unlock before failing the session or the leaked
+			 * shared lock wedges the next exclusive acquirer.
+			 */
+			hammer2_chain_unlock(f->chain);
 			return (error);
+		}
+		/*
+		 * Divergence guard for a non-quiescent source: a concurrent
+		 * chain_modify either COWs into a NEW chain (our held
+		 * reference keeps the old generation stable -- scan stays
+			 * point-in-time consistent), or modifies this chain
+			 * in place (bref.data_off changes).  The latter would mix
+			 * generations in the stream -- detect it and fail the
+			 * send cleanly instead.
+		 */
+		if (f->chain->bref.data_off != f->data_off) {
+			hammer2_chain_unlock(f->chain);
+			return (EIO);
+		}
 
 		/*
 		 * Iterate the frame's children.  The cursor (f->bref,
@@ -384,7 +414,7 @@ hammer2_send_walk(hammer2_send_state_t *st)
 			--st->depth;
 			error = hammer2_send_emit_block(st, &pbref,
 			    (st->flags & HAMMER2_SENDF_SKIP_PAYLOAD) ?
-			    0 : 1);
+			    (pbref.type == HAMMER2_BREF_TYPE_INODE) : 1);
 			hammer2_chain_drop(f->chain);
 			hfree(f, M_HAMMER2, sizeof(*f));
 			if (error)
@@ -436,6 +466,7 @@ hammer2_send_walk(hammer2_send_state_t *st)
 			    M_WAITOK | M_ZERO);
 			f->chain = child;
 			f->first = 1;
+			f->data_off = bref.data_off;
 			hammer2_chain_unlock(child);
 			SLIST_INSERT_HEAD(&st->frames, f, entry);
 			if (++st->depth > HAMMER2_SEND_MAX_DEPTH)
@@ -546,18 +577,21 @@ hammer2_send_free_list(hammer2_send_state_list_t *freelist)
 }
 
 /*
- * Reclaim sessions whose owning process is gone.  Removed sessions are
- * queued on *freelist for the caller to hammer2_send_free() after
- * dropping hammer2_send_lk.  Caller holds hammer2_send_lk.
+ * Reclaim sessions whose owning process is gone -- DEVICE-WIDE, not
+ * label-scoped: a killed sender's chain references, 64KB payload buffer
+ * and pfs-delete pin must not sit unreclaimable until someone retries
+ * that exact label.  Removed sessions are queued on *freelist for the
+ * caller to hammer2_send_free() after dropping hammer2_send_lk.  Caller
+ * holds hammer2_send_lk.
  */
 static void
-hammer2_send_reap(hammer2_dev_t *hmp, const char *label, pid_t pid,
+hammer2_send_reap(hammer2_dev_t *hmp, pid_t pid,
     hammer2_send_state_list_t *freelist)
 {
 	hammer2_send_state_t *st, *next;
 
 	TAILQ_FOREACH_SAFE(st, &hammer2_send_states, entry, next) {
-		if (st->hmp != hmp || strcmp(st->label, label) != 0)
+		if (st->hmp != hmp)
 			continue;
 		if (st->pid == pid)
 			continue;
@@ -592,6 +626,21 @@ hammer2_send_purge_dev(hammer2_dev_t *hmp)
 	TAILQ_FOREACH_SAFE(st, &hammer2_send_states, entry, next) {
 		if (st->hmp != hmp)
 			continue;
+		if (st->active) {
+			/*
+			 * MNT_FORCE caught a walk in literal progress.
+			 * Freeing the state now would use-after-free the
+			 * walker in SEND_NEXT's epilogue; mark it dead and
+			 * leave it queued -- the epilogue removes and frees
+			 * it.  (The chains it references stay pinned by the
+			 * frame references either way.)
+			 */
+			hprintf("hammer2_send_purge_dev: session \"%s\" "
+			    "still ACTIVE; deferring release to the walk\n",
+			    st->label);
+			st->dead = 1;
+			continue;
+		}
 		TAILQ_REMOVE(&hammer2_send_states, st, entry);
 		TAILQ_INSERT_TAIL(&freelist, st, entry);
 	}
@@ -601,16 +650,13 @@ hammer2_send_purge_dev(hammer2_dev_t *hmp)
 	while ((st = TAILQ_FIRST(&freelist)) != NULL) {
 		TAILQ_REMOVE(&freelist, st, entry);
 		/*
-		 * Defensive: freeing a session with a walk in progress
-		 * would use-after-free the walker's state, and freeing one
-		 * whose owner is still alive would drop its pin under it.
-		 * Neither can happen for a quiesced unmount; report if it
-		 * does.
+		 * Defensive: freeing a session whose owner is still alive
+		 * would drop its pin under it (between ioctls the owner
+		 * can no longer reach the session -- it was removed from
+		 * the list -- so this is at most a surprising ENOENT for
+		 * the process).  Report it.
 		 */
-		if (st->active)
-			hprintf("hammer2_send_purge_dev: purging ACTIVE "
-			    "session \"%s\"\n", st->label);
-		else if (hammer2_send_proc_alive(st->pid))
+		if (hammer2_send_proc_alive(st->pid))
 			hprintf("hammer2_send_purge_dev: purging session "
 			    "\"%s\" of live pid %d\n",
 			    st->label, (int)st->pid);
@@ -666,7 +712,7 @@ hammer2_send_start(hammer2_inode_t *ip, void *data)
 
 	TAILQ_INIT(&freelist);
 	hammer2_lk_ex(&hammer2_send_lk);
-	hammer2_send_reap(hmp, send->label, curproc->p_pid, &freelist);
+	hammer2_send_reap(hmp, curproc->p_pid, &freelist);
 	if (hammer2_send_state_find(hmp, send->label) != NULL) {
 		hammer2_lk_unlock(&hammer2_send_lk);
 		/*
@@ -757,6 +803,7 @@ hammer2_send_start(hammer2_inode_t *ip, void *data)
 	f = hmalloc(sizeof(*f), M_HAMMER2, M_WAITOK | M_ZERO);
 	f->chain = chain;		/* reference transferred */
 	f->first = 1;
+	f->data_off = chain->bref.data_off;
 	st->depth = 1;
 	SLIST_INSERT_HEAD(&st->frames, f, entry);
 	hammer2_chain_unlock(chain);
@@ -832,9 +879,19 @@ hammer2_send_next(hammer2_inode_t *ip, void *data)
 		send->bref = st->rec_bref;
 		send->rec_flags = st->rec_flags;
 		send->rec_size = st->rec_size;
-		if (st->rec_size)
+		if (st->rec_size) {
 			error = copyout(st->rec_data, send->payload,
 			    st->rec_size);
+			if (error) {
+				/*
+				 * The walk already consumed this record;
+				 * dropping it silently would produce a
+				 * valid-looking truncated stream.  Fail the
+				 * session instead (sticky).
+				 */
+				st->error = error;
+			}
+		}
 	}
 
 	hammer2_lk_ex(&hammer2_send_lk);
@@ -873,6 +930,14 @@ hammer2_send_finish(hammer2_inode_t *ip, void *data)
 		error = ENOENT;
 	} else if (st->pid != curproc->p_pid &&
 		   hammer2_send_proc_alive(st->pid)) {
+		error = EBUSY;
+	} else if (!st->ready) {
+		/*
+		 * START is still setting the session up in another thread
+		 * of this process -- freeing it now would use-after-free
+		 * the START (which writes root_bref/frames/ready after
+		 * releasing the lock).  Retry once it is ready.
+		 */
 		error = EBUSY;
 	} else if (st->active) {
 		/*

@@ -1263,7 +1263,41 @@ hammer2_write_file(hammer2_inode_t *ip, struct uio *uio, int ioflag,
 		}
 		hammer2_mtx_unlock(&ip->lock);
 	} else if (modified) {
-		hammer2_update_time(&mtime);
+		/*
+		 * Only frontend (uio) writes and pager writes on a vnode
+		 * with a writable mapping stamp mtime.
+		 *
+		 * Plain pageout rewrites of already-accounted dirty
+		 * pages (HAMMER2_IO_PAGER, issued by genfs_do_putpages
+		 * -> hammer2_gop_write) can happen tens of seconds
+		 * after the logical write; re-stamping there made mtime
+		 * jump long after the fact, which editors (vi's "newer
+		 * version of the file is available") and any stat-based
+		 * change detection observe as a phantom modification.
+		 * Such vnodes have no writable mapping and never
+		 * re-stamp here.
+		 *
+		 * A vnode that (maybe) has PROT_WRITE mappings
+		 * (VI_WRMAP) mirrors FFS: genfs_do_putpages calls
+		 * GOP_MARKUPDATE(GOP_UPDATE_MODIFIED) after cleaning
+		 * (VI_WRMAP-gated), and ufs_gop_markupdate sets
+		 * IN_CHANGE|IN_UPDATE, so FFS refreshes mtime at
+		 * laundering for mmap-dirtied files -- the timestamp
+		 * value trails the store by the laundering window,
+		 * exactly as here.  FFS putpages never re-enter
+		 * ufs_write (genfs_gop_write goes to strategy), so this
+		 * is FFS's only mmap mtime path.
+		 */
+		int wrmapped;
+
+		mutex_enter(vp->v_interlock);
+		wrmapped = (vp->v_iflag & VI_WRMAP) != 0;
+		mutex_exit(vp->v_interlock);
+		const int stamp = (ioflag & HAMMER2_IO_PAGER) == 0 ||
+		    wrmapped;
+
+		if (stamp)
+			hammer2_update_time(&mtime);
 		hammer2_mtx_ex(&ip->lock);
 		hammer2_inode_modify(ip);
 		/*
@@ -1281,7 +1315,8 @@ hammer2_write_file(hammer2_inode_t *ip, struct uio *uio, int ioflag,
 				    KAUTH_VNODE_RETAIN_SGID, vp, NULL, EPERM))
 					ip->meta.mode &= ~S_ISGID;
 		}
-		ip->meta.mtime = mtime;
+		if (stamp)
+			ip->meta.mtime = mtime;
 		hammer2_mtx_unlock(&ip->lock);
 	}
 	hammer2_trans_assert_strategy(ip->pmp);

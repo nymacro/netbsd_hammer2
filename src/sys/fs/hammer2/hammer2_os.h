@@ -403,6 +403,9 @@ MALLOC_DECLARE(M_HAMMER2_LZ4);
 MALLOC_DECLARE(M_TEMP); /* nonexistent in sys/sys/malloc.h */
 extern struct pool hammer2_pool_inode;
 extern struct pool hammer2_pool_xops;
+extern pool_cache_t hammer2_pool_scratch;
+extern pool_cache_t hammer2_pool_wbuf;
+extern pool_cache_t hammer2_pool_rbuf;
 
 extern int malloc_leak_m_hammer2;
 extern int malloc_leak_m_hammer2_rbuf;

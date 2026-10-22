@@ -357,12 +357,18 @@ hammer2_xop_start(hammer2_xop_head_t *xop, hammer2_xop_desc_t *desc)
 		 * (see hammer2_xop_alloc()).  On failure, fail this one
 		 * buffer with ENOMEM -- genfs_do_putpages() re-dirties
 		 * the page and the write is retried later.
+		 *
+		 * The scratch is pooled (pool_allocator_big handles
+		 * items > PAGE_SIZE); no zeroing is needed because
+		 * hammer2_xop_strategy_write() bcopy's the full 64KB
+		 * logical block into it before any consumer reads it.
+		 * Upstream pools the same buffer via its per-xop-thread
+		 * scratch / cache_buffer_write objcache.
 		 */
-		const int mflags = (curlwp == uvm.pagedaemon_lwp) ?
-		    (M_NOWAIT | M_ZERO) : (M_WAITOK | M_ZERO);
+		const int prflags = (curlwp == uvm.pagedaemon_lwp) ?
+		    PR_NOWAIT : PR_WAITOK;
 
-		xop->scratch = hmalloc(hammer2_get_logical(), M_HAMMER2,
-		    mflags);
+		xop->scratch = pool_cache_get(hammer2_pool_scratch, prflags);
 		if (xop->scratch == NULL) {
 			struct buf *bp = ((hammer2_xop_strategy_t *)xop)->bp;
 			int j;
@@ -560,7 +566,7 @@ hammer2_xop_retire(hammer2_xop_head_t *xop, uint32_t mask)
 	}
 
 	if (xop->scratch)
-		hfree(xop->scratch, M_HAMMER2, hammer2_get_logical());
+		pool_cache_put(hammer2_pool_scratch, xop->scratch);
 
 	pool_put(&hammer2_pool_xops, xop);
 }

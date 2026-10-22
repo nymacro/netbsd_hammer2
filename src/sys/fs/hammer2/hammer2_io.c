@@ -37,6 +37,9 @@
 
 #include "hammer2.h"
 
+#include <sys/lwp.h> /* curlwp */
+#include <uvm/uvm.h> /* curlwp == uvm.pagedaemon_lwp */
+
 #define HAMMER2_DOP_READ	1
 #define HAMMER2_DOP_NEW		2
 #define HAMMER2_DOP_NEWNZ	3
@@ -167,12 +170,117 @@ hammer2_io_alloc(hammer2_dev_t *hmp, hammer2_off_t data_off, uint8_t btype,
 	return (dio);
 }
 
+/*
+ * Physical read-ahead, the NetBSD analog of upstream's
+ * cluster_readx(..., HAMMER2_PBUFSIZE * hce, ...) device clustering
+ * (upstream vfs.hammer2.cluster_meta_read=1 / cluster_data_read=4).
+ * The demanded block is read synchronously; the remaining blocks of the
+ * run are queued as B_ASYNC device reads, so subsequent DIO breads of
+ * those blocks hit the device buffer cache.  Readahead is clamped to the
+ * volume holding the block (each volume is an independent device vnode)
+ * and never runs in the pagedaemon (its allocations must not wait, see
+ * the pagedaemon contract notes).
+ */
+#define HAMMER2_CLUSTER_READ_MAX	8
+
+/*
+ * Issue one B_ASYNC speculative read.  Mirrors bio_doread()'s B_ASYNC
+ * arm, except the buffer is acquired with a 1-tick bounded getblk():
+ * upstream's speculative acquisition is GETBLK_NOWAIT (sys/kern/
+ * vfs_cluster.c) -- a block that turned busy between the incore() check
+ * and acquisition must be SKIPPED, not waited on.  A plain blocking
+ * getblk() here waits while we still hold the demanded block's DIO lock,
+ * which inverts against a thread holding the neighbor's DIO reference
+ * (buffer stays BC_BUSY) and re-entering that DIO lock: deadlock.
+ */
+static void
+hammer2_readahead(struct vnode *devvp, daddr_t *rablks, int *rasizes,
+    int nrablks)
+{
+	struct buf *bp;
+	int i;
+
+	for (i = 0; i < nrablks; ++i) {
+		bp = getblk(devvp, rablks[i], rasizes[i], 0, 1);
+		if (bp == NULL)
+			continue;
+		if (!ISSET(bp->b_oflags, (BO_DONE | BO_DELWRI))) {
+			SET(bp->b_flags, B_READ | B_ASYNC);
+			BIO_SETPRIO(bp, BPRIO_TIMELIMITED);
+			VOP_STRATEGY(devvp, bp);
+			/* B_ASYNC: the buffer is released on I/O completion. */
+		} else {
+			brelse(bp, 0);
+		}
+	}
+}
+
 static int
 hammer2_bread(hammer2_dev_t *hmp, hammer2_io_t *dio, daddr_t lblkno)
 {
-	int error;
+	daddr_t rablks[HAMMER2_CLUSTER_READ_MAX - 1];
+	int rasizes[HAMMER2_CLUSTER_READ_MAX - 1];
+	struct buf *bp;
+	int error, i, hce, nrablks, step;
 
-	error = bread(dio->devvp, lblkno, dio->psize, 0, &dio->bp);
+	hce = (dio->btype == HAMMER2_BREF_TYPE_DATA) ?
+	    hammer2_cluster_data_read : hammer2_cluster_meta_read;
+	if (hce > HAMMER2_CLUSTER_READ_MAX)
+		hce = HAMMER2_CLUSTER_READ_MAX;
+
+	nrablks = 0;
+	if (hce > 1 && curlwp != uvm.pagedaemon_lwp) {
+		/*
+		 * dio->pbase - dio->dbase is the byte offset within the
+		 * volume; clamp the run to the volume REMAINDER (size
+		 * beyond the current block -- vol->size alone is an
+		 * absolute, not a distance) and to the current segment
+		 * like upstream's peof calculation.  NOTE:
+		 * hammer2_get_volume() panics rather than returning
+		 * NULL, there is no failure case to handle.
+		 */
+		hammer2_volume_t *vol = hammer2_get_volume(hmp,
+		    dio->pbase);
+		hammer2_off_t voloff = dio->pbase - dio->dbase;
+		hammer2_off_t peof = (voloff + (hammer2_off_t)HAMMER2_SEGMASK) &
+		    ~(hammer2_off_t)HAMMER2_SEGMASK;
+		hammer2_off_t maxoff = MIN(vol->size, peof) - voloff;
+		int maxblks = (int)(maxoff >> HAMMER2_PBUFRADIX);
+
+		step = dio->psize / DEV_BSIZE;
+		for (i = 1; i < hce && i < maxblks; ++i) {
+			rablks[nrablks] = lblkno + (daddr_t)i * step;
+			rasizes[nrablks] = dio->psize;
+			++nrablks;
+		}
+	}
+
+	/*
+	 * bread() equivalent with the read-ahead queued between starting
+	 * the demanded block's I/O and waiting for it (breadn's ordering,
+	 * with non-blocking speculative acquisition).  bread()'s flags=0
+	 * semantics: no fscow_run, brelse + NULL bp on error.
+	 */
+	bp = getblk(dio->devvp, lblkno, dio->psize, 0, 0);
+	if (bp == NULL)
+		return (ENOMEM);
+	if (!ISSET(bp->b_oflags, (BO_DONE | BO_DELWRI))) {
+		SET(bp->b_flags, B_READ);
+		BIO_SETPRIO(bp, BPRIO_TIMECRITICAL);
+		VOP_STRATEGY(dio->devvp, bp);
+		/* Pay for the read. */
+		curlwp->l_ru.ru_inblock++;
+	}
+	if (nrablks)
+		hammer2_readahead(dio->devvp, rablks, rasizes, nrablks);
+	error = biowait(bp);
+	if (error) {
+		brelse(bp, 0);
+		hammer2_inc_iostat(&hmp->iostat_read, dio->btype, dio->psize);
+		return (error);
+	}
+	dio->bp = bp;
+
 	hammer2_inc_iostat(&hmp->iostat_read, dio->btype, dio->psize);
 
 	return (error);

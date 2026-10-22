@@ -475,8 +475,9 @@ int LZ4_decompress_generic(
 
         // get offset
         LZ4_READ_LITTLEENDIAN_16(ref,cpy,ip); ip+=2;
-        if ((prefix64k==noPrefix) && unlikely(ref < (BYTE*)dest))
-			goto _output_error;   // Error : offset outside destination buffer
+        if ((prefix64k==noPrefix) && unlikely(ref < (BYTE*)dest || ref == cpy))
+			goto _output_error;   // Error : offset outside destination buffer,
+                                  // or zero (self-referencing, never valid)
 
         // get matchlength
         if ((length=(token&ML_MASK)) == ML_MASK) 

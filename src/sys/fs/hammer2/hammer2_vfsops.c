@@ -76,6 +76,9 @@ MALLOC_DEFINE(M_HAMMER2_RBUF, "hammer2_buffer_read", "HAMMER2 buffer read");
 MALLOC_DEFINE(M_HAMMER2_WBUF, "hammer2_buffer_write", "HAMMER2 buffer write");
 struct pool hammer2_pool_inode;
 struct pool hammer2_pool_xops;
+pool_cache_t hammer2_pool_scratch;
+pool_cache_t hammer2_pool_wbuf;
+pool_cache_t hammer2_pool_rbuf;
 
 /* global list of HAMMER2 */
 TAILQ_HEAD(hammer2_mntlist, hammer2_dev); /* <-> hammer2_dev::mntentry */
@@ -94,6 +97,8 @@ int hammer2_debug;
 long hammer2_process_icrc32;
 long hammer2_process_xxhash64;
 int hammer2_dedup_enable = 1;
+int hammer2_cluster_meta_read = 1;	/* physical read-ahead */
+int hammer2_cluster_data_read = 4;	/* physical read-ahead */
 int hammer2_flush_pipe = 100;
 int hammer2_limit_dirty_chains;
 int hammer2_limit_dirty_inodes;
@@ -130,6 +135,8 @@ int malloc_leak_m_temp;
 #define HAMMER2_SYSCTL_LIMIT_DIRTY_INODES	14
 #define HAMMER2_SYSCTL_PROCESS_ICRC32		15
 #define HAMMER2_SYSCTL_PROCESS_XXHASH64		16
+#define HAMMER2_SYSCTL_CLUSTER_META_READ	17
+#define HAMMER2_SYSCTL_CLUSTER_DATA_READ	18
 
 SYSCTL_SETUP(hammer2_sysctl_create, "hammer2 sysctl")
 {
@@ -294,6 +301,24 @@ SYSCTL_SETUP(hammer2_sysctl_create, "hammer2 sysctl")
 	if (error)
 		goto fail;
 
+	error = sysctl_createv(clog, 0, NULL, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE,
+	    CTLTYPE_INT, "cluster_meta_read",
+	    SYSCTL_DESCR("Physical read-ahead for metadata blocks (64KB units)"),
+	    NULL, 0, &hammer2_cluster_meta_read, 0,
+	    CTL_VFS, x, HAMMER2_SYSCTL_CLUSTER_META_READ, CTL_EOL);
+	if (error)
+		goto fail;
+
+	error = sysctl_createv(clog, 0, NULL, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE,
+	    CTLTYPE_INT, "cluster_data_read",
+	    SYSCTL_DESCR("Physical read-ahead for data blocks (64KB units)"),
+	    NULL, 0, &hammer2_cluster_data_read, 0,
+	    CTL_VFS, x, HAMMER2_SYSCTL_CLUSTER_DATA_READ, CTL_EOL);
+	if (error)
+		goto fail;
+
 	return;
 fail:
 	hprintf("sysctl_createv failed with error %d\n", error);
@@ -359,15 +384,29 @@ hammer2_init(void)
 		hammer2_dio_limit = 100000;
 
 	/*
-	 * Note that buffers for strategy read/write use malloc(9) as they
-	 * exceed limitation of pool(9) size.
-	 * "pool item size (65536) larger than page size (4096)"
+	 * Buffers larger than PAGE_SIZE (the xop scratch and the
+	 * compression/decompression buffers) used to be malloc(9)'d
+	 * because a plain pool(9) with pool_allocator_nointr cannot
+	 * hold items larger than a page.  Passing a NULL allocator to
+	 * pool_cache_init() makes subr_pool select pool_allocator_big[]
+	 * (pa_pagesz = item size, rounded to a power of 2), so these
+	 * hot 32KB/64KB allocations are now pooled like upstream's
+	 * cache_buffer_read/cache_buffer_write objcaches.
 	 */
 	pool_init(&hammer2_pool_inode, sizeof(hammer2_inode_t), 0, 0, 0,
 	    "h2inopool", &pool_allocator_nointr, IPL_NONE);
 
 	pool_init(&hammer2_pool_xops, sizeof(hammer2_xop_t), 0, 0, 0,
 	    "h2xopspool", &pool_allocator_nointr, IPL_NONE);
+
+	hammer2_pool_scratch = pool_cache_init(HAMMER2_PBUFSIZE, 0, 0, 0,
+	    "h2scratch", NULL, IPL_NONE, NULL, NULL, NULL);
+	hammer2_pool_wbuf = pool_cache_init(HAMMER2_PBUFSIZE / 2, 0, 0, 0,
+	    "h2wbuf", NULL, IPL_NONE, NULL, NULL, NULL);
+	hammer2_pool_rbuf = pool_cache_init(HAMMER2_PBUFSIZE, 0, 0, 0,
+	    "h2rbuf", NULL, IPL_NONE, NULL, NULL, NULL);
+	KKASSERT(hammer2_pool_scratch && hammer2_pool_wbuf &&
+	    hammer2_pool_rbuf);
 
 	hammer2_lk_init(&hammer2_mntlk, "h2_mnt");
 	hammer2_send_init();
@@ -402,6 +441,10 @@ hammer2_done(void)
 
 	pool_destroy(&hammer2_pool_inode);
 	pool_destroy(&hammer2_pool_xops);
+
+	pool_cache_destroy(hammer2_pool_scratch);
+	pool_cache_destroy(hammer2_pool_wbuf);
+	pool_cache_destroy(hammer2_pool_rbuf);
 
 	hammer2_assert_clean();
 

@@ -1176,6 +1176,8 @@ extern struct hammer2_pfslist hammer2_pfslist;
 extern hammer2_lk_t hammer2_mntlk;
 
 extern int hammer2_dedup_enable;
+extern int hammer2_cluster_meta_read;
+extern int hammer2_cluster_data_read;
 extern int hammer2_debug;
 extern long hammer2_process_icrc32;
 extern long hammer2_process_xxhash64;

@@ -113,8 +113,18 @@ hammer2_decompress_LZ4_callback(const char *data, unsigned int bytes,
 	compressed_size = *(const int *)data;
 	KKASSERT((uint32_t)compressed_size <= bytes - sizeof(int));
 
-	compressed_buffer = hmalloc(HAMMER2_PBUFSIZE, M_HAMMER2_RBUF,
-	    M_WAITOK | M_ZERO);
+	/*
+	 * Pooled 64KB scratch (upstream cache_buffer_read objcache).
+	 * It is cleared before use: the bundled LZ4 decoder can be fed
+	 * checksum-valid malformed streams whose overlap copy reads
+	 * destination bytes that were never written by any literal or
+	 * match, and those bytes must not expose stale contents of a
+	 * previous decompression recycled from the pool.  (The decoder
+	 * additionally rejects the zero-offset form that reads them;
+	 * this bzero covers every other unwritten-tail shape.)
+	 */
+	compressed_buffer = pool_cache_get(hammer2_pool_rbuf, PR_WAITOK);
+	bzero(compressed_buffer, HAMMER2_PBUFSIZE);
 	result = LZ4_decompress_safe(__DECONST(char *, &data[sizeof(int)]),
 	    compressed_buffer, compressed_size, HAMMER2_PBUFSIZE);
 	if (result < 0) {
@@ -133,8 +143,51 @@ hammer2_decompress_LZ4_callback(const char *data, unsigned int bytes,
 	}
 	if (n < len)
 		bzero((char *)bp->b_data + n, len - n);
-	hfree(compressed_buffer, M_HAMMER2_RBUF, HAMMER2_PBUFSIZE);
+	pool_cache_put(hammer2_pool_rbuf, compressed_buffer);
 	bp->b_resid = 0;
+}
+
+/*
+ * Kernel zlib (sys/net/zlib.c) is built with NO_ZCFUNCS, which compiles
+ * out the "zalloc == Z_NULL -> zcalloc" defaulting: a bzero'd z_stream
+ * jumps through a NULL function pointer on the first ZALLOC.  Supply
+ * malloc(9)-backed allocators explicitly (upstream's kernel zlib provides
+ * its own kmalloc-based zcalloc).
+ *
+ * The allocation size is carried in a header word: zlib's zfree() passes
+ * no size, but the matching hfree() needs the exact byte count to keep
+ * the HAMMER2_MALLOC accounting balanced.  Both callbacks run
+ * synchronously in the strategy caller; that context is never the
+ * pagedaemon (the gop_write pagedaemon arm returns ENOMEM before the
+ * VOP_WRITE that leads here), so M_WAITOK cannot self-deadlock it.
+ */
+#define	H2_ZHDRSZ	sizeof(size_t)
+
+static voidpf
+hammer2_zlib_alloc(voidpf opaque, uInt items, uInt size)
+{
+	size_t *hdr;
+	size_t bytes;
+
+	if (size != 0 && items > (uInt)(__SIZE_MAX__ / size))
+		return (NULL);
+	bytes = (size_t)items * size + H2_ZHDRSZ;
+	hdr = hmalloc(bytes, M_HAMMER2, M_WAITOK);
+	if (hdr == NULL)
+		return (NULL);
+	*hdr = bytes;
+	return (voidpf)(hdr + 1);
+}
+
+static void
+hammer2_zlib_free(voidpf opaque, voidpf address)
+{
+	size_t *hdr;
+
+	if (address == NULL)
+		return;
+	hdr = (size_t *)address - 1;
+	hfree(hdr, M_HAMMER2, *hdr);
 }
 
 /*
@@ -154,14 +207,16 @@ hammer2_decompress_ZLIB_callback(const char *data, unsigned int bytes,
 	bzero(&strm_decompress, sizeof(strm_decompress));
 	strm_decompress.avail_in = 0;
 	strm_decompress.next_in = Z_NULL;
+	strm_decompress.zalloc = hammer2_zlib_alloc;
+	strm_decompress.zfree = hammer2_zlib_free;
 
 	/* XXX NetBSD doesn't have inflateInit. */
 	result = inflateInit2(&strm_decompress, 15 /* DEF_WBITS */);
 	if (result != Z_OK)
 		hprintf("fatal error in inflateInit\n");
 
-	compressed_buffer = hmalloc(HAMMER2_PBUFSIZE, M_HAMMER2_RBUF,
-	    M_WAITOK | M_ZERO);
+	/* Pooled 64KB scratch (upstream cache_buffer_read objcache). */
+	compressed_buffer = pool_cache_get(hammer2_pool_rbuf, PR_WAITOK);
 	strm_decompress.next_in = __DECONST(char *, data);
 
 	/* XXX supply proper size, subset of device bp */
@@ -182,7 +237,7 @@ hammer2_decompress_ZLIB_callback(const char *data, unsigned int bytes,
 	}
 	if (n < len)
 		bzero((char *)bp->b_data + n, len - n);
-	hfree(compressed_buffer, M_HAMMER2_RBUF, HAMMER2_PBUFSIZE);
+	pool_cache_put(hammer2_pool_rbuf, compressed_buffer);
 	inflateEnd(&strm_decompress);
 
 	bp->b_resid = 0;
@@ -767,8 +822,15 @@ hammer2_compress_and_write(char *data, hammer2_inode_t *ip,
 			 *	 overrun the buffer if given a 4-byte
 			 *	 granularity.
 			 */
-			comp_buffer = hmalloc(HAMMER2_PBUFSIZE / 2, M_HAMMER2_WBUF,
-			    M_WAITOK | M_ZERO);
+			/*
+			 * Pooled 32KB output buffer (upstream
+			 * cache_buffer_write objcache).  No zeroing needed:
+			 * only comp_buffer[0..comp_block_size) is consumed
+			 * and the remainder past comp_size is explicitly
+			 * zeroed below for dedup.
+			 */
+			comp_buffer = pool_cache_get(hammer2_pool_wbuf,
+			    PR_WAITOK);
 			comp_size = LZ4_compress_limitedOutput(data,
 			    &comp_buffer[sizeof(int)], pblksize,
 			    pblksize / 2 - sizeof(int64_t));
@@ -786,13 +848,22 @@ hammer2_compress_and_write(char *data, hammer2_inode_t *ip,
 				comp_level = 9;
 			/* XXX NetBSD doesn't have deflateInit. */
 			bzero(&strm_compress, sizeof(strm_compress));
+			strm_compress.zalloc = hammer2_zlib_alloc;
+			strm_compress.zfree = hammer2_zlib_free;
+			/*
+			 * MAX_WBITS (positive, zlib-wrapped stream) to match both
+			 * the decompress callback (inflateInit2, +15) and the
+			 * offline userland decoder.  The previous -15 (raw DEFLATE)
+			 * wrote streams the reader cannot inflate.
+			 */
 			ret = deflateInit2(&strm_compress, comp_level,
-			    Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY);
+			    Z_DEFLATED, 15, 8, Z_DEFAULT_STRATEGY);
 			if (ret != Z_OK)
 				hprintf("fatal error on deflateInit\n");
 
-			comp_buffer = hmalloc(HAMMER2_PBUFSIZE / 2, M_HAMMER2_WBUF,
-			    M_WAITOK | M_ZERO);
+			/* Pooled 32KB output buffer, see the LZ4 arm. */
+			comp_buffer = pool_cache_get(hammer2_pool_wbuf,
+			    PR_WAITOK);
 			strm_compress.next_in = data;
 			strm_compress.avail_in = pblksize;
 			strm_compress.next_out = comp_buffer;
@@ -948,7 +1019,7 @@ done:
 		hammer2_chain_drop(chain);
 	}
 	if (comp_buffer)
-		hfree(comp_buffer, M_HAMMER2_WBUF, HAMMER2_PBUFSIZE / 2);
+		pool_cache_put(hammer2_pool_wbuf, comp_buffer);
 }
 
 /*

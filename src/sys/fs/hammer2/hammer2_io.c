@@ -64,8 +64,43 @@ static __inline void
 hammer2_assert_io_refs(hammer2_io_t *dio)
 {
 	KKASSERT(dio);
-	hammer2_mtx_assert_ex(&dio->lock);
 	KKASSERT((dio->refs & HAMMER2_DIO_MASK) != 0);
+}
+
+/*
+ * Wait for an INPROG owner (I/O or lastdrop disposal) to finish.
+ *
+ * WAITING is registered under waitlk after re-checking INPROG, so a
+ * wakeup that races our registration can at worst cost one hz timeout
+ * (upstream's exact envelope with tsleep(hz)); the re-check under the
+ * mutex removes the common case of sleeping after the owner already
+ * finished.
+ */
+static __inline void
+hammer2_io_wait(hammer2_io_t *dio)
+{
+	hammer2_lk_ex(&dio->waitlk);
+	if (dio->refs & HAMMER2_DIO_INPROG) {
+		atomic_set_32(&dio->refs, HAMMER2_DIO_WAITING);
+		hammer2_lkc_sleep(&dio->cv, &dio->waitlk, "h2dio", hz);
+	}
+	hammer2_lk_unlock(&dio->waitlk);
+}
+
+/*
+ * Wake waiters after an INPROG-clearing cmpset succeeded.  orefs is the
+ * value read by the successful cmpset: a WAITING set after that instant
+ * cannot happen (INPROG is already clear) and would have made the
+ * cmpset fail anyway, so the gate is exact.
+ */
+static __inline void
+hammer2_io_wakeup(hammer2_io_t *dio, uint32_t orefs)
+{
+	if (orefs & HAMMER2_DIO_WAITING) {
+		hammer2_lk_ex(&dio->waitlk);
+		hammer2_lkc_wakeup(&dio->cv);
+		hammer2_lk_unlock(&dio->waitlk);
+	}
 }
 
 void
@@ -126,9 +161,10 @@ hammer2_io_alloc(hammer2_dev_t *hmp, hammer2_off_t data_off, uint8_t btype,
 	/*
 	 * Access/Allocate the DIO, bump dio->refs to prevent destruction.
 	 *
-	 * If DIO_GOOD is set the ref should prevent it from being cleared
-	 * out from under us, we can set *isgoodp, and the caller can operate
-	 * on the buffer without any further interaction.
+	 * The ref is bumped atomically (the 0->1 transition also moves the
+	 * dio out of the free accounting).  If DIO_GOOD is set the ref
+	 * prevents it from being cleared out from under us, and the caller
+	 * can operate on the buffer without any further interaction.
 	 */
 	dio = hammer2_io_hash_lookup(hmp, pbase, NULL);
 	if (dio) {
@@ -145,17 +181,16 @@ hammer2_io_alloc(hammer2_dev_t *hmp, hammer2_off_t data_off, uint8_t btype,
 		dio->btype = btype;
 		dio->refs = 1;
 		dio->act = 5;
-		hammer2_mtx_init(&dio->lock, "h2io");
-		hammer2_mtx_ex(&dio->lock);
+		hammer2_lk_init(&dio->waitlk, "h2dio");
+		hammer2_lkc_init(&dio->cv, "h2diocv");
 		xio = hammer2_io_hash_enter(hmp, dio, NULL);
 		if (xio == NULL) {
 			atomic_add_int(&hammer2_count_dio_allocated, 1);
 		} else {
-			hammer2_mtx_unlock(&dio->lock);
-			hammer2_mtx_destroy(&dio->lock);
+			hammer2_lkc_destroy(&dio->cv);
+			hammer2_lk_destroy(&dio->waitlk);
 			hfree(dio, M_HAMMER2, sizeof(*dio));
 			dio = xio;
-			hammer2_mtx_ex(&dio->lock);
 		}
 	} else {
 		return (NULL);
@@ -316,6 +351,7 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, hammer2_off_t lbase,
     int lsize, int op HAMMER2_IO_DEBUG_ARGS)
 {
 	hammer2_io_t *dio;
+	uint32_t nrefs, orefs;
 	daddr_t lblkno;
 	int error;
 
@@ -333,30 +369,51 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, hammer2_off_t lbase,
 		dio = hammer2_io_alloc(hmp, lbase, btype, 1);
 	}
 	KKASSERT(dio);
-	hammer2_assert_io_refs(dio); /* dio locked + refs > 0 */
 	hammer2_mtx_unlock(&hmp->iohash_lock);
 
-	/*
-	 * Buffer is already good, handle the op and return.
-	 */
-	if (dio->refs & HAMMER2_DIO_GOOD) {
-		switch (op) {
-		case HAMMER2_DOP_NEW:
-			bzero(hammer2_io_data(dio, lbase), lsize);
-			/* fall through */
-		case HAMMER2_DOP_NEWNZ:
-			dio->refs |= HAMMER2_DIO_DIRTY;
-			break;
-		default:
-			/* nothing to do */
-			break;
+	for (;;) {
+		orefs = dio->refs;
+		cpu_ccfence();
+
+		/*
+		 * Buffer is already good, handle the op and return.
+		 * The ref we hold prevents GOOD from being cleared.
+		 */
+		if (orefs & HAMMER2_DIO_GOOD) {
+			switch (op) {
+			case HAMMER2_DOP_NEW:
+				bzero(hammer2_io_data(dio, lbase), lsize);
+				/* fall through */
+			case HAMMER2_DOP_NEWNZ:
+				atomic_set_32(&dio->refs, HAMMER2_DIO_DIRTY);
+				break;
+			default:
+				/* nothing to do */
+				break;
+			}
+			DIO_RECORD(dio HAMMER2_IO_DEBUG_CALL);
+			return (dio);
 		}
-		hammer2_mtx_unlock(&dio->lock);
-		DIO_RECORD(dio HAMMER2_IO_DEBUG_CALL);
-		return (dio);
+
+		/*
+		 * Try to own the DIO.  If an I/O (or a lastdrop disposal)
+		 * is in progress we register as a waiter and sleep.
+		 */
+		if (orefs & HAMMER2_DIO_INPROG) {
+			hammer2_io_wait(dio);
+		} else {
+			nrefs = orefs | HAMMER2_DIO_INPROG;
+			if (atomic_cmpset_32(&dio->refs, orefs, nrefs))
+				break;
+		}
+		cpu_pause();
+		/* retry */
 	}
 
-	/* GOOD is not set. */
+	/*
+	 * We break to here if GOOD is not set and we acquired INPROG for
+	 * the I/O.
+	 */
 	KKASSERT(dio->bp == NULL);
 
 	error = 0;
@@ -370,7 +427,7 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, hammer2_off_t lbase,
 			dio->bp = getblk(dio->devvp, lblkno, dio->psize, 0, 0);
 			if (op == HAMMER2_DOP_NEW)
 				bzero(dio->bp->b_data, dio->psize);
-			dio->refs |= HAMMER2_DIO_DIRTY;
+			atomic_set_32(&dio->refs, HAMMER2_DIO_DIRTY);
 			break;
 		default:
 			error = hammer2_bread(hmp, dio, lblkno);
@@ -388,7 +445,7 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, hammer2_off_t lbase,
 				bzero(hammer2_io_data(dio, lbase), lsize);
 				/* fall through */
 			case HAMMER2_DOP_NEWNZ:
-				dio->refs |= HAMMER2_DIO_DIRTY;
+				atomic_set_32(&dio->refs, HAMMER2_DIO_DIRTY);
 				break;
 			default:
 				break;
@@ -403,10 +460,23 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, hammer2_off_t lbase,
 	*/
 
 	dio->error = error;
-	if (error == 0)
-		dio->refs |= HAMMER2_DIO_GOOD;
 
-	hammer2_mtx_unlock(&dio->lock);
+	/*
+	 * Clear INPROG and WAITING, set GOOD (if no error) and wake up
+	 * anyone waiting.
+	 */
+	for (;;) {
+		orefs = dio->refs;
+		cpu_ccfence();
+		nrefs = orefs & ~(HAMMER2_DIO_INPROG | HAMMER2_DIO_WAITING);
+		if (error == 0)
+			nrefs |= HAMMER2_DIO_GOOD;
+		if (atomic_cmpset_32(&dio->refs, orefs, nrefs)) {
+			hammer2_io_wakeup(dio, orefs);
+			break;
+		}
+		cpu_pause();
+	}
 
 	/* XXX error handling */
 	DIO_RECORD(dio HAMMER2_IO_DEBUG_CALL);
@@ -417,8 +487,11 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, hammer2_off_t lbase,
 /*
  * Release our ref on *diop.
  *
- * On the 1->0 transition we clear DIO_GOOD, set DIO_INPROG, and dispose
- * of dio->bp.  Then we clean up DIO_INPROG and DIO_WAITING.
+ * On the 1->0 transition we clear DIO_GOOD, set DIO_INPROG in the same
+ * cmpset, and dispose of dio->bp with no lock held (upstream holds no
+ * mutex across the disposal either -- the INPROG flag is what keeps
+ * concurrent getblk() callers out).  Then we clear DIO_INPROG and
+ * DIO_WAITING and wake up any waiters.
  */
 void
 _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
@@ -426,7 +499,7 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 	hammer2_dev_t *hmp;
 	hammer2_io_t *dio;
 	struct buf *bp;
-	uint64_t orefs;
+	uint32_t nrefs, orefs;
 	int dio_limit;
 
 	dio = *diop;
@@ -434,12 +507,7 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 	hmp = dio->hmp;
 	DIO_RECORD(dio HAMMER2_IO_DEBUG_CALL);
 
-	hammer2_mtx_ex(&dio->lock);
-	if ((dio->refs & HAMMER2_DIO_MASK) == 0) {
-		hammer2_mtx_unlock(&dio->lock);
-		return; /* lost race */
-	}
-	hammer2_assert_io_refs(dio);
+	KKASSERT((dio->refs & HAMMER2_DIO_MASK) != 0);
 
 	/*
 	 * Drop refs.
@@ -447,17 +515,40 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 	 * On the 1->0 transition clear GOOD and set INPROG, and break.
 	 * On any other transition we can return early.
 	 */
-	orefs = dio->refs;
-	if ((dio->refs & HAMMER2_DIO_MASK) == 1) {
-		dio->refs--;
-		dio->refs &= ~(HAMMER2_DIO_GOOD | HAMMER2_DIO_DIRTY);
-	} else {
-		/*
-		 * Normal drop case.
-		 */
-		dio->refs--;
-		hammer2_mtx_unlock(&dio->lock);
-		return;
+	for (;;) {
+		orefs = dio->refs;
+		cpu_ccfence();
+
+		if ((orefs & HAMMER2_DIO_MASK) == 1 &&
+		    (orefs & HAMMER2_DIO_INPROG) == 0) {
+			/*
+			 * Lastdrop case.  GOOD must be cleared in the same
+			 * cmpset to prevent the getblk shortcut, and INPROG
+			 * must be set so other threads do not touch the
+			 * buffer while we dispose of it.
+			 */
+			nrefs = orefs - 1;
+			nrefs &= ~(HAMMER2_DIO_GOOD | HAMMER2_DIO_DIRTY);
+			nrefs |= HAMMER2_DIO_INPROG;
+			if (atomic_cmpset_32(&dio->refs, orefs, nrefs))
+				break;
+		} else if ((orefs & HAMMER2_DIO_MASK) == 1) {
+			/*
+			 * Lastdrop case, INPROG already set.  We must
+			 * wait for INPROG to clear.
+			 */
+			hammer2_io_wait(dio);
+			/* retry */
+		} else {
+			/*
+			 * Normal drop case.
+			 */
+			nrefs = orefs - 1;
+			if (atomic_cmpset_32(&dio->refs, orefs, nrefs))
+				return;
+		}
+		cpu_pause();
+		/* retry */
 	}
 
 	/*
@@ -511,8 +602,22 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 	/* Update iofree_count before disposing of the dio. */
 	atomic_add_int(&hmp->iofree_count, 1);
 
+	/*
+	 * Clear INPROG and WAITING (GOOD and DIRTY were already cleared
+	 * above).  Also clear FLUSH as it was handled above.
+	 */
 	KKASSERT(!(dio->refs & HAMMER2_DIO_GOOD));
-	hammer2_mtx_unlock(&dio->lock);
+	for (;;) {
+		orefs = dio->refs;
+		cpu_ccfence();
+		nrefs = orefs & ~(HAMMER2_DIO_INPROG | HAMMER2_DIO_GOOD |
+				  HAMMER2_DIO_WAITING | HAMMER2_DIO_FLUSH);
+		if (atomic_cmpset_32(&dio->refs, orefs, nrefs)) {
+			hammer2_io_wakeup(dio, orefs);
+			break;
+		}
+		cpu_pause();
+	}
 	/* Another process may come in and get/put this dio. */
 
 	/*
@@ -670,8 +775,7 @@ hammer2_io_hash_lookup(hammer2_dev_t *hmp, hammer2_off_t pbase, uint64_t *refsp)
 	//hammer2_spin_sh(&hash->spin);
 	for (dio = hash->base; dio; dio = dio->next) {
 		if (dio->pbase == pbase) {
-			hammer2_mtx_ex(&dio->lock);
-			refs = dio->refs++;
+			refs = atomic_add_32_nv(&dio->refs, 1) - 1;
 			if ((refs & HAMMER2_DIO_MASK) == 0)
 				atomic_add_int(&dio->hmp->iofree_count, -1);
 			if (refsp)
@@ -708,7 +812,7 @@ hammer2_io_hash_enter(hammer2_dev_t *hmp, hammer2_io_t *dio, uint64_t *refsp)
 	//hammer2_spin_ex(&hash->spin);
 	for (xiop = &hash->base; (xio = *xiop) != NULL; xiop = &xio->next) {
 		if (xio->pbase == dio->pbase) {
-			refs = xio->refs++;
+			refs = atomic_add_32_nv(&xio->refs, 1) - 1;
 			if ((refs & HAMMER2_DIO_MASK) == 0)
 				atomic_add_int(&xio->hmp->iofree_count, -1);
 			if (refsp)
@@ -750,7 +854,8 @@ hammer2_io_hash_cleanup(hammer2_dev_t *hmp, int dio_limit)
 		//hammer2_spin_ex(&hash->spin);
 		diop = &hash->base;
 		while ((dio = *diop) != NULL) {
-			if ((dio->refs & HAMMER2_DIO_MASK) != 0) {
+			if ((dio->refs & (HAMMER2_DIO_MASK |
+					  HAMMER2_DIO_INPROG)) != 0) {
 				/*
 				 * Leak probe: a referenced dio that still
 				 * holds its buffer with a stale access time
@@ -800,11 +905,12 @@ hammer2_io_hash_cleanup(hammer2_dev_t *hmp, int dio_limit)
 		cleanbase = dio->next;
 		dio->next = NULL;
 		KKASSERT(dio->bp == NULL &&
-		    (dio->refs & HAMMER2_DIO_MASK) == 0);
+		    (dio->refs & (HAMMER2_DIO_MASK | HAMMER2_DIO_INPROG)) == 0);
 		if (dio->refs & HAMMER2_DIO_DIRTY)
 			hprintf("dirty buffer %016llx/%d\n",
 			    (long long)dio->pbase, dio->psize);
-		hammer2_mtx_destroy(&dio->lock);
+		hammer2_lkc_destroy(&dio->cv);
+		hammer2_lk_destroy(&dio->waitlk);
 		hfree(dio, M_HAMMER2, sizeof(*dio));
 	}
 }
@@ -826,12 +932,17 @@ hammer2_io_hash_cleanup_all(hammer2_dev_t *hmp)
 		while ((dio = hash->base) != NULL) {
 			hash->base = dio->next;
 			dio->next = NULL;
+			/*
+			 * Teardown path: unmount quiesces all I/O first, so no dio
+			 * may still be in its INPROG disposal window here.
+			 */
 			KKASSERT(dio->bp == NULL &&
-			    (dio->refs & HAMMER2_DIO_MASK) == 0);
+			    (dio->refs & (HAMMER2_DIO_MASK | HAMMER2_DIO_INPROG)) == 0);
 			if (dio->refs & HAMMER2_DIO_DIRTY)
 				hprintf("dirty buffer %016llx/%d\n",
 				    (long long)dio->pbase, dio->psize);
-			hammer2_mtx_destroy(&dio->lock);
+			hammer2_lkc_destroy(&dio->cv);
+			hammer2_lk_destroy(&dio->waitlk);
 			hfree(dio, M_HAMMER2, sizeof(*dio));
 			atomic_add_int(&hammer2_count_dio_allocated, -1);
 			atomic_add_int(&hmp->iofree_count, -1);
@@ -877,7 +988,6 @@ hammer2_io_dedup_set(hammer2_dev_t *hmp, hammer2_blockref_t *bref)
 	hammer2_mtx_ex(&hmp->iohash_lock);
 	dio = hammer2_io_alloc(hmp, bref->data_off, bref->type, 1);
 	KKASSERT(dio);
-	hammer2_assert_io_refs(dio); /* dio locked + refs > 0 */
 	hammer2_mtx_unlock(&hmp->iohash_lock);
 
 	if ((int)(bref->data_off & HAMMER2_OFF_MASK_RADIX))
@@ -886,10 +996,9 @@ hammer2_io_dedup_set(hammer2_dev_t *hmp, hammer2_blockref_t *bref)
 		lsize = 0;
 
 	mask = hammer2_dedup_mask(dio, bref->data_off, lsize);
-	dio->dedup_valid &= ~mask;
-	dio->dedup_alloc |= mask;
+	atomic_clear_64(&dio->dedup_valid, mask);
+	atomic_set_64(&dio->dedup_alloc, mask);
 
-	hammer2_mtx_unlock(&dio->lock);
 	hammer2_io_putblk(&dio);
 }
 
@@ -914,7 +1023,6 @@ hammer2_io_dedup_delete(hammer2_dev_t *hmp, uint8_t btype,
 	hammer2_mtx_ex(&hmp->iohash_lock);
 	dio = hammer2_io_alloc(hmp, data_off, btype, 0);
 	if (dio) {
-		hammer2_assert_io_refs(dio); /* dio locked + refs > 0 */
 		hammer2_mtx_unlock(&hmp->iohash_lock);
 
 		if (data_off < (hammer2_off_t)dio->pbase ||
@@ -925,10 +1033,9 @@ hammer2_io_dedup_delete(hammer2_dev_t *hmp, uint8_t btype,
 			    (long long)data_off, bytes, (long long)dio->pbase);
 
 		mask = hammer2_dedup_mask(dio, data_off, bytes);
-		dio->dedup_alloc &= ~mask;
-		dio->dedup_valid &= ~mask;
+		atomic_clear_64(&dio->dedup_alloc, mask);
+		atomic_clear_64(&dio->dedup_valid, mask);
 
-		hammer2_mtx_unlock(&dio->lock);
 		hammer2_io_putblk(&dio);
 	} else {
 		hammer2_mtx_unlock(&hmp->iohash_lock);
@@ -948,7 +1055,6 @@ hammer2_io_dedup_assert(hammer2_dev_t *hmp, hammer2_off_t data_off,
 	hammer2_mtx_ex(&hmp->iohash_lock);
 	dio = hammer2_io_alloc(hmp, data_off, HAMMER2_BREF_TYPE_DATA, 0);
 	if (dio) {
-		hammer2_assert_io_refs(dio); /* dio locked + refs > 0 */
 		hammer2_mtx_unlock(&hmp->iohash_lock);
 
 		KASSERTMSG((dio->dedup_alloc &
@@ -958,7 +1064,6 @@ hammer2_io_dedup_assert(hammer2_dev_t *hmp, hammer2_off_t data_off,
 		    (long long)hammer2_dedup_mask(dio, data_off, bytes),
 		    (long long)dio->dedup_alloc);
 
-		hammer2_mtx_unlock(&dio->lock);
 		hammer2_io_putblk(&dio);
 	} else {
 		hammer2_mtx_unlock(&hmp->iohash_lock);

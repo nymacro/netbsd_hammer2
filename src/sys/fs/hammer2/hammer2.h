@@ -246,7 +246,13 @@ typedef struct hammer2_inoq_head hammer2_inoq_head_t;
  */
 struct hammer2_io {
 	struct hammer2_io	*next;
-	hammer2_mtx_t		lock;
+	/*
+	 * waitlk/cv are ONLY used to sleep on INPROG transitions (the
+	 * refs protocol is lock-free); they are never held across
+	 * buffer acquisition or I/O.
+	 */
+	hammer2_lk_t		waitlk;
+	hammer2_lkc_t		cv;
 	hammer2_dev_t		*hmp;
 	struct vnode		*devvp;
 	struct buf		*bp;
@@ -281,9 +287,25 @@ struct hammer2_io_hash {
 typedef struct hammer2_io_hash	hammer2_io_hash_t;
 
 #define HAMMER2_DIO_GOOD	0x40000000U	/* dio->bp is stable */
+#define HAMMER2_DIO_WAITING	0x20000000U	/* someone waits on flags */
 #define HAMMER2_DIO_DIRTY	0x10000000U	/* flush last drop */
 #define HAMMER2_DIO_FLUSH	0x08000000U	/* immediate flush */
+#define HAMMER2_DIO_INPROG	0x80000000U	/* I/O or disposal in progress */
 #define HAMMER2_DIO_MASK	0x00FFFFFFU
+/*
+ * dio->refs protocol (upstream DragonFly parity, but 32-bit: upstream
+ * packs the same flags into the high bits of a 64-bit refcount).  The
+ * refcount bits (DIO_MASK) are manipulated with atomic ops only; no
+ * lock is held across buffer acquisition or I/O.  A thread wanting to
+ * instantiate the buffer sets DIO_INPROG via cmpset (single owner);
+ * other threads set DIO_WAITING and sleep (bounded by hz).  On the
+ * last putblk the owner clears GOOD|DIRTY, sets INPROG in the same
+ * cmpset, disposes of the buffer with no lock held, then clears
+ * INPROG|WAITING (and GOOD|FLUSH) and wakes DIO_WAITING sleepers.
+ * Nothing in the kernel may hold a mutex across an I/O, and the
+ * hash-cleanup code must skip DIOs with INPROG set (the disposer is
+ * still touching the dio).
+ */
 
 struct hammer2_inum_hash {
 	hammer2_spin_t		spin;

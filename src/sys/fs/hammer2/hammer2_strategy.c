@@ -1238,13 +1238,8 @@ hammer2_dedup_record(hammer2_chain_t *chain, hammer2_io_t *dio,
 			return;
 	}
 	/*
-	 * NOTE: No hammer2_mtx_assert_unlocked(&dio->lock) here: the
-	 * NetBSD rwlock API cannot express "not held by self", and
-	 * rw_lock_held() is a global check — a concurrent LWP's
-	 * hammer2_io_getblk/bread legitimately holds dio->lock for the
-	 * duration of a device read, which made this assert fire as a
-	 * false-positive SMP panic.  Upstream has no such assert either;
-	 * the mtx_ex/mtx_unlock pair below is the real serialization.
+	 * The dio->refs ref we hold pins the buffer: it cannot be disposed
+	 * (putblk lastdrop) while refs > 0, so the data pointer is stable.
 	 */
 
 	switch (HAMMER2_DEC_CHECK(chain->bref.methods)) {
@@ -1315,9 +1310,7 @@ hammer2_dedup_record(hammer2_chain_t *chain, hammer2_io_t *dio,
 	 * be set before a bcmp/dedup operation is able to use the block.
 	 */
 	mask = hammer2_dedup_mask(dio, chain->bref.data_off, chain->bytes);
-	hammer2_mtx_ex(&dio->lock);
-	dio->dedup_valid |= mask; /* DragonFly uses atomic_set_64 */
-	hammer2_mtx_unlock(&dio->lock);
+	atomic_set_64(&dio->dedup_valid, mask);
 
 #if 0
 	/*
@@ -1375,19 +1368,14 @@ hammer2_dedup_lookup(hammer2_dev_t *hmp, char **datap, int pblksize)
 		if (dio) {
 			dtmp = hammer2_io_data(dio, off);
 			mask = hammer2_dedup_mask(dio, off, pblksize);
-			/* No assert_unlocked: global rw_lock_held race, see
-			 * hammer2_dedup_record. */
-			hammer2_mtx_ex(&dio->lock);
 			if ((dio->dedup_alloc & mask) == mask &&
 			    (dio->dedup_valid & mask) == mask &&
 			    bcmp(data, dtmp, pblksize) == 0) {
-				hammer2_mtx_unlock(&dio->lock);
 				hammer2_io_putblk(&dio);
 				*datap = NULL;
 				dedup[i].ticks = getticks();
 				return (off);
 			}
-			hammer2_mtx_unlock(&dio->lock);
 			hammer2_io_putblk(&dio);
 		}
 	}

@@ -517,7 +517,21 @@ hammer2_strategy_write(struct vop_strategy_args *ap)
 	}
 	xop->bp = bp;
 	xop->lbase = lbase;
-	hammer2_xop_start(&xop->head, &hammer2_strategy_write_desc);
+	if (hammer2_xop_start(&xop->head, &hammer2_strategy_write_desc)) {
+		/*
+		 * Scratch allocation failed (typically pagedaemon
+		 * context under memory pressure); xop_start already
+		 * failed the buffer with ENOMEM.  Unwind the trans /
+		 * lwinprog accounting the backend would have consumed
+		 * (no backend runs -- run_mask is still 0), then run
+		 * the frontend-only retire (HAMMER2_XOPMASK_VOP passes
+		 * retire's ALLDONE check and frees fifos/xop).
+		 */
+		hammer2_trans_done(pmp, HAMMER2_TRANS_BUFCACHE);
+		hammer2_lwinprog_drop(pmp);
+		hammer2_xop_retire(&xop->head, HAMMER2_XOPMASK_VOP);
+		return (0);
+	}
 	if (!pdctx)
 		hammer2_lwinprog_wait(pmp, hammer2_flush_pipe);
 	hammer2_xop_retire(&xop->head, HAMMER2_XOPMASK_VOP);

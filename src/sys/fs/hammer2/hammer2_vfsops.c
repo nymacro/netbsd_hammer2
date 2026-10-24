@@ -94,6 +94,7 @@ hammer2_lk_t hammer2_mntlk;
 /* sysctl */
 static int hammer2_supported_version = HAMMER2_VOL_VERSION_DEFAULT;
 int hammer2_debug;
+int hammer2_debug_scratch_fail;
 long hammer2_process_icrc32;
 long hammer2_process_xxhash64;
 int hammer2_dedup_enable = 1;
@@ -137,6 +138,7 @@ int malloc_leak_m_temp;
 #define HAMMER2_SYSCTL_PROCESS_XXHASH64		16
 #define HAMMER2_SYSCTL_CLUSTER_META_READ	17
 #define HAMMER2_SYSCTL_CLUSTER_DATA_READ	18
+#define HAMMER2_SYSCTL_SCRATCH_FAIL		19
 
 SYSCTL_SETUP(hammer2_sysctl_create, "hammer2 sysctl")
 {
@@ -316,6 +318,16 @@ SYSCTL_SETUP(hammer2_sysctl_create, "hammer2 sysctl")
 	    SYSCTL_DESCR("Physical read-ahead for data blocks (64KB units)"),
 	    NULL, 0, &hammer2_cluster_data_read, 0,
 	    CTL_VFS, x, HAMMER2_SYSCTL_CLUSTER_DATA_READ, CTL_EOL);
+	if (error)
+		goto fail;
+
+	error = sysctl_createv(clog, 0, NULL, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE,
+	    CTLTYPE_INT, "scratch_fail",
+	    SYSCTL_DESCR("Debug: fail this many XOP scratch allocations "
+	    "with ENOMEM (fault injection)"),
+	    NULL, 0, &hammer2_debug_scratch_fail, 0,
+	    CTL_VFS, x, HAMMER2_SYSCTL_SCRATCH_FAIL, CTL_EOL);
 	if (error)
 		goto fail;
 

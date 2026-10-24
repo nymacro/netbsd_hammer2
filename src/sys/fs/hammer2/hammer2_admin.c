@@ -340,7 +340,7 @@ xop_storage_func(hammer2_xop_head_t *xop, hammer2_inode_t *ip, void *scratch,
  *
  * XXX optimize single-target case.
  */
-void
+int
 hammer2_xop_start(hammer2_xop_head_t *xop, hammer2_xop_desc_t *desc)
 {
 	hammer2_inode_t *ip = xop->ip1;
@@ -368,20 +368,28 @@ hammer2_xop_start(hammer2_xop_head_t *xop, hammer2_xop_desc_t *desc)
 		const int prflags = (curlwp == uvm.pagedaemon_lwp) ?
 		    PR_NOWAIT : PR_WAITOK;
 
-		xop->scratch = pool_cache_get(hammer2_pool_scratch, prflags);
+		if (hammer2_debug_scratch_fail > 0) {
+			/* Debug fault-injection knob (test only). */
+			--hammer2_debug_scratch_fail;
+			xop->scratch = NULL;
+		} else {
+			xop->scratch = pool_cache_get(hammer2_pool_scratch,
+			    prflags);
+		}
 		if (xop->scratch == NULL) {
 			struct buf *bp = ((hammer2_xop_strategy_t *)xop)->bp;
-			int j;
 
-			for (j = 0; j < ip->cluster.nchains; ++j) {
-				if (ip->cluster.array[j].chain) {
-					hammer2_xop_feed(xop, NULL, j, ENOMEM);
-					hammer2_xop_retire(xop, 1LLU << j);
-				}
-			}
+			/*
+			 * Fail this one buffer with ENOMEM.  Do NOT feed or
+			 * retire per chain here: nothing has been registered
+			 * yet (ipdep registration and run_mask bits happen
+			 * below), so the xop is still a pristine
+			 * frontend-only XOP.  The caller unwinds with a
+			 * frontend-only retire and returns ENOMEM.
+			 */
 			bp->b_error = ENOMEM;
 			biodone(bp);
-			return;
+			return (ENOMEM);
 		}
 	}
 
@@ -423,6 +431,8 @@ hammer2_xop_start(hammer2_xop_head_t *xop, hammer2_xop_desc_t *desc)
 			hammer2_xop_retire(xop, mask);
 		}
 	}
+
+	return (0);
 }
 
 /*

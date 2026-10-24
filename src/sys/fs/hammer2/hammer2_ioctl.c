@@ -758,6 +758,7 @@ hammer2_ioctl_emerg_mode(hammer2_inode_t *ip, u_int mode)
 static int
 hammer2_ioctl_bulkfree_scan(hammer2_inode_t *ip, void *data)
 {
+	hammer2_ioc_bulkfree_t bfi_default;
 	hammer2_ioc_bulkfree_t *bfi = data;
 	hammer2_dev_t *hmp;
 	int error = 0;
@@ -767,8 +768,16 @@ hammer2_ioctl_bulkfree_scan(hammer2_inode_t *ip, void *data)
 	hmp = ip->pmp->pfs_hmps[0];
 	if (hmp == NULL)
 		return (EINVAL);
-	if (bfi == NULL)
-		return (EINVAL);
+	if (bfi == NULL) {
+		/*
+		 * HAMMER2IOC_BULKFREE_ASYNC: no user buffer.  Use the
+		 * userland minimum window (8MB, cmd_bulkfree.c) and
+		 * discard the per-run results.
+		 */
+		bzero(&bfi_default, sizeof(bfi_default));
+		bfi_default.size = 8192 * 1024;
+		bfi = &bfi_default;
+	}
 
 	if (hammer2_is_rdonly(ip->pmp->mp))
 		return (EROFS);
@@ -1138,6 +1147,23 @@ hammer2_ioctl_impl(struct vnode *vp, unsigned long com, void *data,
 	case HAMMER2IOC_BULKFREE_SCAN:
 		if (error == 0)
 			error = hammer2_ioctl_bulkfree_scan(ip, data);
+		break;
+	case HAMMER2IOC_BULKFREE_ASYNC:
+		/*
+		 * ABI parity with upstream (hammer2_ioctl.c:147): the async
+		 * form carries no user buffer.  Upstream then rejects NULL
+		 * in the scan (EINVAL); this port makes it work by using the
+		 * default 8MB window.
+		 */
+		if (error == 0)
+			error = hammer2_ioctl_bulkfree_scan(ip, NULL);
+		break;
+	case HAMMER2IOC_RECLUSTER:
+		/*
+		 * Single-node port: there is no remote cluster to
+		 * reconnect.  Success is the upstream behavior for a
+		 * local mount (c5cc81fefa); nothing to do.
+		 */
 		break;
 	case HAMMER2IOC_DESTROY:
 		if (error == 0)

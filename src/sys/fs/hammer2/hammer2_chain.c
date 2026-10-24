@@ -229,11 +229,14 @@ void
 hammer2_chain_init(hammer2_chain_t *chain)
 {
 	/*
-	 * Note that hammer2_chain_lookup() via strategy read / write can
-	 * attempt to recursively lock chain->lock for inode with DIRECTDATA.
-	 * This is possible in DragonFly and FreeBSD, but not in NetBSD.
-	 * To prevent this happening, HAMMER2_OPFLAG_DIRECTDATA is currently
-	 * disabled.  This means write always create data block(s).
+	 * Note that hammer2_chain_lookup() via strategy read / write CAN
+	 * attempt to recursively lock chain->lock for inodes flagged
+	 * HAMMER2_OPFLAG_DIRECTDATA: the lookup returns the locked inode
+	 * chain itself and takes a second (LOCKAGAIN) lock on it.  The
+	 * NetBSD rwlock shim cannot recurse, so that path is accounted as
+	 * a logical "self" lock in chain->lockcnt instead of a second mtx
+	 * acquisition (see hammer2_chain_lock/unlock and lockcnt in
+	 * hammer2.h).  DIRECTDATA is therefore enabled.
 	 */
 	/*
 	 * Another NetBSD specific problem is getnewbuf() via getblk() can
@@ -273,7 +276,8 @@ hammer2_chain_ref_hold(hammer2_chain_t *chain)
 {
 	hammer2_mtx_assert_locked(&chain->lock);
 
-	atomic_add_int(&chain->lockcnt, 1);
+	KKASSERT(hammer2_lockcnt_total(chain->lockcnt) != 0xffffffffU);
+	atomic_add_64(&chain->lockcnt, 1);	/* total only, never a self */
 	hammer2_chain_ref(chain);
 }
 
@@ -372,15 +376,21 @@ hammer2_chain_drop(hammer2_chain_t *chain)
 void
 hammer2_chain_unhold(hammer2_chain_t *chain)
 {
-	unsigned int lockcnt;
+	uint64_t lockcnt;
 	int iter = 0;
 
 	for (;;) {
 		lockcnt = chain->lockcnt;
 		cpu_ccfence();
 
-		if (lockcnt > 1) {
-			if (atomic_cmpset_int(&chain->lockcnt, lockcnt,
+		if (hammer2_lockcnt_total(lockcnt) > 1) {
+			/*
+			 * Unhold releases a held ref, never a self credit:
+			 * total == 1 implies self == 0 by invariant.
+			 */
+			KKASSERT(hammer2_lockcnt_self(lockcnt) == 0 ||
+			    hammer2_lockcnt_total(lockcnt) > 2);
+			if (atomic_cmpset_64(&chain->lockcnt, lockcnt,
 			    lockcnt - 1))
 				break;
 		} else if (hammer2_mtx_owned(&chain->lock)) {
@@ -431,7 +441,8 @@ void
 hammer2_chain_rehold(hammer2_chain_t *chain)
 {
 	hammer2_chain_lock(chain, HAMMER2_RESOLVE_SHARED);
-	atomic_add_int(&chain->lockcnt, 1);
+	KKASSERT(hammer2_lockcnt_total(chain->lockcnt) != 0xffffffffU);
+	atomic_add_64(&chain->lockcnt, 1);	/* total only */
 	hammer2_chain_unlock(chain);
 }
 
@@ -792,22 +803,25 @@ hammer2_chain_lock(hammer2_chain_t *chain, int how)
 		 * unhold sequence to undo the mess.
 		 *
 		 * NOTE: LOCKAGAIN must always succeed without blocking,
-		 *	 even if NONBLOCK is specified.
+		 *	 even if NONBLOCK is specified.  The caller already owns
+		 *	 a lock (shared or exclusive) on the chain, so no mtx
+		 *	 acquisition is made; the total and self counters are
+		 *	 bumped in ONE atomic operation so no concurrent unlocker
+		 *	 sees a real-lock credit that was never acquired.
 		 */
-		atomic_add_int(&chain->lockcnt, 1);
-		if (how & HAMMER2_RESOLVE_SHARED) {
-			if (how & HAMMER2_RESOLVE_LOCKAGAIN) {
-				hammer2_mtx_assert_locked(&chain->lock);
-				hammer2_mtx_assert_sh(&chain->lock);
-				hammer2_mtx_sh(&chain->lock); /* XXX */
-				hammer2_mtx_assert_sh(&chain->lock);
-			} else {
-				if (hammer2_mtx_sh_try(&chain->lock) != 0) {
-					hammer2_chain_unhold(chain);
-					return (EAGAIN);
-				}
+		if (how & HAMMER2_RESOLVE_LOCKAGAIN) {
+			KKASSERT(hammer2_mtx_sh_held(&chain->lock) ||
+			    hammer2_mtx_owned(&chain->lock));
+			atomic_add_64(&chain->lockcnt,
+			    1 | HAMMER2_LOCKCNT_SELF_ONE);
+		} else if (how & HAMMER2_RESOLVE_SHARED) {
+			atomic_add_64(&chain->lockcnt, 1);
+			if (hammer2_mtx_sh_try(&chain->lock) != 0) {
+				hammer2_chain_unhold(chain);
+				return (EAGAIN);
 			}
 		} else {
+			atomic_add_64(&chain->lockcnt, 1);
 			if (hammer2_mtx_ex_try(&chain->lock) != 0) {
 				hammer2_chain_unhold(chain);
 				return (EAGAIN);
@@ -815,23 +829,23 @@ hammer2_chain_lock(hammer2_chain_t *chain, int how)
 		}
 	} else {
 		/*
-		 * Get the appropriate lock.  If LOCKAGAIN is flagged with
-		 * SHARED the caller expects a shared lock to already be
-		 * present and we are giving it another ref.  This case must
-		 * importantly not block if there is a pending exclusive lock
-		 * request.
+		 * Get the appropriate lock.  If LOCKAGAIN is flagged the caller
+		 * already holds the chain's mtx (shared, or exclusive for a
+		 * DIRECTDATA lookup in an exclusive traversal) and we are giving
+		 * it another logical ref.  This case must importantly not block
+		 * if there is a pending exclusive lock request -- and the NetBSD
+		 * rwlock shim must not be re-entered, hence the self credit.
 		 */
-		atomic_add_int(&chain->lockcnt, 1);
-		if (how & HAMMER2_RESOLVE_SHARED) {
-			if (how & HAMMER2_RESOLVE_LOCKAGAIN) {
-				hammer2_mtx_assert_locked(&chain->lock);
-				hammer2_mtx_assert_sh(&chain->lock);
-				hammer2_mtx_sh(&chain->lock); /* XXX */
-				hammer2_mtx_assert_sh(&chain->lock);
-			} else {
-				hammer2_mtx_sh(&chain->lock);
-			}
+		if (how & HAMMER2_RESOLVE_LOCKAGAIN) {
+			KKASSERT(hammer2_mtx_sh_held(&chain->lock) ||
+			    hammer2_mtx_owned(&chain->lock));
+			atomic_add_64(&chain->lockcnt,
+			    1 | HAMMER2_LOCKCNT_SELF_ONE);
+		} else if (how & HAMMER2_RESOLVE_SHARED) {
+			atomic_add_64(&chain->lockcnt, 1);
+			hammer2_mtx_sh(&chain->lock);
 		} else {
+			atomic_add_64(&chain->lockcnt, 1);
 			hammer2_mtx_ex(&chain->lock);
 		}
 	}
@@ -1081,7 +1095,8 @@ void
 hammer2_chain_unlock(hammer2_chain_t *chain)
 {
 	hammer2_io_t *dio;
-	unsigned int lockcnt;
+	uint64_t lockcnt, nlockcnt;
+	uint32_t self, total;
 	int iter = 0;
 
 	/*
@@ -1089,21 +1104,37 @@ hammer2_chain_unlock(hammer2_chain_t *chain)
 	 * particular chain we can just unlock, drop refs, and return.
 	 *
 	 * Otherwise fall-through on the 1->0 transition.
+	 *
+	 * A self credit (LOCKAGAIN) is consumed first and does NOT release
+	 * the mtx: the mtx exits are matched to the real acquisitions, so
+	 * the last unlock is always performed by a thread that actually
+	 * holds the mutex.  Both halves of the counter are updated in one
+	 * cmpset so no observer ever sees total and self out of step.
 	 */
 	for (;;) {
 		lockcnt = chain->lockcnt;
-		KKASSERT(lockcnt > 0);
+		total = hammer2_lockcnt_total(lockcnt);
+		self = hammer2_lockcnt_self(lockcnt);
+		KKASSERT(total > 0);
+		KKASSERT(self <= total);
 		cpu_ccfence();
 
-		if (lockcnt > 1) {
-			if (atomic_cmpset_int(&chain->lockcnt, lockcnt,
-			    lockcnt - 1)) {
-				hammer2_mtx_unlock(&chain->lock);
+		if (total > 1) {
+			if (self > 0)
+				nlockcnt = lockcnt - 1 -
+				    HAMMER2_LOCKCNT_SELF_ONE;
+			else
+				nlockcnt = lockcnt - 1;
+			if (atomic_cmpset_64(&chain->lockcnt, lockcnt,
+			    nlockcnt)) {
+				if (self == 0)
+					hammer2_mtx_unlock(&chain->lock);
 				return;
 			}
 		} else if (hammer2_mtx_upgrade_try(&chain->lock) == 0) {
 			/* while holding the mutex exclusively */
-			if (atomic_cmpset_int(&chain->lockcnt, 1, 0))
+			KKASSERT(self == 0);
+			if (atomic_cmpset_64(&chain->lockcnt, lockcnt, 0))
 				break;
 		} else {
 			/*
@@ -2924,7 +2955,7 @@ hammer2_chain_create(hammer2_chain_t **parentp, hammer2_chain_t **chainp,
 		 * which we do NOT want to do.  (note: chain->refs is set
 		 * to 1 by chain_alloc() for us, but lockcnt is not).
 		 */
-		chain->lockcnt = 1;
+		chain->lockcnt = hammer2_lockcnt_pack(1, 0);
 		hammer2_mtx_ex(&chain->lock);
 		allocated = 1;
 

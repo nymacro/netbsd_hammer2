@@ -142,7 +142,12 @@ hammer2_io_alloc(hammer2_dev_t *hmp, hammer2_off_t data_off, uint8_t btype,
 	hammer2_off_t lbase, pbase, pmask;
 	int lsize, psize;
 
-	hammer2_mtx_assert_ex(&hmp->iohash_lock);
+	/*
+	 * The hash is protected per-bucket (hash->spin), not by a global
+	 * lock.  Callers may hold any bucket lock that is not the target
+	 * bucket; the lookup+enter pair revalidates under the bucket lock
+	 * and a DIO with refs is never reclaimed.
+	 */
 
 	psize = HAMMER2_PBUFSIZE;
 	pmask = ~(hammer2_off_t)(psize - 1);
@@ -357,19 +362,15 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, hammer2_off_t lbase,
 
 	KKASSERT((1 << (int)(lbase & HAMMER2_OFF_MASK_RADIX)) == lsize);
 
-	hammer2_mtx_ex(&hmp->iohash_lock);
 	if (op == HAMMER2_DOP_READQ) {
 		dio = hammer2_io_alloc(hmp, lbase, btype, 0);
-		if (dio == NULL) {
-			hammer2_mtx_unlock(&hmp->iohash_lock);
+		if (dio == NULL)
 			return (NULL);
-		}
 		op = HAMMER2_DOP_READ;
 	} else {
 		dio = hammer2_io_alloc(hmp, lbase, btype, 1);
 	}
 	KKASSERT(dio);
-	hammer2_mtx_unlock(&hmp->iohash_lock);
 
 	for (;;) {
 		orefs = dio->refs;
@@ -624,7 +625,6 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 	 * We cache free buffers so re-use cases can use a shared lock, but
 	 * if too many build up we have to clean them out.
 	 */
-	hammer2_mtx_ex(&hmp->iohash_lock);
 	dio_limit = hammer2_dio_limit;
 	if (dio_limit < 256)
 		dio_limit = 256;
@@ -632,7 +632,6 @@ _hammer2_io_putblk(hammer2_io_t **diop HAMMER2_IO_DEBUG_ARGS)
 		dio_limit = 1024*1024;
 	if (hmp->iofree_count > dio_limit)
 		hammer2_io_hash_cleanup(hmp, dio_limit);
-	hammer2_mtx_unlock(&hmp->iohash_lock);
 }
 
 /*
@@ -642,8 +641,8 @@ char *
 hammer2_io_data(hammer2_io_t *dio, hammer2_off_t lbase)
 {
 	struct buf *bp;
-	off_t b_offset;
-	int off;
+	off_t	b_offset;
+	int	off;
 
 	bp = dio->bp;
 	KASSERTMSG(bp != NULL, "NULL dio buf");
@@ -766,13 +765,11 @@ hammer2_io_hash_lookup(hammer2_dev_t *hmp, hammer2_off_t pbase, uint64_t *refsp)
 	hammer2_io_t *dio;
 	uint64_t refs;
 
-	hammer2_mtx_assert_ex(&hmp->iohash_lock);
-
 	if (refsp)
 		*refsp = 0;
 
 	hash = hammer2_io_hashv(hmp, pbase);
-	//hammer2_spin_sh(&hash->spin);
+	hammer2_spin_sh(&hash->spin);
 	for (dio = hash->base; dio; dio = dio->next) {
 		if (dio->pbase == pbase) {
 			refs = atomic_add_32_nv(&dio->refs, 1) - 1;
@@ -783,7 +780,7 @@ hammer2_io_hash_lookup(hammer2_dev_t *hmp, hammer2_off_t pbase, uint64_t *refsp)
 			break;
 		}
 	}
-	//hammer2_spin_unsh(&hash->spin);
+	hammer2_spin_unsh(&hash->spin);
 
 	if (dio)
 		hammer2_assert_io_refs(dio);
@@ -802,14 +799,13 @@ hammer2_io_hash_enter(hammer2_dev_t *hmp, hammer2_io_t *dio, uint64_t *refsp)
 	hammer2_io_t *xio, **xiop;
 	uint64_t refs;
 
-	hammer2_mtx_assert_ex(&hmp->iohash_lock);
 	hammer2_assert_io_refs(dio);
 
 	if (refsp)
 		*refsp = 0;
 
 	hash = hammer2_io_hashv(hmp, dio->pbase);
-	//hammer2_spin_ex(&hash->spin);
+	hammer2_spin_ex(&hash->spin);
 	for (xiop = &hash->base; (xio = *xiop) != NULL; xiop = &xio->next) {
 		if (xio->pbase == dio->pbase) {
 			refs = atomic_add_32_nv(&xio->refs, 1) - 1;
@@ -823,7 +819,7 @@ hammer2_io_hash_enter(hammer2_dev_t *hmp, hammer2_io_t *dio, uint64_t *refsp)
 	dio->next = NULL;
 	*xiop = dio;
 done:
-	//hammer2_spin_unex(&hash->spin);
+	hammer2_spin_unex(&hash->spin);
 
 	return (xio);
 }
@@ -838,8 +834,13 @@ hammer2_io_hash_cleanup(hammer2_dev_t *hmp, int dio_limit)
 	hammer2_io_t *dio, **diop, *cleanbase, **cleanapp;
 	int count, maxscan, act, i;
 
-	hammer2_mtx_assert_ex(&hmp->iohash_lock);
-
+	/*
+	 * Called with no bucket lock held.  Each bucket is locked
+	 * exclusively in turn while entries are detached; the detached
+	 * entries are freed after the last bucket lock is dropped.
+	 * Concurrent cleanups are benign (entries are detached exactly
+	 * once; the scan cursor is advisory).
+	 */
 	count = hmp->iofree_count - dio_limit + 32;
 	if (count <= 0)
 		return;
@@ -851,7 +852,7 @@ hammer2_io_hash_cleanup(hammer2_dev_t *hmp, int dio_limit)
 
 	while (count > 0 && maxscan--) {
 		hash = &hmp->iohash[i & HAMMER2_IOHASH_MASK];
-		//hammer2_spin_ex(&hash->spin);
+		hammer2_spin_ex(&hash->spin);
 		diop = &hash->base;
 		while ((dio = *diop) != NULL) {
 			if ((dio->refs & (HAMMER2_DIO_MASK |
@@ -896,7 +897,7 @@ hammer2_io_hash_cleanup(hammer2_dev_t *hmp, int dio_limit)
 			atomic_add_int(&hammer2_count_dio_allocated, -1);
 			atomic_add_int(&hmp->iofree_count, -1);
 		}
-		//hammer2_spin_unex(&hash->spin);
+		hammer2_spin_unex(&hash->spin);
 		i = hmp->io_iterator++;
 	}
 
@@ -922,31 +923,44 @@ void
 hammer2_io_hash_cleanup_all(hammer2_dev_t *hmp)
 {
 	hammer2_io_hash_t *hash;
-	hammer2_io_t *dio;
+	hammer2_io_t *dio, *cleanbase, **cleanapp;
 	int i;
 
-	hammer2_mtx_assert_ex(&hmp->iohash_lock);
+	/*
+	 * Teardown path: unmount quiesces all I/O first, so no dio may still
+	 * be in its INPROG disposal window here.  Each bucket is locked only
+	 * while detaching; the detached list is freed afterwards with no
+	 * bucket lock held.
+	 */
+	cleanbase = NULL;
+	cleanapp = &cleanbase;
 
 	for (i = 0; i < HAMMER2_IOHASH_SIZE; ++i) {
 		hash = &hmp->iohash[i];
+		hammer2_spin_ex(&hash->spin);
 		while ((dio = hash->base) != NULL) {
 			hash->base = dio->next;
 			dio->next = NULL;
-			/*
-			 * Teardown path: unmount quiesces all I/O first, so no dio
-			 * may still be in its INPROG disposal window here.
-			 */
 			KKASSERT(dio->bp == NULL &&
-			    (dio->refs & (HAMMER2_DIO_MASK | HAMMER2_DIO_INPROG)) == 0);
-			if (dio->refs & HAMMER2_DIO_DIRTY)
-				hprintf("dirty buffer %016llx/%d\n",
-				    (long long)dio->pbase, dio->psize);
-			hammer2_lkc_destroy(&dio->cv);
-			hammer2_lk_destroy(&dio->waitlk);
-			hfree(dio, M_HAMMER2, sizeof(*dio));
+			    (dio->refs & (HAMMER2_DIO_MASK |
+					  HAMMER2_DIO_INPROG)) == 0);
+			*cleanapp = dio;
+			cleanapp = &dio->next;
 			atomic_add_int(&hammer2_count_dio_allocated, -1);
 			atomic_add_int(&hmp->iofree_count, -1);
 		}
+		hammer2_spin_unex(&hash->spin);
+	}
+
+	while ((dio = cleanbase) != NULL) {
+		cleanbase = dio->next;
+		dio->next = NULL;
+		if (dio->refs & HAMMER2_DIO_DIRTY)
+			hprintf("dirty buffer %016llx/%d\n",
+			    (long long)dio->pbase, dio->psize);
+		hammer2_lkc_destroy(&dio->cv);
+		hammer2_lk_destroy(&dio->waitlk);
+		hfree(dio, M_HAMMER2, sizeof(*dio));
 	}
 }
 
@@ -985,10 +999,8 @@ hammer2_io_dedup_set(hammer2_dev_t *hmp, hammer2_blockref_t *bref)
 	uint64_t mask;
 	int lsize;
 
-	hammer2_mtx_ex(&hmp->iohash_lock);
 	dio = hammer2_io_alloc(hmp, bref->data_off, bref->type, 1);
 	KKASSERT(dio);
-	hammer2_mtx_unlock(&hmp->iohash_lock);
 
 	if ((int)(bref->data_off & HAMMER2_OFF_MASK_RADIX))
 		lsize = 1 << (int)(bref->data_off & HAMMER2_OFF_MASK_RADIX);
@@ -1020,11 +1032,8 @@ hammer2_io_dedup_delete(hammer2_dev_t *hmp, uint8_t btype,
 	if (btype != HAMMER2_BREF_TYPE_DATA)
 		return;
 
-	hammer2_mtx_ex(&hmp->iohash_lock);
 	dio = hammer2_io_alloc(hmp, data_off, btype, 0);
 	if (dio) {
-		hammer2_mtx_unlock(&hmp->iohash_lock);
-
 		if (data_off < (hammer2_off_t)dio->pbase ||
 		    (data_off & ~HAMMER2_OFF_MASK_RADIX) +
 		    (hammer2_off_t)bytes >
@@ -1037,8 +1046,6 @@ hammer2_io_dedup_delete(hammer2_dev_t *hmp, uint8_t btype,
 		atomic_clear_64(&dio->dedup_valid, mask);
 
 		hammer2_io_putblk(&dio);
-	} else {
-		hammer2_mtx_unlock(&hmp->iohash_lock);
 	}
 }
 
@@ -1052,11 +1059,8 @@ hammer2_io_dedup_assert(hammer2_dev_t *hmp, hammer2_off_t data_off,
 {
 	hammer2_io_t *dio;
 
-	hammer2_mtx_ex(&hmp->iohash_lock);
 	dio = hammer2_io_alloc(hmp, data_off, HAMMER2_BREF_TYPE_DATA, 0);
 	if (dio) {
-		hammer2_mtx_unlock(&hmp->iohash_lock);
-
 		KASSERTMSG((dio->dedup_alloc &
 		    hammer2_dedup_mask(dio, data_off, bytes)) == 0,
 		    "%016llx/%d %016llx/%016llx",
@@ -1065,7 +1069,5 @@ hammer2_io_dedup_assert(hammer2_dev_t *hmp, hammer2_off_t data_off,
 		    (long long)dio->dedup_alloc);
 
 		hammer2_io_putblk(&dio);
-	} else {
-		hammer2_mtx_unlock(&hmp->iohash_lock);
 	}
 }

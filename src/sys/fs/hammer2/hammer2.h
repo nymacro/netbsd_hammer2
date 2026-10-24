@@ -209,11 +209,23 @@ typedef struct hammer2_inoq_head hammer2_inoq_head_t;
 #define HAMMER2_LIMIT_DIRTY_CHAINS	(1024*1024)
 #define HAMMER2_LIMIT_DIRTY_INODES	(65536)
 
-#define HAMMER2_IOHASH_SIZE		1024	/* NetBSD: originally 32768 */
+/*
+ * Hash table sizes: upstream DragonFly values.
+ *
+ * The IO hash is locked per bucket (hash->spin) since 2026-10-22; the
+ * array costs 16 bytes per entry per mounted device (512KB at 32768).
+ * The inode hash lives in each PFS (also 512KB at 32768).
+ *
+ * NOTE: upstream defines HAMMER2_INUMHASH_MASK from HAMMER2_IOHASH_SIZE
+ * because both sizes are 32768 there.  The masks are kept derived from
+ * their own sizes here so a future divergence cannot index past
+ * pmp->inumhash[].
+ */
+#define HAMMER2_IOHASH_SIZE		32768
 #define HAMMER2_IOHASH_MASK		(HAMMER2_IOHASH_SIZE - 1)
 
-#define HAMMER2_INUMHASH_SIZE		1024	/* NetBSD: originally 32768 */
-#define HAMMER2_INUMHASH_MASK		(HAMMER2_IOHASH_SIZE - 1)
+#define HAMMER2_INUMHASH_SIZE		32768
+#define HAMMER2_INUMHASH_MASK		(HAMMER2_INUMHASH_SIZE - 1)
 
 /*
  * HAMMER2 dio - Management structure wrapping system buffer cache.
@@ -343,6 +355,39 @@ struct hammer2_chain_core {
 typedef struct hammer2_chain_core hammer2_chain_core_t;
 
 /*
+ * chain->lockcnt is packed: the low 32 bits count logical locks, the
+ * high 32 bits count "self" locks.  A self lock is a logical lock taken
+ * with HAMMER2_RESOLVE_LOCKAGAIN: the caller already owns the chain's
+ * mtx (it is resolving a DIRECTDATA lookup on a chain it holds), so the
+ * lock is accounted but no second mtx acquisition is made.  The unlock
+ * path consumes a self credit first, which keeps mtx exits exactly
+ * matched to real acquisitions regardless of unlock order (shared
+ * readers are anonymous).
+ *
+ * Invariants: self <= total, and total == 1 implies self == 0 (a self
+ * lock always coexists with at least one real mtx acquisition).
+ */
+#define HAMMER2_LOCKCNT_SELF_ONE	(1ULL << 32)
+
+static __inline uint64_t
+hammer2_lockcnt_pack(uint32_t total, uint32_t self)
+{
+	return ((uint64_t)self << 32 | (uint64_t)total);
+}
+
+static __inline uint32_t
+hammer2_lockcnt_total(uint64_t lockcnt)
+{
+	return ((uint32_t)lockcnt);
+}
+
+static __inline uint32_t
+hammer2_lockcnt_self(uint64_t lockcnt)
+{
+	return ((uint32_t)(lockcnt >> 32));
+}
+
+/*
  * Primary chain structure keeps track of the topology in-memory.
  */
 struct hammer2_chain {
@@ -359,7 +404,7 @@ struct hammer2_chain {
 	hammer2_io_t		*dio;		/* physical data buffer */
 	hammer2_media_data_t	*data;		/* data pointer shortcut */
 	unsigned int		refs;
-	unsigned int		lockcnt;
+	uint64_t		lockcnt;	/* packed total (low) / self (high) */
 	unsigned int		flags;		/* for HAMMER2_CHAIN_xxx */
 	unsigned int		bytes;		/* physical data size */
 	int			error;		/* on-lock data error state */
@@ -1071,7 +1116,6 @@ struct hammer2_dev {
 	TAILQ_ENTRY(hammer2_dev) mntentry;	/* hammer2_mntlist */
 	hammer2_devvp_list_t	devvp_list;	/* list of device vnodes including *devvp */
 	hammer2_io_hash_t	iohash[HAMMER2_IOHASH_SIZE];
-	hammer2_mtx_t		iohash_lock;
 	hammer2_pfs_t		*spmp;		/* super-root pmp for transactions */
 	struct vnode		*devvp;		/* device vnode for root volume */
 	hammer2_chain_t		vchain;		/* anchor chain (topology) */

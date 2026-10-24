@@ -116,6 +116,18 @@ struct hammer2_ioc_bulkfree {
 typedef struct hammer2_ioc_bulkfree hammer2_ioc_bulkfree_t;
 
 /*
+ * Reconnect a cluster to a new file descriptor (upstream remote-cluster
+ * ioctl).  This port is single-node only: the ioctl is accepted for ABI
+ * parity and is a no-op.
+ */
+struct hammer2_ioc_recluster {
+	int			fd;
+	char			reserved[256 - 4];
+};
+
+typedef struct hammer2_ioc_recluster hammer2_ioc_recluster_t;
+
+/*
  * Unconditionally delete a hammer2 directory entry or inode number.
  */
 struct hammer2_ioc_destroy {
@@ -229,6 +241,7 @@ typedef struct hammer2_ioc_send hammer2_ioc_send_t;
  * Ioctl list.
  */
 #define HAMMER2IOC_VERSION_GET		_IOWR('h', 64, struct hammer2_ioc_version)
+#define HAMMER2IOC_RECLUSTER		_IOWR('h', 65, struct hammer2_ioc_recluster)
 #define HAMMER2IOC_PFS_GET		_IOWR('h', 80, struct hammer2_ioc_pfs)
 #define HAMMER2IOC_PFS_CREATE		_IOWR('h', 81, struct hammer2_ioc_pfs)
 #define HAMMER2IOC_PFS_DELETE		_IOWR('h', 82, struct hammer2_ioc_pfs)
@@ -245,6 +258,7 @@ typedef struct hammer2_ioc_send hammer2_ioc_send_t;
  */
 #define HAMMER2IOC_DEBUG_DUMP		_IOWR('h', 91, int)
 #define HAMMER2IOC_BULKFREE_SCAN	_IOWR('h', 92, struct hammer2_ioc_bulkfree)
+#define HAMMER2IOC_BULKFREE_ASYNC	_IOWR('h', 93, struct hammer2_ioc_bulkfree)
 #define HAMMER2IOC_DESTROY		_IOWR('h', 94, struct hammer2_ioc_destroy)
 #define HAMMER2IOC_EMERG_MODE		_IOWR('h', 95, int)
 #define HAMMER2IOC_GROWFS		_IOWR('h', 96, struct hammer2_ioc_growfs)

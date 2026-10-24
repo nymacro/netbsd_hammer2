@@ -247,17 +247,22 @@ hammer2_inode_lock(hammer2_inode_t *ip, int how)
 	/*
 	 * Inode structure mutex - Exclusive lock
 	 *
-	 * An exclusive lock (if not recursive) must wait for inodes on
-	 * SYNCQ to flush first, to ensure that meta-data dependencies such
-	 * as the nlink count and related directory entries are not split
-	 * across flushes.
+	 * An exclusive lock must wait for inodes on SYNCQ to flush first, to
+	 * ensure that meta-data dependencies such as the nlink count and
+	 * related directory entries are not split across flushes.
+	 *
+	 * Inode locking is NOT recursive in this port: the NetBSD rwlock
+	 * shim would self-deadlock on a second exclusive acquisition by
+	 * the same thread, so there is no recursive depth to detect here.
+	 * (Upstream DragonFly returns early when mtx refs > 1, i.e. when
+	 * the lock is already held by this thread.)  The KASSERT documents
+	 * the invariant: exactly one acquisition (ours) is live.
 	 *
 	 * If the vnode is locked by the current thread it must be unlocked
 	 * across the tsleep() to avoid a deadlock.
 	 */
 	hammer2_mtx_ex(&ip->lock);
-	if (hammer2_mtx_refs(&ip->lock) > 1)
-		return;
+	KKASSERT(hammer2_mtx_refs(&ip->lock) == 1);
 	while ((ip->flags & HAMMER2_INODE_SYNCQ) && pmp) {
 		hammer2_spin_ex(&pmp->list_spin);
 		if (ip->flags & HAMMER2_INODE_SYNCQ) {
@@ -1052,12 +1057,9 @@ hammer2_inode_create_normal(hammer2_inode_t *pip, struct vattr *vap,
 	 * directly embedded in the inode.  This flag will be cleared if
 	 * the size is extended past the embedded limit.
 	 */
-	/* XXX chlock: HAMMER2_OPFLAG_DIRECTDATA is currently disabled. */
-#if 0
 	if (nip->meta.type == HAMMER2_OBJTYPE_REGFILE ||
 	    nip->meta.type == HAMMER2_OBJTYPE_SOFTLINK)
 		nip->meta.op_flags |= HAMMER2_OPFLAG_DIRECTDATA;
-#endif
 	/*
 	 * Create the inode using (inum) as the key.  Pass pip for
 	 * method inheritance.

@@ -239,6 +239,13 @@ hammer2_mtx_owned(hammer2_mtx_t *p)
 	return (rw_write_held(&p->lock));
 }
 
+/* Non-zero if shared-locked by the calling thread (read lock). */
+static __inline int
+hammer2_mtx_sh_held(hammer2_mtx_t *p)
+{
+	return (rw_read_held(&p->lock));
+}
+
 #ifdef INVARIANTS
 static __inline void
 hammer2_mtx_assert_ex(hammer2_mtx_t *p)

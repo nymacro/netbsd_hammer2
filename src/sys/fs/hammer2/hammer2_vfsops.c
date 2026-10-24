@@ -1179,7 +1179,6 @@ next_hmp:
 		hmp->hflags = args->hflags & HMNT2_DEVFLAGS;
 
 		TAILQ_INSERT_TAIL(&hammer2_mntlist, hmp, mntentry);
-		hammer2_mtx_init(&hmp->iohash_lock, "h2dev_iohash");
 		hammer2_io_hash_init(hmp);
 
 		hammer2_lk_init(&hmp->vollk, "h2dev_vol");
@@ -1911,16 +1910,13 @@ again:
 	 */
 	hammer2_chain_drop(&hmp->fchain);
 
-	hammer2_mtx_ex(&hmp->iohash_lock);
 	hammer2_io_hash_cleanup_all(hmp);
 	if (hmp->iofree_count) {
 		hprintf("XXX %d I/O's left hanging\n", hmp->iofree_count);
 		//KKASSERT(0); /* XXX2 enable this */
 	}
-	hammer2_mtx_unlock(&hmp->iohash_lock);
 
 	TAILQ_REMOVE(&hammer2_mntlist, hmp, mntentry);
-	hammer2_mtx_destroy(&hmp->iohash_lock);
 	hammer2_io_hash_destroy(hmp);
 
 	hammer2_lk_destroy(&hmp->vollk);
@@ -2678,6 +2674,15 @@ restart:
 		 *	 loop can livelock against that frontend.
 		 */
 		if (dorestart & 2) {
+			/*
+			 * Wake any frontend stalled in
+			 * hammer2_pfs_memory_wait() (it sleeps on
+			 * &pmp->inmem_dirty_chains with a 1s timeout):
+			 * the restart below is exactly the progress it
+			 * is waiting for, so do not make it pay the
+			 * full timeout (upstream caf661fcf8).
+			 */
+			wakeup(&pmp->inmem_dirty_chains);
 			tsleep(&dorestart, 0, "h2syndel", 2);
 			++syndel_loops;
 			if (syndel_loops >= 15 * 30) {

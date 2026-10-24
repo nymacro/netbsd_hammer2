@@ -603,6 +603,12 @@ hammer2_bulkfree_pass(hammer2_dev_t *hmp, hammer2_chain_t *vchain,
 	 */
 	error = 0;
 	while (cbinfo.sbase < hmp->total_size) {
+		if (hmp->bulkfree_quit) {
+			/* Unmount teardown (M3): stop starting new passes. */
+			error |= HAMMER2_ERROR_ABORTED;
+			break;
+		}
+
 		/*
 		 * We have enough ram to represent (incr) bytes of storage.
 		 * Each 32KB of ram represents 1GB of storage.
@@ -811,6 +817,15 @@ h2_bulkfree_callback(hammer2_bulkfree_info_t *cbinfo, hammer2_blockref_t *bref)
 		cbinfo->signaled = 1;
 		return (HAMMER2_ERROR_ABORTED);
 	}
+
+	/*
+	 * Unmount teardown in progress (forced umount while this pass is
+	 * in flight): abort the pass promptly so the unmount's bflk
+	 * acquisition can proceed.  The abort unwinds through the normal
+	 * signal-abort path (save-list cleanup, freemap sync skipped).
+	 */
+	if (cbinfo->hmp->bulkfree_quit)
+		return (HAMMER2_ERROR_ABORTED);
 
 	/*
 	 * Deal with kernel thread cpu or I/O hogging by limiting the

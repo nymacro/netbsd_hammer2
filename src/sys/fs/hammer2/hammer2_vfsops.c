@@ -1819,6 +1819,18 @@ again:
 	hmp->bulkfree_quit = 1;
 
 	/*
+	 * Wait out an in-flight bulkfree pass: acquiring bflk exclusively
+	 * guarantees no pass is running when we return (a pass holds bflk
+	 * for its whole duration and aborts promptly once it notices
+	 * bulkfree_quit).  Lock-order safety: the pass holds bflk and only
+	 * TRYENTERS hammer2_mntlk (aborting on quit, never blocking), so
+	 * this mntlk->bflk acquisition cannot deadlock against the pass's
+	 * bflk->mntlk ordering.
+	 */
+	hammer2_lk_ex(&hmp->bflk);
+	hammer2_lk_unlock(&hmp->bflk);
+
+	/*
 	 * Reap `hammer2 send` sessions of this device (a killed sender
 	 * must not wedge the unmount with held chain references, nor
 	 * leak a pin keyed by this hammer2_dev_t into a future mount).

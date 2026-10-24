@@ -1440,8 +1440,14 @@ hammer2_truncate_file(hammer2_inode_t *ip, hammer2_key_t nsize)
 		 * Zero the tail through the UVM pages (the same memory the
 		 * buffer cache maps for this vnode), then dirty the block
 		 * so the zeroed range is rewritten to media, mirroring
-		 * ffs_truncate().  A fully-zero block is detected by the
-		 * strategy code and stored as a hole.
+		 * ffs_truncate().  The retained tail block is READ first
+		 * (bread) and only then partially zeroed: the block can
+		 * pre-exist with real content (we shrink into a populated
+		 * block, or the block is a zero-filled hole), and getblk()
+		 * would return raw pool memory -- committing it with
+		 * bawrite() overwrites the preserved prefix with garbage.
+		 * A fully-zero block is detected by the strategy code and
+		 * stored as a hole.
 		 */
 		if (nsize & (lblksize - 1)) {
 			hammer2_key_t lbase = nsize &
@@ -1449,12 +1455,27 @@ hammer2_truncate_file(hammer2_inode_t *ip, hammer2_key_t nsize)
 			hammer2_key_t lbn = lbase / lblksize;
 			struct buf *bp;
 			size_t off = (size_t)(nsize - lbase);
+			int berror;
 
 			ubc_zerorange(&vp->v_uobj, (off_t)nsize,
 			    (size_t)lblksize - off, UBC_VNODE_FLAGS(vp));
-			bp = getblk(vp, lbn, lblksize, 0, 0);
-			memset((char *)bp->b_data + off, 0, lblksize - off);
-			bawrite(bp);
+			berror = bread(vp, lbn, lblksize, 0, &bp);
+			if (berror) {
+				/*
+				 * Do not fail the truncate: the
+				 * INODE_RESIZED dead-block removal still
+				 * bounds the damage.  Just skip the
+				 * tail-zero write.
+				 */
+				hprintf("truncate: tail bread lbn %lld "
+				    "failed %d\n", (long long)lbn, berror);
+				if (bp)
+					brelse(bp, 0);
+			} else {
+				memset((char *)bp->b_data + off, 0,
+				    lblksize - off);
+				bawrite(bp);
+			}
 		}
 		uvm_vnp_setsize(vp, nsize);
 		uvm_vnp_setwritesize(vp, nsize);

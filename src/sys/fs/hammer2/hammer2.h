@@ -276,6 +276,7 @@ struct hammer2_io {
 	int			btype;
 	int			ticks;
 	int			error;
+	uint64_t		id;		/* unique dio instance serial */
 #ifdef HAMMER2_IO_DEBUG
 	int			debug_index;
 #else
@@ -408,6 +409,7 @@ struct hammer2_chain {
 	unsigned int		flags;		/* for HAMMER2_CHAIN_xxx */
 	unsigned int		bytes;		/* physical data size */
 	int			error;		/* on-lock data error state */
+	uint64_t		tested_id;	/* dio instance TESTEDGOOD covers */
 	int			cache_index;	/* heur speeds up lookup */
 };
 
@@ -1246,6 +1248,7 @@ extern int hammer2_cluster_meta_read;
 extern int hammer2_cluster_data_read;
 extern int hammer2_debug;
 extern int hammer2_debug_scratch_fail;
+extern uint64_t hammer2_dio_seq;
 extern long hammer2_process_icrc32;
 extern long hammer2_process_xxhash64;
 extern int hammer2_flush_pipe;

@@ -184,6 +184,7 @@ hammer2_io_alloc(hammer2_dev_t *hmp, hammer2_off_t data_off, uint8_t btype,
 		dio->pbase = pbase;
 		dio->psize = psize;
 		dio->btype = btype;
+		dio->id = atomic_inc_64_nv(&hammer2_dio_seq);
 		dio->refs = 1;
 		dio->act = 5;
 		hammer2_lk_init(&dio->waitlk, "h2dio");

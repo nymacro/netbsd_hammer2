@@ -998,20 +998,31 @@ again:
 		hammer2_io_t *dio;
 
 		if ((dio = chain->dio) != NULL && dio->bp) {
-			struct buf *bp = dio->bp;
-
 			/*
 			 * Any chain fully covered by the re-read buffer must
 			 * re-verify.  Chains smaller than the physical buffer
 			 * (e.g. 1KB inode records in a 64KB buffer) share the
 			 * buffer with siblings, so a re-read of the buffer
 			 * reloaded their bytes from media too.
+			 *
+			 * NetBSD port: instead of consuming the shared
+			 * B_IOISSUED flag on the buffer (first loader wins,
+			 * sibling chains loading the same buffer kept their
+			 * stale TESTEDGOOD), each dio instance carries a
+			 * unique creation serial (dio->id).  A chain
+			 * re-verifies exactly once per dio instance: a dio
+			 * created for a re-read after disposal has a new id,
+			 * so every sibling sharing the buffer re-verifies,
+			 * while chains loading data still cached in the
+			 * SAME dio instance keep their tested state (no
+			 * per-load CRC overhead).  The serial never repeats
+			 * for a new dio object, so recreation after
+			 * disposal cannot alias a chain's recorded id.
 			 */
 			if ((u_int)dio->psize >= chain->bytes &&
-			    (bp->b_flags & B_IOISSUED)) {
+			    dio->id != chain->tested_id) {
 				atomic_clear_int(&chain->flags,
 				    HAMMER2_CHAIN_TESTEDGOOD);
-				bp->b_flags &= ~B_IOISSUED;
 			}
 		}
 	}
@@ -1043,10 +1054,13 @@ again:
 		 * to calculate crc?  or simple crc?).
 		 */
 	} else if ((chain->flags & HAMMER2_CHAIN_TESTEDGOOD) == 0) {
-		if (hammer2_chain_testcheck(chain, bdata) == 0)
+		if (hammer2_chain_testcheck(chain, bdata) == 0) {
 			chain->error = HAMMER2_ERROR_CHECK;
-		else
+		} else {
 			atomic_set_int(&chain->flags, HAMMER2_CHAIN_TESTEDGOOD);
+			if (chain->dio)
+				chain->tested_id = chain->dio->id;
+		}
 	}
 
 	/*

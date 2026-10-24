@@ -95,6 +95,7 @@ hammer2_lk_t hammer2_mntlk;
 static int hammer2_supported_version = HAMMER2_VOL_VERSION_DEFAULT;
 int hammer2_debug;
 int hammer2_debug_scratch_fail;
+uint64_t hammer2_dio_seq;
 long hammer2_process_icrc32;
 long hammer2_process_xxhash64;
 int hammer2_dedup_enable = 1;

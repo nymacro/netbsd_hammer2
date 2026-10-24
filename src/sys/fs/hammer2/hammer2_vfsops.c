@@ -1853,7 +1853,7 @@ again:
 		hprintf("chains left over after final sync "
 		    "vchain %08x fchain %08x\n",
 		    hmp->vchain.flags, hmp->fchain.flags);
-		KKASSERT(0);
+		/* Upstream prints and continues the teardown in this case. */
 	}
 
 	hammer2_pfsfree_scan(hmp, 1);
@@ -1870,19 +1870,19 @@ again:
 	 * Clear vchain/fchain flags that might prevent final cleanup
 	 * of these chains.
 	 */
-	if (hmp->vchain.flags & HAMMER2_CHAIN_MODIFIED) {
-		atomic_add_int(&hammer2_count_chain_modified, -1);
-		atomic_clear_int(&hmp->vchain.flags, HAMMER2_CHAIN_MODIFIED);
-	}
-	if (hmp->vchain.flags & HAMMER2_CHAIN_UPDATE)
-		atomic_clear_int(&hmp->vchain.flags, HAMMER2_CHAIN_UPDATE);
-
 	if (hmp->fchain.flags & HAMMER2_CHAIN_MODIFIED) {
 		atomic_add_int(&hammer2_count_chain_modified, -1);
 		atomic_clear_int(&hmp->fchain.flags, HAMMER2_CHAIN_MODIFIED);
 	}
 	if (hmp->fchain.flags & HAMMER2_CHAIN_UPDATE)
 		atomic_clear_int(&hmp->fchain.flags, HAMMER2_CHAIN_UPDATE);
+
+	if (hmp->vchain.flags & HAMMER2_CHAIN_MODIFIED) {
+		atomic_add_int(&hammer2_count_chain_modified, -1);
+		atomic_clear_int(&hmp->vchain.flags, HAMMER2_CHAIN_MODIFIED);
+	}
+	if (hmp->vchain.flags & HAMMER2_CHAIN_UPDATE)
+		atomic_clear_int(&hmp->vchain.flags, HAMMER2_CHAIN_UPDATE);
 
 #if 0 /* kept for future debug (upstream 40e5c5625b: dumps disabled on unmount) */
 	{
@@ -1895,20 +1895,20 @@ again:
 	}
 #endif
 	/*
-	 * Final drop of embedded volume root chain to clean
-	 * up vchain.core (vchain structure is not flagged
-	 * ALLOCATED so it is cleaned out and then left to
-	 * rot).
-	 */
-	hammer2_chain_drop(&hmp->vchain);
-
-	/*
 	 * Final drop of embedded freemap root chain to
 	 * clean up fchain.core (fchain structure is not
 	 * flagged ALLOCATED so it is cleaned out and then
 	 * left to rot).
 	 */
 	hammer2_chain_drop(&hmp->fchain);
+
+	/*
+	 * Final drop of embedded volume root chain to clean
+	 * up vchain.core (vchain structure is not flagged
+	 * ALLOCATED so it is cleaned out and then left to
+	 * rot).
+	 */
+	hammer2_chain_drop(&hmp->vchain);
 
 	hammer2_io_hash_cleanup_all(hmp);
 	if (hmp->iofree_count) {
@@ -2945,7 +2945,13 @@ hammer2_loadvnode(struct mount *mp, struct vnode *vp,
 	 * ip is temporarily unlocked by caller (hammer2_igetv()).
 	 */
 	ip = hammer2_inode_lookup(pmp, inum);
-	KASSERTMSG(ip, "inode lookup failed for inum %llu", (long long)inum);
+	if (ip == NULL) {
+		/* Corrupt hash state: fail the vnode load instead of
+		 * dereferencing NULL. */
+		hprintf("inode lookup failed for inum %llu\n",
+		    (long long)inum);
+		return (EINVAL);
+	}
 	/*
 	 * No hammer2_mtx_assert_unlocked(&ip->lock): rw_lock_held() is a
 	 * global check (can't express "not held by self"), and another

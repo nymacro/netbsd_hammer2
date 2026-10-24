@@ -74,6 +74,7 @@ typedef struct hammer2_bulkfree_info {
 	long			count_chains_scanned;
 	long			count_chains_reported;
 	long			bulkfree_calls;
+	time_t			save_time;
 	int			bulkfree_ticks;
 	int			list_alert;
 	hammer2_off_t		adj_free;
@@ -804,7 +805,7 @@ h2_bulkfree_callback(hammer2_bulkfree_info_t *cbinfo, hammer2_blockref_t *bref)
 	int radix, dticks, bindex, sig;
 
 	/* Check for signal and allow yield to userland during scan. */
-	sig = hammer2_signal_check();
+	sig = hammer2_signal_check(&cbinfo->save_time);
 	if (sig != 0 && cbinfo->signaled == 0) {
 		hprintf("pending signal %d\n", sig);
 		cbinfo->signaled = 1;

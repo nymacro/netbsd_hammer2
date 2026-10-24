@@ -1514,7 +1514,7 @@ int hammer2_calc_physical(hammer2_inode_t *, hammer2_key_t);
 void hammer2_update_time(uint64_t *);
 void hammer2_inc_iostat(hammer2_iostat_t *, int, size_t);
 void hammer2_print_iostat(const hammer2_iostat_t *, const char *);
-int hammer2_signal_check(void);
+int hammer2_signal_check(time_t *);
 const char *hammer2_bref_type_str(uint8_t);
 const char *hammer2_error_str(int error);
 uid_t hammer2_inode_to_uid(const hammer2_inode_t *);

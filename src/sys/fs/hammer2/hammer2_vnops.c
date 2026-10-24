@@ -1359,6 +1359,16 @@ hammer2_write(void *v)
 
 	switch (hammer2_vfs_enospace(ip, uio->uio_resid, ap->a_cred)) {
 	case 2:
+		/*
+		 * Pager writes (genfs_do_putpages -> hammer2_gop_write)
+		 * must return ENOMEM, never ENOSPC: uvm_aio_aiodone
+		 * re-dirties pages only on ENOMEM and DROPS the dirty
+		 * data on any other pager write error (uvm_pager.c
+		 * "bummer" path).  ENOMEM is a transient failure from
+		 * uvm's point of view, so the pages get retried.
+		 */
+		if (ioflag & HAMMER2_IO_PAGER)
+			return (ENOMEM);
 		return (ENOSPC);
 	case 1:
 		ioflag |= IO_DIRECT; /* semi-synchronous */

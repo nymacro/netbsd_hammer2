@@ -381,20 +381,26 @@ hammer2_print_iostat(const hammer2_iostat_t *ios, const char *msg)
 }
 
 /*
- * Check for pending signal to allow interruption.  This function will
- * return immediately if the calling thread is a kernel thread and not
- * a user thread.
+ * Check for pending signal to allow interruption.  The check is
+ * throttled to once per second via the caller's *timep (upstream
+ * hammer2_signal_check semantics), so a transient signal during a
+ * long pass does not necessarily abort it.
  */
 int
-hammer2_signal_check(void)
+hammer2_signal_check(time_t *timep)
 {
 	struct lwp *l = curlwp;
 	struct proc *p = l->l_proc;
 	int sig;
 
-	mutex_enter(p->p_lock);
-	sig = sigispending(l, 0);
-	mutex_exit(p->p_lock);
+	if (*timep != time_second) {
+		*timep = time_second;
+		mutex_enter(p->p_lock);
+		sig = sigispending(l, 0);
+		mutex_exit(p->p_lock);
+	} else {
+		sig = 0;
+	}
 
 	return (sig);
 }

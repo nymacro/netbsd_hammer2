@@ -2372,6 +2372,15 @@ again:
 		 * blocking (we don't want to block on a second shared
 		 * ref if an exclusive lock is pending).
 		 */
+		if (parent->data == NULL) {
+			/*
+			 * Corrupt/incomplete inode: controlled failure
+			 * instead of a NULL dereference on the
+			 * embedded-data shortcut.
+			 */
+			*errorp = HAMMER2_ERROR_INCOMPLETE;
+			return (NULL);
+		}
 		if (parent->data->ipdata.meta.op_flags &
 		    HAMMER2_OPFLAG_DIRECTDATA) {
 			if (flags & HAMMER2_LOOKUP_NODIRECT) {
@@ -2398,6 +2407,14 @@ again:
 		 */
 		if (parent->flags & HAMMER2_CHAIN_INITIAL) {
 			base = NULL;
+		} else if (parent->data == NULL) {
+			/*
+			 * Corrupt/incomplete indirect block: controlled
+			 * failure instead of a NULL dereference on
+			 * non-DIAGNOSTIC kernels (assert class kept).
+			 */
+			*errorp = HAMMER2_ERROR_INCOMPLETE;
+			return (NULL);
 		} else {
 			KKASSERT(parent->data);
 			base = &parent->data->npdata[0];
@@ -4860,7 +4877,13 @@ hammer2_chain_setcheck(hammer2_chain_t *chain, void *bdata)
 		    hammer2_icrc32(bdata, chain->bytes);
 		break;
 	default:
-		hpanic("bad check type %02x", chain->bref.methods);
+		/*
+		 * Unknown check method (corrupt bref): do not panic the
+		 * flush path, leave the check data stale (upstream prints
+		 * and continues the same way).
+		 */
+		hprintf("hammer2_chain_setcheck: unknown check type %02x\n",
+		    chain->bref.methods);
 		break;
 	}
 }

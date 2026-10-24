@@ -957,17 +957,26 @@ hammer2_ioctl_growfs(hammer2_inode_t *ip, void *data)
 			break;
 		hprintf("growfs - clear volhdr %d\n", i);
 		blkno = i * HAMMER2_ZONE_BYTES64 / DEV_BSIZE;
-		error = bread(hmp->devvp, blkno, HAMMER2_VOLUME_BYTES, 0, &bp);
-		if (error) {
-			hprintf("I/O error %d\n", error);
-			return (EINVAL);
-		}
+		/*
+		 * Never use bread(9) for the 64KB volume header: the buffer
+		 * cache may already hold a smaller buffer for the same
+		 * (vnode, blkno).  Use an unkeyed geteblk() buffer driven
+		 * through VOP_STRATEGY, like hammer2_read_volume_header().
+		 */
+		bp = geteblk(HAMMER2_VOLUME_BYTES);
+		bp->b_blkno = bp->b_lblkno = bp->b_rawblkno = blkno;
+		bp->b_bcount = HAMMER2_VOLUME_BYTES;
+		bp->b_flags &= ~B_READ;		/* write */
+		bp->b_oflags &= ~BO_DONE;
 		bzero(bp->b_data, HAMMER2_VOLUME_BYTES);
-		error = bwrite(bp);
+		VOP_STRATEGY(hmp->devvp, bp);
+		error = biowait(bp);
 		if (error) {
 			hprintf("I/O error %d\n", error);
+			brelse(bp, BC_INVAL);
 			return (EINVAL);
 		}
+		brelse(bp, 0);
 	}
 
 	hammer2_trans_init(hmp->spmp, HAMMER2_TRANS_ISFLUSH);

@@ -251,6 +251,72 @@ hammer2_chain_init(hammer2_chain_t *chain)
 	hammer2_lk_init(&chain->inp_lock, "h2ch_inp");
 	hammer2_lkc_init(&chain->inp_cv, "h2ch_inp_cv");
 	hammer2_spin_init(&chain->core.spin, "h2ch_core");
+	hammer2_spin_init(&chain->lka_spin, "h2ch_lka");
+}
+
+/*
+ * Register a LOCKAGAIN self credit for curlwp in the owner table (the
+ * credit itself is accounted in lockcnt by the caller).  Only the
+ * creator may consume the credit on unlock, keeping per-thread
+ * mtx enter/exit counts balanced under any unlock order.
+ */
+static void
+hammer2_chain_lka_add(hammer2_chain_t *chain)
+{
+	struct lwp *l = curlwp;
+	int i;
+
+	for (;;) {
+		hammer2_spin_ex(&chain->lka_spin);
+		for (i = 0; i < HAMMER2_CHAIN_LKA_SIZE; ++i) {
+			if (chain->lka[i].lwp == l) {
+				++chain->lka[i].cnt;
+				hammer2_spin_unex(&chain->lka_spin);
+				return;
+			}
+		}
+		for (i = 0; i < HAMMER2_CHAIN_LKA_SIZE; ++i) {
+			if (chain->lka[i].lwp == NULL) {
+				chain->lka[i].lwp = l;
+				chain->lka[i].cnt = 1;
+				hammer2_spin_unex(&chain->lka_spin);
+				return;
+			}
+		}
+		/*
+		 * All slots taken (>= 5 concurrent LOCKAGAIN holders of this
+		 * chain).  Slots free quickly -- no holder can keep a slot
+		 * indefinitely (the credit is consumed by its creator's own
+		 * unlock) -- so a short spin-retry cannot deadlock.
+		 */
+		hammer2_spin_unex(&chain->lka_spin);
+		kpause("h2lka", false, 1, NULL);
+	}
+}
+
+/*
+ * Consume one LOCKAGAIN self credit owned by curlwp.  Returns 1 if a
+ * credit was consumed (the caller must then drop total AND self from
+ * lockcnt and NOT release the mtx), 0 if curlwp owns no credit (the
+ * caller takes the plain path: total-1 with the mtx release).
+ */
+static int
+hammer2_chain_lka_consume(hammer2_chain_t *chain)
+{
+	struct lwp *l = curlwp;
+	int i;
+
+	hammer2_spin_ex(&chain->lka_spin);
+	for (i = 0; i < HAMMER2_CHAIN_LKA_SIZE; ++i) {
+		if (chain->lka[i].lwp == l) {
+			if (--chain->lka[i].cnt == 0)
+				chain->lka[i].lwp = NULL;
+			hammer2_spin_unex(&chain->lka_spin);
+			return (1);
+		}
+	}
+	hammer2_spin_unex(&chain->lka_spin);
+	return (0);
 }
 
 /*
@@ -812,6 +878,7 @@ hammer2_chain_lock(hammer2_chain_t *chain, int how)
 		if (how & HAMMER2_RESOLVE_LOCKAGAIN) {
 			KKASSERT(hammer2_mtx_sh_held(&chain->lock) ||
 			    hammer2_mtx_owned(&chain->lock));
+			hammer2_chain_lka_add(chain);
 			atomic_add_64(&chain->lockcnt,
 			    1 | HAMMER2_LOCKCNT_SELF_ONE);
 		} else if (how & HAMMER2_RESOLVE_SHARED) {
@@ -839,6 +906,7 @@ hammer2_chain_lock(hammer2_chain_t *chain, int how)
 		if (how & HAMMER2_RESOLVE_LOCKAGAIN) {
 			KKASSERT(hammer2_mtx_sh_held(&chain->lock) ||
 			    hammer2_mtx_owned(&chain->lock));
+			hammer2_chain_lka_add(chain);
 			atomic_add_64(&chain->lockcnt,
 			    1 | HAMMER2_LOCKCNT_SELF_ONE);
 		} else if (how & HAMMER2_RESOLVE_SHARED) {
@@ -1134,17 +1202,37 @@ hammer2_chain_unlock(hammer2_chain_t *chain)
 		cpu_ccfence();
 
 		if (total > 1) {
-			if (self > 0)
+			/*
+			 * Consume a self credit ONLY if curlwp created one
+			 * (pinned in the lka table).  A credit consumption does
+			 * not release the mtx -- the mtx exits are matched to
+			 * the real acquisitions, so the last unlock (1->0) is
+			 * performed by a thread that actually holds the mutex.
+			 * Any other unlocker takes the plain path: total-1 with
+			 * the mtx release (it entered the mtx for its own real
+			 * lock).
+			 */
+			int consume = 0;
+
+			if (self > 0 && hammer2_chain_lka_consume(chain))
+				consume = 1;
+			if (consume)
 				nlockcnt = lockcnt - 1 -
 				    HAMMER2_LOCKCNT_SELF_ONE;
 			else
 				nlockcnt = lockcnt - 1;
 			if (atomic_cmpset_64(&chain->lockcnt, lockcnt,
 			    nlockcnt)) {
-				if (self == 0)
+				if (!consume)
 					hammer2_mtx_unlock(&chain->lock);
 				return;
 			}
+			/*
+			 * cmpset failed: put a consumed credit back (the retry
+			 * below re-evaluates from scratch).
+			 */
+			if (consume)
+				hammer2_chain_lka_add(chain);
 		} else if (hammer2_mtx_upgrade_try(&chain->lock) == 0) {
 			/* while holding the mutex exclusively */
 			KKASSERT(self == 0);

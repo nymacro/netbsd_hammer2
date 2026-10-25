@@ -360,15 +360,29 @@ typedef struct hammer2_chain_core hammer2_chain_core_t;
  * high 32 bits count "self" locks.  A self lock is a logical lock taken
  * with HAMMER2_RESOLVE_LOCKAGAIN: the caller already owns the chain's
  * mtx (it is resolving a DIRECTDATA lookup on a chain it holds), so the
- * lock is accounted but no second mtx acquisition is made.  The unlock
- * path consumes a self credit first, which keeps mtx exits exactly
- * matched to real acquisitions regardless of unlock order (shared
- * readers are anonymous).
+ * lock is accounted but no second mtx acquisition is made.
+ *
+ * Each self credit is PINNED to the LWP that created it (chain->lka[]):
+ * only the credit's creator may consume it on unlock, so the per-thread
+ * invariant "rw_exit count == rw_enter count" holds under ANY unlock
+ * order.  The unlock path consumes a self credit (no mtx exit) only
+ * when curlwp owns a table slot; any other unlocker takes the plain
+ * path (total-1 + mtx exit), which is correct because it entered the
+ * mtx for its own real lock.  (An earlier version let ANY unlocker
+ * consume any outstanding self credit, which leaked the mtx across
+ * threads and live-spun the final unlocker.)
  *
  * Invariants: self <= total, and total == 1 implies self == 0 (a self
  * lock always coexists with at least one real mtx acquisition).
  */
 #define HAMMER2_LOCKCNT_SELF_ONE	(1ULL << 32)
+
+/*
+ * Self-credit owner table: credits are pinned to their creator LWP.
+ * 4 slots; a 5th concurrent LOCKAGAIN holder of the same chain spins
+ * briefly (holders release quickly, none can hold a slot indefinitely).
+ */
+#define HAMMER2_CHAIN_LKA_SIZE	4
 
 static __inline uint64_t
 hammer2_lockcnt_pack(uint32_t total, uint32_t self)
@@ -406,6 +420,11 @@ struct hammer2_chain {
 	hammer2_media_data_t	*data;		/* data pointer shortcut */
 	unsigned int		refs;
 	uint64_t		lockcnt;	/* packed total (low) / self (high) */
+	struct {				/* LOCKAGAIN credit owners */
+		struct lwp	*lwp;
+		int32_t		cnt;
+	} lka[HAMMER2_CHAIN_LKA_SIZE];
+	hammer2_spin_t		lka_spin;
 	unsigned int		flags;		/* for HAMMER2_CHAIN_xxx */
 	unsigned int		bytes;		/* physical data size */
 	int			error;		/* on-lock data error state */

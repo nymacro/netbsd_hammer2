@@ -331,6 +331,47 @@ hammer2_verify_volumes_common(const hammer2_volume_t *volumes,
 			hprintf("%s has size of 0\n", path);
 			return (EINVAL);
 		}
+
+		/*
+		 * NetBSD port: verify the last block of the volume is
+		 * actually accessible through this device vnode (cf. the
+		 * FFS last-block probe in ffs_vfsops.c).  A partition
+		 * device whose disklabel is smaller than the volume (stale
+		 * label, shrunk partition) silently truncates transfers
+		 * in bounds_check_with_label(): a straddling transfer gets
+		 * its b_bcount reduced (b_resid stays 0), a transfer
+		 * entirely beyond the partition end returns EOF with
+		 * b_resid = b_bcount and no I/O.  Without this probe the
+		 * mount succeeds and the fs silently truncates at the
+		 * partition boundary.  Never use bread(9) here (buffer
+		 * size aliasing rule) -- use the geteblk + strategy
+		 * pattern like hammer2_read_volume_header().
+		 */
+		{
+			struct buf *bp;
+			daddr_t blkno;
+
+			blkno = ((vol->size - 1) &
+			    ~(hammer2_off_t)(HAMMER2_PBUFSIZE - 1)) / DEV_BSIZE;
+			bp = geteblk(HAMMER2_PBUFSIZE);
+			bp->b_blkno = bp->b_lblkno = bp->b_rawblkno = blkno;
+			bp->b_bcount = HAMMER2_PBUFSIZE;
+			bp->b_flags = (bp->b_flags & ~B_WRITE) | B_READ;
+			bp->b_oflags &= ~BO_DONE;
+			VOP_STRATEGY(vol->dev->devvp, bp);
+			error = biowait(bp);
+			if (error || bp->b_resid != 0 ||
+			    bp->b_bcount != HAMMER2_PBUFSIZE) {
+				hprintf("%s: last volume block %lld not "
+				    "accessible (error %d resid %ld bcount "
+				    "%ld) - volume exceeds its partition\n",
+				    path, (long long)blkno, error,
+				    (long)bp->b_resid, (long)bp->b_bcount);
+				brelse(bp, BC_INVAL);
+				return (EINVAL);
+			}
+			brelse(bp, 0);
+		}
 	}
 
 	return (0);

@@ -36,6 +36,8 @@
  */
 
 #include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/mount.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -48,6 +50,7 @@
 #include "mkfs_hammer2.h"
 
 static void parse_fs_size(hammer2_mkfs_options_t *, const char *);
+static void check_not_mounted(const char *);
 static void usage(void);
 
 int
@@ -56,6 +59,8 @@ main(int ac, char **av)
 	hammer2_mkfs_options_t opt;
 	int ch;
 	int label_specified = 0;
+	int force = 0;
+	int ai;
 
 	/*
 	 * Initialize option structure.
@@ -65,10 +70,13 @@ main(int ac, char **av)
 	/*
 	 * Parse arguments.
 	 */
-	while ((ch = getopt(ac, av, "L:b:r:V:s:d")) != -1) {
+	while ((ch = getopt(ac, av, "FL:b:r:V:s:d")) != -1) {
 		int i;
 
 		switch(ch) {
+		case 'F':
+			force = 1;
+			break;
 		case 'b':
 			opt.BootAreaSize = getsize(optarg,
 					 HAMMER2_NEWFS_ALIGN,
@@ -138,6 +146,16 @@ main(int ac, char **av)
 		     HAMMER2_MAX_VOLUMES);
 
 	/*
+	 * Refuse to format a mounted device: writing a new volume header
+	 * over a live mount corrupts the mounted filesystem (and every
+	 * other PFS on the same volume).
+	 */
+	if (!force) {
+		for (ai = 0; ai < ac; ++ai)
+			check_not_mounted(av[ai]);
+	}
+
+	/*
 	 * Check default label type.
 	 */
 	if (!label_specified) {
@@ -187,12 +205,94 @@ parse_fs_size(hammer2_mkfs_options_t *opt, const char *arg)
 	free(o);
 }
 
+/*
+ * Device-name comparison tolerating the raw(4) char-device 'r' prefix
+ * ("rld1d" vs "ld1d"): a mount holds the block device while newfs is
+ * commonly pointed at the character device.
+ */
+static int
+devname_eq(const char *a, const char *b)
+{
+	size_t la = strlen(a), lb = strlen(b);
+
+	if (la == lb && strcasecmp(a, b) == 0)
+		return (1);
+	if (la == lb + 1 && a[0] == 'r' && strcasecmp(a + 1, b) == 0)
+		return (1);
+	if (lb == la + 1 && b[0] == 'r' && strcasecmp(b + 1, a) == 0)
+		return (1);
+	return (0);
+}
+
+static
+void
+check_not_mounted(const char *path)
+{
+	struct stat st;
+	struct statvfs *vfs;
+	int n, i;
+
+	/*
+	 * Only device nodes can be live-mounted; regular files (offline
+	 * disk images) are unaffected.
+	 */
+	if (stat(path, &st) != 0)
+		return;		/* let hammer2_mkfs() report the real error */
+	if (!S_ISBLK(st.st_mode) && !S_ISCHR(st.st_mode))
+		return;
+
+	n = getvfsstat(NULL, 0, ST_WAIT);
+	if (n <= 0)
+		return;
+	vfs = malloc(n * sizeof(*vfs));
+	if (vfs == NULL)
+		return;
+	n = getvfsstat(vfs, n * sizeof(*vfs), ST_WAIT);
+	for (i = 0; i < n; ++i) {
+		char devpath[sizeof(vfs[i].f_mntfromname) + 6];
+		char devname[sizeof(vfs[i].f_mntfromname)];
+		char *at;
+		struct stat mst;
+
+		/*
+		 * hammer2 mount sources carry the PFS label as a "@label"
+		 * suffix ("ld1d@DATA"); strip it before resolving the
+		 * device node.
+		 */
+		snprintf(devname, sizeof(devname), "%s",
+		    vfs[i].f_mntfromname);
+		at = strchr(devname, '@');
+		if (at)
+			*at = '\0';
+		if (devname[0] == '/')
+			snprintf(devpath, sizeof(devpath), "%s", devname);
+		else
+			snprintf(devpath, sizeof(devpath), "/dev/%s", devname);
+		const char *mntbase, *tgtbase;
+
+		if (stat(devpath, &mst) != 0)
+			continue;
+		mntbase = strrchr(devpath, '/');
+		mntbase = mntbase ? mntbase + 1 : devpath;
+		tgtbase = strrchr(path, '/');
+		tgtbase = tgtbase ? tgtbase + 1 : path;
+		if (devname_eq(mntbase, tgtbase) ||
+		    mst.st_rdev == st.st_rdev) {
+			free(vfs);
+			errx(1, "%s is mounted on %s -- newfs would corrupt "
+			    "the live filesystem (use -F to override)",
+			    path, vfs[i].f_mntonname);
+		}
+	}
+	free(vfs);
+}
+
 static
 void
 usage(void)
 {
 	fprintf(stderr,
-		"usage: newfs_hammer2 [-b bootsize] [-r auxsize] "
+		"usage: newfs_hammer2 [-F] [-b bootsize] [-r auxsize] "
 		"[-V version] [-L label ...] [-s size] special ...\n"
 	);
 	exit(1);

@@ -427,6 +427,17 @@ _hammer2_io_getblk(hammer2_dev_t *hmp, int btype, hammer2_off_t lbase,
 		case HAMMER2_DOP_NEW:
 		case HAMMER2_DOP_NEWNZ:
 			dio->bp = getblk(dio->devvp, lblkno, dio->psize, 0, 0);
+			if (dio->bp == NULL) {
+				/*
+				 * NetBSD getblk() returns NULL when
+				 * getnewbuf() cannot allocate and always
+				 * for the pagedaemon (the caller must
+				 * retry later); do not touch the buffer
+				 * and report a transient ENOMEM instead.
+				 */
+				error = ENOMEM;
+				break;
+			}
 			if (op == HAMMER2_DOP_NEW)
 				bzero(dio->bp->b_data, dio->psize);
 			atomic_set_32(&dio->refs, HAMMER2_DIO_DIRTY);

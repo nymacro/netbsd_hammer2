@@ -251,6 +251,8 @@ check_not_mounted(const char *path)
 	for (i = 0; i < n; ++i) {
 		char devpath[sizeof(vfs[i].f_mntfromname) + 6];
 		char devname[sizeof(vfs[i].f_mntfromname)];
+		char mntname[sizeof(vfs[i].f_mntonname)];
+		const char *mntbase, *tgtbase;
 		char *at;
 		struct stat mst;
 
@@ -268,7 +270,6 @@ check_not_mounted(const char *path)
 			snprintf(devpath, sizeof(devpath), "%s", devname);
 		else
 			snprintf(devpath, sizeof(devpath), "/dev/%s", devname);
-		const char *mntbase, *tgtbase;
 
 		if (stat(devpath, &mst) != 0)
 			continue;
@@ -278,10 +279,16 @@ check_not_mounted(const char *path)
 		tgtbase = tgtbase ? tgtbase + 1 : path;
 		if (devname_eq(mntbase, tgtbase) ||
 		    mst.st_rdev == st.st_rdev) {
+			/*
+			 * Copy the mount point before freeing vfs[]: errx()
+			 * must not format the message from freed memory.
+			 */
+			snprintf(mntname, sizeof(mntname), "%s",
+			    vfs[i].f_mntonname);
 			free(vfs);
 			errx(1, "%s is mounted on %s -- newfs would corrupt "
 			    "the live filesystem (use -F to override)",
-			    path, vfs[i].f_mntonname);
+			    path, mntname);
 		}
 	}
 	free(vfs);

@@ -1368,7 +1368,24 @@ next_hmp:
 			error = hammer2_recovery(hmp);
 			if (error == 0)
 				error |= hammer2_fixup_pfses(hmp);
-			/* XXX do something with error */
+			if (error) {
+				/*
+				 * The freemap could not be reconciled with
+				 * the committed topology.  Continuing
+				 * read-write would let the allocator hand
+				 * out blocks that are still referenced and
+				 * corrupt the filesystem, so refuse the
+				 * mount (hammer2_remount_impl() already
+				 * refuses to upgrade an existing mount in
+				 * this situation).
+				 */
+				hprintf("recovery failed %08x, refusing "
+				    "read-write mount\n", error);
+				hammer2_unmount_helper(mp, NULL, hmp);
+				hammer2_lk_unlock(&hammer2_mntlk);
+				hammer2_unmount(mp, MNT_FORCE);
+				return (hammer2_error_to_errno(error));
+			}
 		}
 
 		/*

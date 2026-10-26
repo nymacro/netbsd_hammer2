@@ -298,10 +298,10 @@ main(int ac, char **av)
 		 */
 		switch(ac) {
 		case 2:
-			cmd_show(av[1], NULL, 0);
+			ecode = cmd_show(av[1], NULL, 0);
 			break;
 		case 3:
-			cmd_show(av[1], av[2], 0);
+			ecode = cmd_show(av[1], av[2], 0);
 			break;
 		default:
 			fprintf(stderr, "show: requires device path\n");
@@ -316,7 +316,7 @@ main(int ac, char **av)
 			fprintf(stderr, "freemap: requires device path\n");
 			usage(1);
 		} else {
-			cmd_show(av[1], NULL, 1);
+			ecode = cmd_show(av[1], NULL, 1);
 		}
 	} else if (strcmp(av[0], "volhdr") == 0) {
 		/*
@@ -326,7 +326,7 @@ main(int ac, char **av)
 			fprintf(stderr, "volhdr: requires device path\n");
 			usage(1);
 		} else {
-			cmd_show(av[1], NULL, 2);
+			ecode = cmd_show(av[1], NULL, 2);
 		}
 	} else if (strcmp(av[0], "volume-list") == 0) {
 		/*

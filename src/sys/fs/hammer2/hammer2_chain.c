@@ -1034,10 +1034,16 @@ again:
 		error = hammer2_io_bread(hmp, bref->type, bref->data_off,
 		    chain->bytes, &chain->dio);
 	if (error) {
+		/*
+		 * Preserve the error class: a transient allocation failure
+		 * (ENOMEM from getblk()/hammer2_bread()) must not be
+		 * reported as a media EIO, which callers treat as
+		 * corruption.
+		 */
 		hprintf("%s blockref I/O error %d at %016llx\n",
 		    hammer2_bref_type_str(bref->type), error,
 		    (long long)bref->data_off);
-		chain->error = HAMMER2_ERROR_EIO;
+		chain->error = hammer2_errno_to_error(error);
 		hammer2_io_bqrelse(&chain->dio);
 		goto done;
 	}
@@ -1832,7 +1838,7 @@ hammer2_chain_modify(hammer2_chain_t *chain, hammer2_tid_t mtid,
 			hprintf("%s blockref I/O error %d at %016llx\n",
 			    hammer2_bref_type_str(chain->bref.type), error,
 			    (long long)chain->bref.data_off);
-			chain->error = HAMMER2_ERROR_EIO;
+			chain->error = hammer2_errno_to_error(error);
 			hammer2_io_brelse(&dio);
 			hammer2_io_brelse(&chain->dio);
 			chain->data = NULL;

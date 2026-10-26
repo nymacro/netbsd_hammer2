@@ -99,6 +99,7 @@ cmd_show(const char *devpath, const char *chspec, int which)
 	int bests[HAMMER2_MAX_VOLUMES];
 	int fd;
 	int i, j;
+	int ret = 0;
 	char *env;
 
 	memset(bests, 0xff, sizeof(bests));
@@ -149,15 +150,23 @@ cmd_show(const char *devpath, const char *chspec, int which)
 	 * If chspec is non-NULL, construct a bref out of the spec
 	 */
 	if (chspec) {
-		int btype;
-		long boff;
-		if (sscanf(chspec, "%jx.%02x", &boff, &btype) != 2) {
-			fprintf(stderr, "bad chainspec: %%llx.%%02x\n");
+		unsigned long long boff;
+		unsigned int btype;
+		char extra;
+
+		if (sscanf(chspec, "%llx.%x%c", &boff, &btype, &extra) != 2 ||
+		    (btype > HAMMER2_BREF_TYPE_INVALID &&
+		     btype != HAMMER2_BREF_TYPE_FREEMAP &&
+		     btype != HAMMER2_BREF_TYPE_VOLUME)) {
+			fprintf(stderr, "bad chainspec \"%s\" "
+			    "(expected <offset>.<type>, e.g. "
+			    "000001559a68900a.01)\n", chspec);
+			ret = 1;
 			goto done;
 		}
 		bzero(&broot, sizeof(broot));
-		broot.data_off = boff;
-		broot.type = btype;
+		broot.data_off = (hammer2_off_t)boff;
+		broot.type = (uint8_t)btype;
 		broot.methods = HAMMER2_ENC_CHECK(HAMMER2_CHECK_XXHASH64);
 
 		show_bref(&media.voldata, 0, 0, &broot, 0);
@@ -255,7 +264,7 @@ cmd_show(const char *devpath, const char *chspec, int which)
 done:
 	hammer2_cleanup_volumes();
 
-	return 0;
+	return (ret);
 }
 
 static void

@@ -523,6 +523,7 @@ struct hammer2_chain {
 #define HAMMER2_ERROR_EDEADLK		0x00010000
 #define HAMMER2_ERROR_ESRCH		0x00020000
 #define HAMMER2_ERROR_ETIMEDOUT		0x00040000
+#define HAMMER2_ERROR_ENOMEM		0x00080000	/* kernel memory shortage */
 #define HAMMER2_ERROR_EOPNOTSUPP	0x10000000	/* unsupported */
 
 /*
@@ -1619,6 +1620,8 @@ hammer2_error_to_errno(int error)
 			error = ESRCH;
 		else if (error & HAMMER2_ERROR_ETIMEDOUT)
 			error = ETIMEDOUT;
+		else if (error & HAMMER2_ERROR_ENOMEM)
+			error = ENOMEM;
 		//else if (error & HAMMER2_ERROR_EOF)
 		//	error = xxx;
 		else if (error & HAMMER2_ERROR_EOPNOTSUPP)
@@ -1668,6 +1671,8 @@ hammer2_errno_to_error(int error)
 		return HAMMER2_ERROR_ESRCH;
 	case ETIMEDOUT:
 		return HAMMER2_ERROR_ETIMEDOUT;
+	case ENOMEM:
+		return HAMMER2_ERROR_ENOMEM;
 	//case xxx:
 	//	return HAMMER2_ERROR_EOF;
 	case EOPNOTSUPP:

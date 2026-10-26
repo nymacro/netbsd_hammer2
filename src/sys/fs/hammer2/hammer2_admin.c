@@ -529,30 +529,44 @@ hammer2_xop_retire(hammer2_xop_head_t *xop, uint32_t mask)
 		mask &= ~(1U << i);
 	}
 
-	/* The inode is only held at this point, simply drop it. */
-	if (xop->ip1) {
-		hammer2_xop_unset_ipdep(xop->ip1);
-		hammer2_inode_drop(xop->ip1);
-		xop->ip1 = NULL;
-	}
-	if (xop->ip2) {
-		if (xop->ip2 != xop->ip1) /* rename */
-			hammer2_xop_unset_ipdep(xop->ip2);
-		hammer2_inode_drop(xop->ip2);
-		xop->ip2 = NULL;
-	}
-	if (xop->ip3) {
-		if (xop->ip3 != xop->ip1 && xop->ip3 != xop->ip2) /* rename */
-			hammer2_xop_unset_ipdep(xop->ip3);
-		hammer2_inode_drop(xop->ip3);
-		xop->ip3 = NULL;
-	}
-	if (xop->ip4) {
-		if (xop->ip4 != xop->ip1 && xop->ip4 != xop->ip2 &&
-		    xop->ip4 != xop->ip3) /* rename */
-			hammer2_xop_unset_ipdep(xop->ip4);
-		hammer2_inode_drop(xop->ip4);
-		xop->ip4 = NULL;
+	/*
+	 * The inode is only held at this point, simply drop it.
+	 *
+	 * Save the pointers before clearing the slots: the alias checks
+	 * below must compare against the INODE POINTERS, not against the
+	 * already-cleared xop slots (which made every check true and could
+	 * unset a shared ipdep registration twice, dropping another XOP's
+	 * registration).
+	 */
+	{
+		hammer2_inode_t *ip1 = xop->ip1;
+		hammer2_inode_t *ip2 = xop->ip2;
+		hammer2_inode_t *ip3 = xop->ip3;
+
+		if (ip1) {
+			hammer2_xop_unset_ipdep(ip1);
+			hammer2_inode_drop(ip1);
+			xop->ip1 = NULL;
+		}
+		if (ip2) {
+			if (ip2 != ip1) /* rename */
+				hammer2_xop_unset_ipdep(ip2);
+			hammer2_inode_drop(ip2);
+			xop->ip2 = NULL;
+		}
+		if (ip3) {
+			if (ip3 != ip1 && ip3 != ip2) /* rename */
+				hammer2_xop_unset_ipdep(ip3);
+			hammer2_inode_drop(ip3);
+			xop->ip3 = NULL;
+		}
+		if (xop->ip4) {
+			if (xop->ip4 != ip1 && xop->ip4 != ip2 &&
+			    xop->ip4 != ip3) /* rename */
+				hammer2_xop_unset_ipdep(xop->ip4);
+			hammer2_inode_drop(xop->ip4);
+			xop->ip4 = NULL;
+		}
 	}
 
 	if (xop->name1) {

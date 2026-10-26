@@ -45,6 +45,44 @@
 #include <sys/filio.h>
 #include <sys/fcntl.h>
 #include <sys/dkio.h>
+#include <sys/disk.h>
+#include <sys/disklabel.h>
+#include <miscfs/specfs/specdev.h>	/* for v_rdev */
+
+/*
+ * Return the size of the partition (wedge, disklabel partition, or whole
+ * device) backing devvp.
+ *
+ * NetBSD's DIOCGMEDIASIZE returns the WHOLE-DISK size even when devvp is a
+ * disklabel partition device, so using it blindly lets growfs expand a
+ * filesystem past the end of its partition (the mount-time last-block probe
+ * then rejects the volume).  Probe the wedge size first, then the disklabel
+ * partition, and only then the whole-disk media size -- the same order as
+ * sbin/hammer2/subs.c:check_volume().
+ */
+static int
+hammer2_ioctl_dev_size(struct vnode *devvp, hammer2_off_t *sizep)
+{
+	struct dkwedge_info dkw;
+	struct disklabel dl;
+	hammer2_off_t size;
+	int part;
+
+	if (VOP_IOCTL(devvp, DIOCGWEDGEINFO, &dkw, FREAD, FSCRED) == 0) {
+		size = (hammer2_off_t)dkw.dkw_size * 512;
+	} else if (VOP_IOCTL(devvp, DIOCGDINFO, &dl, FREAD, FSCRED) == 0) {
+		part = minor(devvp->v_rdev) % MAXPARTITIONS;
+		size = (hammer2_off_t)dl.d_partitions[part].p_size *
+		    dl.d_secsize;
+	} else if (VOP_IOCTL(devvp, DIOCGMEDIASIZE, &size, FREAD,
+	    FSCRED) != 0) {
+		return (EINVAL);
+	}
+	if (size <= 0)
+		return (EINVAL);
+	*sizep = size;
+	return (0);
+}
 
 /*
  * Return 1 if read-only mounted otherwise 0.  DragonFly allows bwrite(9)
@@ -903,8 +941,8 @@ hammer2_ioctl_growfs(hammer2_inode_t *ip, void *data)
 	}
 	KKASSERT(hmp->total_size == hmp->voldata.volu_size);
 
-	/* Get media size. */
-	error = VOP_IOCTL(hmp->devvp, DIOCGMEDIASIZE, &size, FREAD, FSCRED);
+	/* Get media size (partition size, not whole-disk size). */
+	error = hammer2_ioctl_dev_size(hmp->devvp, &size);
 	if (error) {
 		hprintf("failed to get media size\n");
 		return (error);
@@ -1011,9 +1049,15 @@ hammer2_ioctl_growfs(hammer2_inode_t *ip, void *data)
 	/*
 	 * Flush the mess right here and now.  We could just let the
 	 * filesystem syncer do it, but this was a sensitive operation
-	 * so don't take any chances.
+	 * so don't take any chances.  A failed flush leaves the in-core
+	 * size diverged from the media, so report it instead of
+	 * pretending the grow succeeded.
 	 */
-	hammer2_sync(ip->pmp->mp, MNT_WAIT, NULL);
+	error = hammer2_sync(ip->pmp->mp, MNT_WAIT, NULL);
+	if (error) {
+		hprintf("growfs: sync after resize failed %d\n", error);
+		return (error);
+	}
 
 	return (0);
 }
@@ -1033,6 +1077,7 @@ hammer2_ioctl_volume_list(hammer2_inode_t *ip, void *data)
 	if (hmp == NULL)
 		return (EINVAL);
 
+	hammer2_voldata_lock(hmp);
 	for (i = 0; i < hmp->nvolumes; ++i) {
 		if (cnt >= vollist->nvolumes)
 			break;
@@ -1045,13 +1090,15 @@ hammer2_ioctl_volume_list(hammer2_inode_t *ip, void *data)
 		entry.size = vol->size;
 		error = copyout(&entry, &vollist->volumes[cnt], sizeof(entry));
 		if (error)
-			return (error);
+			goto failed;
 		cnt++;
 	}
 	vollist->nvolumes = cnt;
 	vollist->version = hmp->voldata.version;
 	bcopy(ip->pmp->pfs_names[0], vollist->pfs_name,
 	    sizeof(vollist->pfs_name));
+failed:
+	hammer2_voldata_unlock(hmp);
 
 	return (error);
 }
@@ -1071,6 +1118,7 @@ hammer2_ioctl_volume_list2(hammer2_inode_t *ip, void *data)
 	if (hmp == NULL)
 		return (EINVAL);
 
+	hammer2_voldata_lock(hmp);
 	for (i = 0; i < hmp->nvolumes; ++i) {
 		if (cnt >= (int)__arraycount(vollist->volumes) ||
 		    cnt >= vollist->nvolumes)
@@ -1088,6 +1136,7 @@ hammer2_ioctl_volume_list2(hammer2_inode_t *ip, void *data)
 	vollist->version = hmp->voldata.version;
 	bcopy(ip->pmp->pfs_names[0], vollist->pfs_name,
 	    sizeof(vollist->pfs_name));
+	hammer2_voldata_unlock(hmp);
 
 	return (error);
 }

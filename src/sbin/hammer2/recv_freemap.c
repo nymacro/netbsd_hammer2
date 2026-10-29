@@ -40,8 +40,9 @@
  * 32KB blocks: FREEMAP_LEAF blocks (256 x 4MB hammer2_bmap_data_t) at
  * LEVEL1 (1GB) and FREEMAP_NODE blocks (256 x 128B blockref) at LEVEL2..5.
  *
- * This module reads that tree, allocates received blocks from free 16KB
- * units (the bitmap granularity), and COW-writes every modified block to a
+ * This module reads that tree (building it from scratch when the root
+ * blockset is entirely empty -- a pristine destination), allocates received
+ * blocks from free 16KB units, and COW-writes every modified block to a
  * rotated reserve slot before the caller commits the volume header.  A crash
  * before the commit leaves the previous root (and thus the previous freemap)
  * intact; newly written blocks are simply unreferenced.
@@ -163,19 +164,6 @@ fm_covers(const hammer2_blockref_t *bref, hammer2_off_t key)
 	return (key >= base && key < base + size);
 }
 
-int
-recv_freemap_present(const hammer2_volume_data_t *voldata)
-{
-	int i;
-
-	for (i = 0; i < HAMMER2_SET_COUNT; ++i) {
-		if (voldata->freemap_blockset.blockref[i].type !=
-		    HAMMER2_BREF_TYPE_EMPTY)
-			return (1);
-	}
-	return (0);
-}
-
 /*
  * Read and check a freemap node or leaf block.
  */
@@ -252,7 +240,10 @@ fm_descend(struct recv_freemap *fm, struct fm_blk *parent, hammer2_off_t key)
 /*
  * Initialize a newly created LEVEL1 leaf, mirroring hammer2_freemap_init():
  * everything below allocator_beg (and outside the volume) is marked
- * allocated, including the 4MB reserve at the base of the region.
+ * allocated, including the 4MB reserve at the base of the region.  Free
+ * arms keep bmap->linear at 0 (leaf->data is calloc'd): the kernel's
+ * sub-unit linear cursor must never see stale state for space this module
+ * has not yet touched (fm_unit_mark() clears it again on allocation).
  */
 static void
 fm_leaf_init(struct recv_freemap *fm, struct fm_blk *leaf, hammer2_off_t region)

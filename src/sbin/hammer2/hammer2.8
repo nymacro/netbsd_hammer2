@@ -582,21 +582,22 @@ from stdin onto the offline volume
 .Ar devpath ,
 creating a new PFS named after the stream, similar to
 .Xr zfs 8 Ns ' Cm recv .
-Payload blocks are reallocated on the destination and the super-root is
-extended with a dirent for the received PFS; the volume headers are
+Payload blocks are reallocated on the destination from its on-media
+freemap (built from scratch on a freshly formatted volume; a COW copy of
+the freemap tree is committed with the volume header) and the super-root
+is extended with a dirent for the received PFS; the volume headers are
 committed last, so a crash at any earlier point leaves the destination
 in its previous consistent state.
-On a freshly created volume
-.Pq Xr newfs_hammer2 8
-the allocator-begin offset is advanced past the received blocks, which
-live below it and are therefore never handed out by the kernel allocator
-or
-.Cm bulkfree
-again.
-On a volume that has already been mounted read-write the received blocks
-are instead allocated from, and recorded in, the destination's on-media
-freemap, and a COW copy of the freemap tree is committed with the volume
-header; such a destination must have enough free space.
+.Dv allocator_beg
+is never advanced by
+.Cm recv ,
+so every received block stays visible to the kernel's delete-time freemap
+adjust and to
+.Cm bulkfree :
+deleting a received PFS and running
+.Cm hammer2 cleanup
+reclaims its space.
+The destination must have enough free space.
 .Pp
 With
 .Fl u Ar label
@@ -609,7 +610,9 @@ label while its contents are replaced by the stream's generation
 lineage, matched by the root inode's
 .Dv modify_tid ;
 the destination label may differ from the stream's from-label).
-The diverged blocks of the previous generation are not reclaimed.
+The diverged blocks of the previous generation are reclaimed by
+.Cm hammer2 cleanup
+like any other free block.
 .Pp
 The destination volume must not be mounted (recv writes raw blocks and
 commits the volume header itself; a mounted filesystem would race with

@@ -36,25 +36,37 @@
  * hammer2 recv - deserialize a stream produced by `hammer2 send' onto a
  * destination volume, similar to zfs recv.
  *
- * Payload blocks are reallocated linearly from voldata.allocator_beg,
- * exactly the way newfs_hammer2 allocates its initial blocks: the kernel
- * allocator never hands out blocks below allocator_beg and bulkfree
- * ignores them, so the freemap bitmaps do not have to be touched.  After
- * all blocks are written, allocator_beg is advanced (rounded up to the
- * next 4MB segment so the freemap marks the whole partial segment
- * allocated), a new copy of the super-root inode is written with a dirent
- * for the received PFS, and the volume header(s) are committed last.
+ * Payload blocks are always allocated from the destination's on-media
+ * freemap (recv_freemap.c), even on a pristine destination: on a freshly
+ * formatted volume the freemap blockset is empty, so the freemap tree is
+ * built from scratch (LEVEL1 leaves are created lazily per 1GB region,
+ * mirroring hammer2_freemap_init()).  voldata.allocator_beg is NEVER
+ * advanced by recv.  After all blocks are written, a new copy of the
+ * super-root inode is written with a dirent for the received PFS, the
+ * COW'd freemap tree is committed, and the volume header(s) are committed
+ * last.
+ *
+ * Because every received block lands at or above the (frozen)
+ * allocator_beg, the kernel's delete-time freemap adjust and bulkfree both
+ * see it: deleting a received PFS and running `hammer2 cleanup' reclaims
+ * its space.  This also applies to the diverged blocks of a previous
+ * generation discarded by an incremental (-u) update.
  *
  * A crash at any point before the volume header commit leaves the
  * destination in its previous consistent state (the received blocks are
- * simply unreachable); the volume headers are written back-to-front for
- * extra safety.
+ * simply unreferenced garbage); the volume headers are written
+ * back-to-front for extra safety.
+ *
+ * Volumes written by old (linear-allocation) recv binaries keep their
+ * below-allocator_beg regions leaked permanently: those blocks are below
+ * allocator_beg, invisible to every reclaim path, and there is no
+ * migration.
  *
  * Incremental (-u) streams update an existing PFS: unchanged leaf blocks
  * are located in the destination PFS by bref identity and shared, the way
  * COW snapshots share blocks.  The destination PFS root bref is replaced;
- * the diverged blocks of the previous generation are not reclaimed (they
- * stay below allocator_beg, like all recv allocations).
+ * the diverged blocks of the previous generation are reclaimed by
+ * `hammer2 cleanup' like any other free block.
  */
 
 #include <err.h>
@@ -186,39 +198,22 @@ is_leaf_bref(const hammer2_blockref_t *bref, const void *data)
 }
 
 /*
- * Linear allocator, newfs_hammer2 style: power-of-2 sized, size-aligned,
- * skipping the 4MB freemap/volhdr reserve at every 1GB boundary.  All
- * received blocks land below the final allocator_beg, so neither the
- * kernel allocator nor bulkfree will ever hand them out again.  This is
- * only valid for a pristine destination (no on-media freemap); a used
- * destination is allocated from its freemap instead (recv_freemap.c).
+ * The rounded allocator_beg input to the freemap allocator and the volume
+ * size (freemap leaf-init and the volhdr commit loop use VoluEnd).
+ * allocator_beg itself is never advanced: all received blocks are
+ * allocated from the freemap (recv_freemap.c), at or above allocator_beg,
+ * so they remain reclaimable after a delete.
  */
 static hammer2_off_t AllocBase;
-static uint64_t AllocBytes;
 static hammer2_off_t VoluEnd;
 static struct recv_freemap *Freemap;
 
 static int
 recv_alloc(int radix, hammer2_off_t *offp)
 {
-	size_t bytes = (size_t)1 << radix;
-
 	if (radix < HAMMER2_RADIX_MIN || radix > HAMMER2_RADIX_MAX)
 		return (-1);
-	if (Freemap != NULL)
-		return (recv_freemap_alloc(Freemap, radix, offp));
-	if (AllocBase & (bytes - 1))
-		AllocBase = (AllocBase + bytes - 1) &
-		    ~((hammer2_off_t)bytes - 1);
-	if ((AllocBase & HAMMER2_FREEMAP_LEVEL1_MASK) < HAMMER2_ZONE_SEG)
-		AllocBase = (AllocBase & ~HAMMER2_FREEMAP_LEVEL1_MASK) +
-		    HAMMER2_ZONE_SEG;
-	if (AllocBase + bytes > VoluEnd)
-		return (-1);
-	*offp = AllocBase | radix;
-	AllocBase += bytes;
-	AllocBytes += bytes;
-	return (0);
+	return (recv_freemap_alloc(Freemap, radix, offp));
 }
 
 static uint64_t RecvRecords;
@@ -745,14 +740,13 @@ cmd_recv(int ac, char **av)
 		    ~HAMMER2_PBUFMASK64;
 
 	/*
-	 * A destination that already carries a freemap has been mounted
-	 * read-write, so its [allocator_beg, ...) region may hold live
-	 * allocations and a stale freemap.  Allocate from the freemap and
-	 * commit a COW'd copy of it.  A pristine volume has no freemap and
-	 * stays on the linear allocator.
+	 * Always allocate from the freemap and commit a COW'd copy of it,
+	 * even on a pristine destination (empty freemap_blockset): the tree
+	 * is then built from scratch, lazily per 1GB region.  allocator_beg
+	 * is never advanced, so received blocks stay reclaimable after a
+	 * delete (the old linear placement permanently leaked them).
 	 */
-	if (recv_freemap_present(&voldata))
-		Freemap = recv_freemap_init(&voldata, AllocBase, VoluEnd, 0);
+	Freemap = recv_freemap_init(&voldata, AllocBase, VoluEnd, 0);
 
 	/*
 	 * Process the stream.  Nothing on the destination is modified
@@ -841,30 +835,13 @@ cmd_recv(int ac, char **av)
 	if (recv_write_phys(sroot_off, &media, HAMMER2_INODE_BYTES))
 		err(1, "recv: super-root write failed");
 
-	if (Freemap != NULL) {
-		/*
-		 * The received blocks and the COW'd freemap tree are written
-		 * now, before the header commit; allocator_beg is unchanged
-		 * and allocator_free / freemap_tid are updated by the flush.
-		 */
-		if (recv_freemap_flush(Freemap, new_tid) != 0)
-			err(1, "recv: freemap commit failed");
-	} else {
-		/*
-		 * Fresh destination: advance allocator_beg past everything
-		 * we placed, rounded up to the next 4MB segment so the
-		 * freemap leaf created on the next mount marks the whole
-		 * partial segment as allocated.
-		 */
-		voldata.allocator_beg = (AllocBase + HAMMER2_SEGMASK64) &
-		    ~HAMMER2_SEGMASK64;
-		if (voldata.allocator_beg > VoluEnd)
-			voldata.allocator_beg = VoluEnd;
-		if (voldata.allocator_free > AllocBytes)
-			voldata.allocator_free -= AllocBytes;
-		else
-			voldata.allocator_free = 0;
-	}
+	/*
+	 * The received blocks and the COW'd freemap tree are written now,
+	 * before the header commit; allocator_beg is unchanged and
+	 * allocator_free / freemap_tid are updated by the flush.
+	 */
+	if (recv_freemap_flush(Freemap, new_tid) != 0)
+		err(1, "recv: freemap commit failed");
 
 	voldata.sroot_blockset.blockref[sroot_slot] = sroot_new;
 	voldata.mirror_tid = new_tid;

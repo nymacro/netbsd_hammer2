@@ -41,9 +41,8 @@
  * so the last record in the stream is always the PFS root inode.
  *
  * The bref's data_off is the SOURCE media offset.  The receiver reallocates
- * every payload block on the destination volume (linearly from
- * voldata.allocator_beg, like newfs_hammer2 does for its initial blocks)
- * and rewrites the embedded child blockrefs inside inode/indirect blocks,
+ * every payload block on the destination volume from its on-media freemap
+ * (voldata.allocator_beg is never advanced) and rewrites the embedded child blockrefs inside inode/indirect blocks,
  * recomputing their check codes.  Leaf payloads are copied verbatim,
  * compression and check codes intact.
  *

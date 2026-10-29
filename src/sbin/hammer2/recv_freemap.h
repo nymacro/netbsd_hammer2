@@ -35,26 +35,23 @@
 /*
  * Destination-side freemap support for `hammer2 recv'.
  *
- * recv used to place every received block linearly from voldata.allocator_beg
- * and never touch the freemap.  That is only safe when the destination's
- * dynamic region has never been used (a freshly formatted volume): the freemap
- * leaf created on the first later allocation marks the received blocks
- * allocated because allocator_beg has advanced past them.
+ * recv allocates every received block from the destination's on-media
+ * freemap and never advances voldata.allocator_beg.  On a volume that has
+ * been mounted read-write the persisted freemap marks the dynamic region,
+ * so allocating from it (and committing a COW'd copy with the volume
+ * header) is the only safe course: writing anywhere else would clobber
+ * live kernel-allocated blocks and leave a stale freemap.
  *
- * On a volume that has already been mounted read-write the persisted freemap
- * still marks [allocator_beg, ...) free, so writing there would both clobber
- * live kernel-allocated blocks and leave a stale freemap that would hand the
- * received blocks back out.
- *
- * This module implements the second case: it allocates each received block
- * from the destination's on-media freemap (allocating from free 16KB units and
- * recording them), and commits a COW'd copy of the freemap tree so the
- * allocation is durable and consistent before the volume header commit.
- *
- * A volume with no freemap at all (voldata.freemap_blockset all empty) keeps
- * using the linear allocator in cmd_recv.c: that region is pristine, so the
- * linear model is correct, and mixing the two models on one volume is never
- * necessary (the freemap only appears once the volume has been mounted).
+ * On a freshly formatted volume (freemap_blockset entirely empty) the same
+ * path builds the freemap tree from scratch: LEVEL1 leaves are created
+ * lazily per 1GB region as allocations touch them, mirroring the kernel's
+ * hammer2_freemap_init() (below-allocator_beg and reserve areas marked
+ * allocated).  Because allocator_beg stays frozen, every received block is
+ * at or above it and remains visible to the kernel's delete-time freemap
+ * adjust and to bulkfree -- deleting a received PFS and running
+ * `hammer2 cleanup' reclaims its space.  (The old linear-placement scheme,
+ * which advanced allocator_beg, permanently leaked received and -u-diverged
+ * blocks; volumes written that way keep their leaks -- no migration.)
  */
 
 #ifndef HAMMER2_RECV_FREEMAP_H_
@@ -72,12 +69,6 @@ ssize_t recv_read_phys(hammer2_off_t data_off, void *buf, size_t bytes);
 int recv_write_phys(hammer2_off_t data_off, const void *buf, size_t bytes);
 
 struct recv_freemap;
-
-/*
- * Return non-zero if the volume has an on-media freemap (i.e. it has been
- * used at least once and the linear allocator is no longer safe).
- */
-int recv_freemap_present(const hammer2_volume_data_t *voldata);
 
 /*
  * Create an allocation context over (*voldata).  The caller keeps ownership of

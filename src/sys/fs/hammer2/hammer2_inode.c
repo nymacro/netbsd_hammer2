@@ -253,8 +253,8 @@ hammer2_inode_lock(hammer2_inode_t *ip, int how)
 	 *
 	 * The lock is recursive for its exclusive owner: hammer2_mtx_ex()
 	 * bumps the recursion depth when this LWP already owns it (the
-	 * rwlock(9) shim in hammer2_os.h emulates DragonFly's mtx_lock_ex
-	 * recursion contract), so hammer2_mtx_refs() is the upstream
+	 * rwlock(9) shim in hammer2_compat.h emulates DragonFly's
+	 * mtx_lock_ex recursion contract), so hammer2_mtx_refs() is the upstream
 	 * "number of references this thread holds" value.  A recursive
 	 * acquisition returns immediately without waiting on SYNCQ, which
 	 * is upstream's behavior verbatim.
@@ -300,10 +300,10 @@ void
 hammer2_inode_lock4(hammer2_inode_t *ip1, hammer2_inode_t *ip2,
     hammer2_inode_t *ip3, hammer2_inode_t *ip4)
 {
-	hammer2_inode_t *ips[4], *iptmp, *ipslp, *iplk[4];
+	hammer2_inode_t *ips[4], *iptmp, *ipslp;
 	hammer2_depend_t *depend;
 	hammer2_pfs_t *pmp;
-	size_t count, i, j, iplkd;
+	size_t count, i;
 
 	pmp = ip1->pmp; /* may be NULL */
 	KKASSERT(pmp == ip2->pmp);
@@ -328,29 +328,16 @@ hammer2_inode_lock4(hammer2_inode_t *ip1, hammer2_inode_t *ip2,
 		hammer2_inode_ref(ips[i]);
 restart:
 	/*
-	 * Lock the inodes in order.
+	 * Lock the inodes in order.  Duplicate pointers are recursively
+	 * locked, matching upstream; every acquisition gets its own unlock
+	 * in the restart path below.
 	 *
-	 * NetBSD-specific: duplicate inode pointers (rename with tdip ==
-	 * fdip) are locked only once.  The hammer2_mtx shim supports
-	 * exclusive recursion, so upstream's lock-every-entry shape would
-	 * also work, but deduping keeps the SYNCQ restart balanced (exactly
-	 * one unlock per acquisition) and avoids growing the recursion depth
-	 * on every restart.  Callers must not already hold a member
-	 * exclusively: the restart loop cannot release a recursive hold, so
-	 * a member stuck on SYNCQ would never be flushed (upstream has the
-	 * same property).
+	 * Callers must not already hold a member exclusively: the restart
+	 * loop cannot release a recursive hold, so a member stuck on SYNCQ
+	 * would never be flushed (upstream has the same property).
 	 */
-	iplk[0] = iplk[1] = iplk[2] = iplk[3] = NULL;
-	for (i = 0; i < count; ++i) {
-		iplkd = 0;
-		for (j = 0; j < i; j++)
-			if (iplk[j] == ips[i])
-				iplkd = 1;
-		if (!iplkd) {
-			hammer2_mtx_ex(&ips[i]->lock);
-			iplk[i] = ips[i];
-		}
-	}
+	for (i = 0; i < count; ++i)
+		hammer2_mtx_ex(&ips[i]->lock);
 
 	/*
 	 * Associate dependencies, record the first inode found on SYNCQ
@@ -383,8 +370,7 @@ restart:
 	 */
 	if (ipslp) {
 		for (i = 0; i < count; ++i)
-			if (iplk[i])
-				hammer2_mtx_unlock(&iplk[i]->lock);
+			hammer2_mtx_unlock(&ips[i]->lock);
 		tsleep(&ipslp->flags, 0, "h2sync", 2);
 		goto restart;
 	}
@@ -667,36 +653,52 @@ hammer2_igetv(hammer2_inode_t *ip, int lktype, struct vnode **vpp)
 	hammer2_assert_inode_meta(ip);
 	inum = ip->meta.inum; /* without HAMMER2_DIRHASH_USERMSK mask */
 
-	/*
-	 * Unlock inode, otherwise deadlocks vs syscall processes.
-	 *
-	 * NOTE: temp_release releases exactly ONE exclusive level (upstream
-	 * mtx_lock_temp_release() semantics).  If the caller happens to hold
-	 * the inode recursively the lock stays held across vcache_get(); no
-	 * live caller does that -- every igetv path arrives with a single
-	 * acquisition -- but recursive callers must not rely on this
-	 * window releasing the inode.
-	 */
-	ostate = hammer2_inode_lock_temp_release(ip);
-	error = vcache_get(mp, &inum, sizeof(inum), &vp);
-	hammer2_inode_lock_temp_restore(ip, ostate);
-	if (error) {
-		*vpp = NULL;
-		return (error);
-	}
-	KKASSERT(vp);
-	KKASSERT(VOP_ISLOCKED(vp) == 0);
-	KKASSERT(vp->v_op);
-
-	if (lktype != LK_NONE) {
-		error = vn_lock(vp, lktype);
+	for (;;) {
+		/*
+		 * Unlock inode, otherwise deadlocks vs syscall processes.
+		 * Both vcache_get() and vn_lock() can wait on vnode state,
+		 * so keep the inode released across the whole acquisition,
+		 * including the failure-side reference cleanup.
+		 *
+		 * NOTE: temp_release releases exactly ONE exclusive level
+		 * (upstream mtx_lock_temp_release() semantics).  If the caller
+		 * happens to hold the inode recursively the lock stays held
+		 * across both calls; no live caller does that -- every igetv
+		 * path arrives with a single acquisition -- but recursive
+		 * callers must not rely on this window releasing the inode.
+		 */
+		ostate = hammer2_inode_lock_temp_release(ip);
+		error = vcache_get(mp, &inum, sizeof(inum), &vp);
+		if (error == 0 && lktype != LK_NONE) {
+			error = vn_lock(vp, lktype);
+			if (error)
+				vrele(vp);
+		} else if (error == 0) {
+			KASSERT(VOP_ISLOCKED(vp) == 0);
+		}
+		hammer2_inode_lock_temp_restore(ip, ostate);
 		if (error) {
-			vrele(vp);
 			*vpp = NULL;
 			return (error);
 		}
-	} else {
-		KASSERT(VOP_ISLOCKED(vp) == 0);
+		KKASSERT(vp);
+		KKASSERT(vp->v_op);
+
+		/*
+		 * Reclaim may have disassociated the vnode while the inode
+		 * was released.  Match upstream's igetv race handling: drop
+		 * the acquired vnode and retry rather than returning a vnode
+		 * no longer associated with this inode.
+		 */
+		if (ip->vp == vp)
+			break;
+
+		ostate = hammer2_inode_lock_temp_release(ip);
+		if (lktype != LK_NONE)
+			vput(vp);
+		else
+			vrele(vp);
+		hammer2_inode_lock_temp_restore(ip, ostate);
 	}
 
 	KASSERTMSG(vp->v_type != VBAD, "VBAD");
@@ -833,8 +835,9 @@ again:
 	 * recursively locks ip->lock in DragonFly and FreeBSD; the port's
 	 * hammer2_mtx shim emulates exclusive recursion, but the syncer still
 	 * releases ip->lock across its final vput()/vdrop() (see the vput
-	 * window there) -- NetBSD-VFS-correct VOP_INACTIVE/VOP_RECLAIM
-	 * discipline, kept deliberately.
+	 * window there).  That is a deliberate NetBSD safeguard: recursion
+	 * prevents same-LWP self-deadlock, but not wider VFS/UVM callback
+	 * lock-order cycles.
 	 * This unlock / relock also applies to hammer2_vfs_sync_pmp() ->
 	 * vflushbuf() -> VOP_PUTPAGES() -> genfs_compat_gop_write() ->
 	 * VOP_WRITE() -> hammer2_write_file().
@@ -1517,26 +1520,29 @@ void
 hammer2_inode_vdrop(hammer2_inode_t *ip, struct vnode *vp, int n)
 {
 	KKASSERT(ip->refs > 0);
-	KKASSERT(ip->vhold >= 0);
 	KKASSERT(vp != NULL || n == 0);
 
+	hammer2_mtx_ex(&ip->vhold_lock);
+	KKASSERT(ip->vhold >= 0);
 	if (n > ip->vhold)
 		hpanic("arg %d > vhold %d", n, ip->vhold);
 
-	hammer2_mtx_ex(&ip->vhold_lock);
-	while (n > 0) {
-		/*
-		 * vp is the caller's saved reference target.  Forced reclaim may
-		 * clear or replace ip->vp, but the reference still belongs to vp.
-		 * Caller must not hold the inode lock here (it is taken
-		 * recursively by the reclaim path).
-		 */
-		ip->vhold--;
-		n--;
-		vrele(vp);
-	}
+	/*
+	 * Account for all references before releasing vhold_lock.  vp is the
+	 * caller's saved reference target; forced reclaim may clear or replace
+	 * ip->vp, but these references still belong to vp.
+	 */
+	ip->vhold -= n;
 	KKASSERT(ip->vhold >= 0);
 	hammer2_mtx_unlock(&ip->vhold_lock);
+
+	/*
+	 * The last vrele can enter VOP_INACTIVE, which acquires ip->lock.
+	 * Do it after dropping vhold_lock: an LWP holding ip->lock can be
+	 * waiting in hammer2_inode_vhold() for vhold_lock.
+	 */
+	while (n-- > 0)
+		vrele(vp);
 }
 
 /*

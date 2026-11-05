@@ -2102,50 +2102,45 @@ hammer2_recovery_scan(hammer2_dev_t *hmp, hammer2_chain_t *parent,
 		 * Must instantiate data for DIRECTDATA test and also
 		 * for recursion.
 		 *
-		 * chain_scan() returned parent already locked (the scan
-		 * protocol keeps the returned chain locked until the
-		 * next iteration unlocks it), so the data is loaded
-		 * directly under the lock we already hold.  Upstream
-		 * re-locks it recursively here (mtx_lock_ex is explicitly
-		 * recursive, "Recursion is allowed", sys/mutex2.h); the
-		 * port's hammer2_mtx shim emulates exclusive recursion as
-		 * well, but a second acquisition would only have to be
-		 * matched by an extra unlock for no gain, so the direct
-		 * call is a deliberate (and correct) port difference.
+		 * chain_scan() returns parent locked, so this is a
+		 * recursive acquisition matching upstream.  The scan's
+		 * outer lock remains held across the switch.
 		 */
-		if (parent->data == NULL)
-			hammer2_chain_load_data(parent);
+		hammer2_chain_lock(parent, HAMMER2_RESOLVE_ALWAYS);
 		if (parent->data == NULL || parent->error) {
 			/*
 			 * Corrupt / unreadable / failed-check inode:
-			 * report and stop walking this branch (the scan
-			 * protocol owns the lock and will unlock it).
+			 * report and stop walking this branch.
 			 * NOTE: a failed media check leaves data pointing
 			 * at the corrupt buffer -- never trust meta.
 			 */
-			return (parent->error ?
-			    parent->error : HAMMER2_ERROR_EIO);
+			error = parent->error ?
+			    parent->error : HAMMER2_ERROR_EIO;
+			hammer2_chain_unlock(parent);
+			return (error);
 		}
 		ripdata = &parent->data->ipdata;
 		if (ripdata->meta.op_flags & HAMMER2_OPFLAG_DIRECTDATA) {
 			/* not applicable to recovery scan */
+			hammer2_chain_unlock(parent);
 			return (0);
 		}
+		hammer2_chain_unlock(parent);
 		break;
 	case HAMMER2_BREF_TYPE_INDIRECT:
 		/*
 		 * Must instantiate data for recursion.  See the INODE
-		 * case: parent is already locked, do not re-lock.
-		 * A failed media check leaves data pointing at the
+		 * case.  A failed media check leaves data pointing at the
 		 * corrupt buffer -- never walk garbage blockrefs.
 		 */
-		if (parent->data == NULL)
-			hammer2_chain_load_data(parent);
-		if (parent->data == NULL)
-			return (parent->error ?
-			    parent->error : HAMMER2_ERROR_EIO);
-		if (parent->error)
-			return (parent->error);
+		hammer2_chain_lock(parent, HAMMER2_RESOLVE_ALWAYS);
+		if (parent->data == NULL || parent->error) {
+			error = parent->error ?
+			    parent->error : HAMMER2_ERROR_EIO;
+			hammer2_chain_unlock(parent);
+			return (error);
+		}
+		hammer2_chain_unlock(parent);
 		break;
 	case HAMMER2_BREF_TYPE_DIRENT:
 	case HAMMER2_BREF_TYPE_DATA:
@@ -2482,12 +2477,17 @@ restart:
 		 * We need the vp in order to vfsync() dirty buffers, so if
 		 * one isn't attached we can skip it.
 		 *
+		 * Take the inode lock before inspecting ip->vp, as upstream
+		 * does.  Reclaim clears the association under this lock, so
+		 * an unlocked snapshot can be stale before we even reach the
+		 * vnode interlock.
+		 *
 		 * Ordering the inode lock and then the vnode lock has the
 		 * potential to deadlock.  If we had left SYNCQ set that could
 		 * also deadlock us against the frontend even if we don't hold
 		 * any locks, but the latter is not a problem now since we
-		 * cleared it.  igetv will temporarily release the inode lock
-		 * in a safe manner to work-around the deadlock.
+		 * cleared it.  We therefore release the inode lock across
+		 * vn_lock() and revalidate the association afterwards.
 		 *
 		 * Unfortunately it is still possible to deadlock when the
 		 * frontend obtains multiple inode locks, because all the
@@ -2501,6 +2501,7 @@ restart:
 		 * dependencies may build up, so we definitely need to move
 		 * the whole SIDEQ back to SYNCQ when we restart.
 		 */
+		hammer2_mtx_ex(&ip->lock);
 		vp = ip->vp; /* NULL after vflush() */
 		vp_held = 0;
 		if (vp) {
@@ -2528,17 +2529,34 @@ restart:
 			}
 		}
 		if (vp) {
-			if (vn_lock(vp, LK_EXCLUSIVE | LK_NOWAIT)) {
+			int vp_locked = 0;
+
+			/*
+			 * Do not wait for the vnode while holding ip->lock.
+			 * A forced reclaim can run while our vref keeps the
+			 * vnode allocated, so revalidate ip->vp after the
+			 * lock is acquired.
+			 */
+			hammer2_mtx_unlock(&ip->lock);
+			if (vn_lock(vp, LK_EXCLUSIVE | LK_NOWAIT) == 0)
+				vp_locked = 1;
+			hammer2_mtx_ex(&ip->lock);
+			if (vp_locked == 0 || ip->vp != vp) {
 				/*
-				 * Failed to get the vnode, requeue the inode
-				 * (PASS2 is already set so it will be found
-				 * again on the restart).  Then unlock.
+				 * Failed to get the associated vnode, or a
+				 * forced reclaim disassociated it.  Requeue
+				 * the inode (PASS2 is already set so it will
+				 * be found again on the restart).
 				 */
-				vrele(vp);
+				hammer2_mtx_unlock(&ip->lock);
+				if (vp_locked)
+					vput(vp);
+				else
+					vrele(vp);
 				vp = NULL;
 				dorestart |= 1;
 #ifdef HAMMER2_DEBUG_SYNC
-				kprintf("inum %016llx vn_lock failed\n",
+				kprintf("inum %016llx vnode acquisition failed\n",
 				    (long long)ip->meta.inum);
 #endif
 				hammer2_mtx_ex(&ip->lock);
@@ -2560,8 +2578,7 @@ restart:
 		}
 
 		/*
-		 * Relock the inode, and we inherit a ref from the above.
-		 * We will check for a race after we acquire the vnode.
+		 * We inherit a ref from the above and hold the inode lock.
 		 *
 		 * NOTE: If the vnode is unreferenced (inactivated, sitting
 		 *	 on the LRU) we cannot legally vref/vput it here —
@@ -2572,8 +2589,6 @@ restart:
 		 *	 an unreferenced vnode underflows v_usecount and
 		 *	 panics "vrelel: bad ref count" in the syncer.
 		 */
-		/* XXX2 DragonFly takes inode lock before vget */
-		hammer2_mtx_ex(&ip->lock);
 
 		/*
 		 * If the inode wound up on a SIDEQ again it will already be
@@ -2742,25 +2757,20 @@ restart:
 			 * re-queued after an earlier pass without a new
 			 * modify (the vdrop below consumed it), and any
 			 * last external holder can exit while we flush.
-			 * VOP_INACTIVE/VOP_RECLAIM then take the inode lock
-			 * themselves, so ip->lock must NOT be held here.
-			 * Upstream DragonFly gets away with holding its
-			 * recursive mtx across the vput (hammer2_inode_lock
-			 * early-returns when the mtx is already held by the
-			 * caller).  The port's hammer2_mtx shim now emulates
-			 * that recursion as well, but this window is KEPT
-			 * deliberately: running VOP_INACTIVE/VOP_RECLAIM
-			 * without the syncer's exclusive inode lock is the
-			 * NetBSD-VFS-correct discipline, it keeps the
-			 * "INACTIVE never runs under the syncer's exclusive
-			 * inode lock" contract testable (fw/syncselflock.py),
-			 * and it matches the documented unlock/relock intent
-			 * in hammer2_inode_get().  Release the inode lock
-			 * across the vput + vdrop, the same window already
-			 * used for vflushbuf() above.  We still hold an
-			 * inode ref, so ip remains valid, and no path takes
-			 * ip->lock before the vnode lock, so the window
-			 * cannot self-deadlock.
+			 * VOP_INACTIVE/VOP_RECLAIM then run NetBSD vnode
+			 * teardown, UVM/buffer invalidation, and further
+			 * VOPs.
+			 *
+			 * Upstream DragonFly holds its recursive mtx across
+			 * the vput, and the hammer2_mtx shim now supports the
+			 * same self-recursion.  Recursion only prevents a
+			 * same-LWP self-deadlock, though; it does not bound
+			 * the broader callback lock-order graph.  Keep this
+			 * window unlocked as the NetBSD safeguard (FFS/ext2
+			 * syncers likewise hold no private inode lock across
+			 * vput), which also keeps the contract testable with
+			 * fw/syncselflock.py.  We still hold an inode ref, so
+			 * ip and the saved vp remain valid for vdrop.
 			 */
 			hammer2_mtx_unlock(&ip->lock);
 			vput(vp);

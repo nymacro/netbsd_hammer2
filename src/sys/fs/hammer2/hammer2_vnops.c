@@ -2563,15 +2563,8 @@ done:
 		hammer2_inode_drop(tip);
 	}
 	hammer2_inode_unlock(fip);
-	/*
-	 * XXX iplock: NetBSD HAMMER2 specific.
-	 * If tdip == fdip, hammer2_inode_lock4() locked only once.
-	 */
 	hammer2_inode_unlock(tdip);
-	if (tdip != fdip)
-		hammer2_inode_unlock(fdip);
-	else
-		hammer2_inode_drop(fdip); /* not locked, but ref'd */
+	hammer2_inode_unlock(fdip);
 	hammer2_inode_drop(fip);
 	hammer2_trans_done(tdip->pmp, HAMMER2_TRANS_SIDEQ);
 

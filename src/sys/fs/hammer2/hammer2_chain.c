@@ -232,11 +232,15 @@ hammer2_chain_init(hammer2_chain_t *chain)
 	 * Note that hammer2_chain_lookup() via strategy read / write CAN
 	 * attempt to recursively lock chain->lock for inodes flagged
 	 * HAMMER2_OPFLAG_DIRECTDATA: the lookup returns the locked inode
-	 * chain itself and takes a second (LOCKAGAIN) lock on it.  The
-	 * NetBSD rwlock shim cannot recurse, so that path is accounted as
-	 * a logical "self" lock in chain->lockcnt instead of a second mtx
+	 * chain itself and takes a second (LOCKAGAIN) lock on it.  Upstream
+	 * leaves that to mtx recursion; the port accounts the second logical
+	 * lock as a "self" credit in chain->lockcnt instead of a second mtx
 	 * acquisition (see hammer2_chain_lock/unlock and lockcnt in
-	 * hammer2.h).  DIRECTDATA is therefore enabled.
+	 * hammer2.h).  The self credit is kept even though hammer2_mtx_t now
+	 * emulates exclusive recursion (hammer2_compat.h): chain lock
+	 * accounting is driven by lockcnt alone, and a shared recursive
+	 * rw_enter(RW_READER) can still deadlock behind a queued writer.
+	 * DIRECTDATA is therefore enabled.
 	 */
 	/*
 	 * Another NetBSD specific problem is getnewbuf() via getblk() can
@@ -459,20 +463,16 @@ hammer2_chain_unhold(hammer2_chain_t *chain)
 			if (atomic_cmpset_64(&chain->lockcnt, lockcnt,
 			    lockcnt - 1))
 				break;
-		} else if (hammer2_mtx_owned(&chain->lock)) {
-			/*
-			 * XXX2 We already own the mutex: dropping and
-			 * re-acquiring it here can block if another thread
-			 * grabs the lock in the gap (upstream DragonFly has
-			 * the same shape with its mtx_unlock/mtx_lock).
-			 * Dormant today: only reached with lockcnt == 1
-			 * and the owner present, which no current call
-			 * site produces while another thread waits.
-			 */
-			hammer2_chain_unlock(chain);
-			hammer2_mtx_ex(&chain->lock);
-			break;
 		} else if (hammer2_mtx_ex_try(&chain->lock) == 0) {
+			/*
+			 * Upstream shape.  A try-lock by the LWP that already
+			 * owns the chain mutex SUCCEEDS recursively through the
+			 * hammer2_mtx shim (refs is bumped, no rw_enter), so no
+			 * "already owned" special case is needed: the closing
+			 * hammer2_chain_unlock() performs the 1->0 transition
+			 * (dropping the chain data) and one mtx unlock, leaving
+			 * the caller's own hold intact.
+			 */
 			hammer2_chain_unlock(chain);
 			break;
 		} else {
@@ -900,8 +900,12 @@ hammer2_chain_lock(hammer2_chain_t *chain, int how)
 		 * already holds the chain's mtx (shared, or exclusive for a
 		 * DIRECTDATA lookup in an exclusive traversal) and we are giving
 		 * it another logical ref.  This case must importantly not block
-		 * if there is a pending exclusive lock request -- and the NetBSD
-		 * rwlock shim must not be re-entered, hence the self credit.
+		 * if there is a pending exclusive lock request, and the extra
+		 * lockcnt ref must NOT be backed by another rwlock acquisition:
+		 * a shared recursive rw_enter(RW_READER) can deadlock behind a
+		 * queued writer, and chain lock accounting is driven by lockcnt
+		 * alone.  Hence the self credit (the shim's exclusive-recursion
+		 * emulation is irrelevant here -- chain locks never rely on it).
 		 */
 		if (how & HAMMER2_RESOLVE_LOCKAGAIN) {
 			KKASSERT(hammer2_mtx_sh_held(&chain->lock) ||

@@ -181,156 +181,17 @@ hammer2_lkc_wakeup(hammer2_lkc_t *c)
 }
 
 /*
- * Mutex and lock shims.  Hammer2 requires support for asynchronous and
- * abortable locks, and both exclusive and shared spinlocks.  Normal
- * synchronous non-abortable locks can be substituted for spinlocks.
- * NetBSD HAMMER2 currently uses rwlock(9) for both mtx and spinlock.
+ * Lock shims.  The recursive-exclusive hammer2_mtx_t emulation over
+ * rwlock(9) (struct krwlock_t_wrapper + hammer2_mtx_*) and its DIAGNOSTIC
+ * self-test live in hammer2_compat.h -- they are part of the DragonFly ->
+ * NetBSD compatibility layer.  The spin and lock/cv helpers below are
+ * plain OS glue and stay here.
+ *
+ * Hammer2 requires support for asynchronous and abortable locks, and
+ * both exclusive and shared spinlocks.  Normal synchronous non-abortable
+ * locks can be substituted for spinlocks.  NetBSD HAMMER2 currently uses
+ * rwlock(9) for both mtx and spinlock.
  */
-struct krwlock_t_wrapper {
-	krwlock_t lock;
-	int refs;
-};
-typedef struct krwlock_t_wrapper hammer2_mtx_t;
-
-static __inline void
-hammer2_mtx_init(hammer2_mtx_t *p, const char *s)
-{
-	bzero(p, sizeof(*p));
-	rw_init(&p->lock);
-}
-
-static __inline void
-hammer2_mtx_ex(hammer2_mtx_t *p)
-{
-	rw_enter(&p->lock, RW_WRITER);
-	atomic_add_int(&p->refs, 1);
-}
-
-static __inline void
-hammer2_mtx_sh(hammer2_mtx_t *p)
-{
-	rw_enter(&p->lock, RW_READER);
-	atomic_add_int(&p->refs, 1);
-}
-
-static __inline void
-hammer2_mtx_unlock(hammer2_mtx_t *p)
-{
-	atomic_add_int(&p->refs, -1);
-	rw_exit(&p->lock);
-}
-
-static __inline int
-hammer2_mtx_refs(hammer2_mtx_t *p)
-{
-	return (p->refs);
-}
-
-static __inline void
-hammer2_mtx_destroy(hammer2_mtx_t *p)
-{
-	rw_destroy(&p->lock);
-}
-
-/* Non-zero if exclusively locked by the calling thread. */
-static __inline int
-hammer2_mtx_owned(hammer2_mtx_t *p)
-{
-	return (rw_write_held(&p->lock));
-}
-
-/* Non-zero if shared-locked by the calling thread (read lock). */
-static __inline int
-hammer2_mtx_sh_held(hammer2_mtx_t *p)
-{
-	return (rw_read_held(&p->lock));
-}
-
-#ifdef INVARIANTS
-static __inline void
-hammer2_mtx_assert_ex(hammer2_mtx_t *p)
-{
-	KASSERT(rw_write_held(&p->lock));
-}
-
-static __inline void
-hammer2_mtx_assert_sh(hammer2_mtx_t *p)
-{
-	KASSERT(rw_read_held(&p->lock));
-}
-
-static __inline void
-hammer2_mtx_assert_locked(hammer2_mtx_t *p)
-{
-	KASSERT(rw_lock_held(&p->lock));
-}
-
-static __inline void
-hammer2_mtx_assert_unlocked(hammer2_mtx_t *p)
-{
-	KASSERT(!rw_lock_held(&p->lock));
-}
-#else
-#define hammer2_mtx_assert_ex(p)	do {} while (0)
-#define hammer2_mtx_assert_sh(p)	do {} while (0)
-#define hammer2_mtx_assert_locked(p)	do {} while (0)
-#define hammer2_mtx_assert_unlocked(p)	do {} while (0)
-#endif
-
-static __inline int
-hammer2_mtx_ex_try(hammer2_mtx_t *p)
-{
-	if (rw_tryenter(&p->lock, RW_WRITER)) {
-		atomic_add_int(&p->refs, 1);
-		return (0);
-	} else {
-		return (1);
-	}
-}
-
-static __inline int
-hammer2_mtx_sh_try(hammer2_mtx_t *p)
-{
-	if (rw_tryenter(&p->lock, RW_READER)) {
-		atomic_add_int(&p->refs, 1);
-		return (0);
-	} else {
-		return (1);
-	}
-}
-
-static __inline int
-hammer2_mtx_upgrade_try(hammer2_mtx_t *p)
-{
-	/* rw_tryupgrade() panics with DIAGNOSTIC if already ex-locked. */
-	if (hammer2_mtx_owned(p))
-		return (0);
-
-	if (rw_tryupgrade(&p->lock))
-		return (0);
-	else
-		return (1);
-}
-
-static __inline int
-hammer2_mtx_temp_release(hammer2_mtx_t *p)
-{
-	int x;
-
-	x = hammer2_mtx_owned(p);
-	hammer2_mtx_unlock(p);
-
-	return (x);
-}
-
-static __inline void
-hammer2_mtx_temp_restore(hammer2_mtx_t *p, int x)
-{
-	if (x)
-		hammer2_mtx_ex(p);
-	else
-		hammer2_mtx_sh(p);
-}
 
 typedef krwlock_t hammer2_spin_t;
 

@@ -95,6 +95,7 @@ hammer2_lk_t hammer2_mntlk;
 static int hammer2_supported_version = HAMMER2_VOL_VERSION_DEFAULT;
 int hammer2_debug;
 int hammer2_debug_scratch_fail;
+int hammer2_debug_selflock_test;
 uint64_t hammer2_dio_seq;
 long hammer2_process_icrc32;
 long hammer2_process_xxhash64;
@@ -140,6 +141,7 @@ int malloc_leak_m_temp;
 #define HAMMER2_SYSCTL_CLUSTER_META_READ	17
 #define HAMMER2_SYSCTL_CLUSTER_DATA_READ	18
 #define HAMMER2_SYSCTL_SCRATCH_FAIL		19
+#define HAMMER2_SYSCTL_SELFLOCK_TEST		20
 
 SYSCTL_SETUP(hammer2_sysctl_create, "hammer2 sysctl")
 {
@@ -332,6 +334,17 @@ SYSCTL_SETUP(hammer2_sysctl_create, "hammer2 sysctl")
 	if (error)
 		goto fail;
 
+	error = sysctl_createv(clog, 0, NULL, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE,
+	    CTLTYPE_INT, "selflock_test",
+	    SYSCTL_DESCR("Debug: force the syncer's final vput to be the "
+	    "last vnode reference (self-lock regression test, "
+	    "fw/syncselflock.py)"),
+	    NULL, 0, &hammer2_debug_selflock_test, 0,
+	    CTL_VFS, x, HAMMER2_SYSCTL_SELFLOCK_TEST, CTL_EOL);
+	if (error)
+		goto fail;
+
 	return;
 fail:
 	hprintf("sysctl_createv failed with error %d\n", error);
@@ -380,6 +393,7 @@ static void
 hammer2_init(void)
 {
 	hammer2_assert_clean();
+	hammer2_mtx_selftest();		/* DIAGNOSTIC: recursion shim */
 
 	/*
 	 * A large DIO cache is needed to retain dedup enablement masks.
@@ -1355,8 +1369,11 @@ next_hmp:
 		/* leave spmp->iroot with one ref */
 #ifdef HAMMER2_INVARIANTS
 		/*
-		 * XXX rwlock(9) says "Callers must not recursively acquire
-		 * read locks", so let's test it now.
+		 * Shared-mode recursion is NOT emulated by the hammer2_mtx
+		 * shim (upstream tracks no per-LWP shared depth either):
+		 * this is a bare rwlock(9) reader recursion, which works as
+		 * long as no writer is queued between the two acquires.
+		 * Keep the smoke test so that behavior stays exercised.
 		 */
 		hammer2_mtx_sh(&spmp->iroot->lock);
 		hammer2_mtx_sh(&spmp->iroot->lock);
@@ -2087,14 +2104,14 @@ hammer2_recovery_scan(hammer2_dev_t *hmp, hammer2_chain_t *parent,
 		 *
 		 * chain_scan() returned parent already locked (the scan
 		 * protocol keeps the returned chain locked until the
-		 * next iteration unlocks it), so we MUST NOT re-lock it
-		 * here: upstream's mtx_lock_ex is explicitly recursive
-		 * ("Recursion is allowed", sys/mutex2.h) but the NetBSD
-		 * rwlock shim is not -- a recursive exclusive acquire
-		 * aborts ("locking against myself", seen as a mount-time
-		 * lockdebug panic when recovery actually walks a tree,
-		 * e.g. after a SIGKILLed send/recv commit).  Load the
-		 * data directly under the lock we already hold.
+		 * next iteration unlocks it), so the data is loaded
+		 * directly under the lock we already hold.  Upstream
+		 * re-locks it recursively here (mtx_lock_ex is explicitly
+		 * recursive, "Recursion is allowed", sys/mutex2.h); the
+		 * port's hammer2_mtx shim emulates exclusive recursion as
+		 * well, but a second acquisition would only have to be
+		 * matched by an extra unlock for no gain, so the direct
+		 * call is a deliberate (and correct) port difference.
 		 */
 		if (parent->data == NULL)
 			hammer2_chain_load_data(parent);
@@ -2670,11 +2687,85 @@ restart:
 			} else {
 				hammer2_inode_delayed_sideq(ip);
 			}
+#ifdef DIAGNOSTIC
+			if (hammer2_debug_selflock_test) {
+				/*
+				 * fw/syncselflock.py fault injection: force
+				 * the last-ref vput state.  Release all
+				 * vhold refs first (outside ip->lock; the
+				 * vrele below cannot fire VOP_INACTIVE
+				 * because our own vref keeps the usecount
+				 * above zero), then wait -- still holding
+				 * ip->lock, which transient holders do not
+				 * need -- until our vref is the only
+				 * reference left.  The vput below is then
+				 * guaranteed to be the final vrele:
+				 * pre-fix kernels panicked "locking against
+				 * myself" in hammer2_inactive() called from
+				 * that vput; the fixed order runs
+				 * VOP_INACTIVE/VOP_RECLAIM in the unlocked
+				 * window.  Bounded wait; skips the round on
+				 * timeout.
+				 */
+				int ssl_waits;
+
+				if (ip->vhold) {
+					hammer2_mtx_unlock(&ip->lock);
+					hammer2_inode_vdrop(ip, vp, ip->vhold);
+					hammer2_mtx_ex(&ip->lock);
+				}
+				for (ssl_waits = 0;
+				    ssl_waits < 200 && vrefcnt(vp) > 1;
+				    ++ssl_waits)
+					tsleep(&hammer2_debug_selflock_test,
+					    0, "ssltest", 1);
+			}
+#endif
 			ndrop = ip->vhold;
+#ifdef DIAGNOSTIC
+			/*
+			 * fw/syncselflock.py probe marker: this vput is
+			 * about to drop the LAST vnode reference (no
+			 * vhold ref, no other holders left).  Pre-fix
+			 * kernels panic "locking against myself" in
+			 * hammer2_inactive() from exactly here, because
+			 * ip->lock was still held across the vput.
+			 */
+			if (ip->vhold == 0 && vrefcnt(vp) == 1)
+				hprintf("syncselflock: last-ref vput "
+				    "inum %016llx\n",
+				    (long long)ip->meta.inum);
+#endif
+			/*
+			 * The vput can drop the LAST vnode reference: the
+			 * inode's vhold ref is gone when the inode was
+			 * re-queued after an earlier pass without a new
+			 * modify (the vdrop below consumed it), and any
+			 * last external holder can exit while we flush.
+			 * VOP_INACTIVE/VOP_RECLAIM then take the inode lock
+			 * themselves, so ip->lock must NOT be held here.
+			 * Upstream DragonFly gets away with holding its
+			 * recursive mtx across the vput (hammer2_inode_lock
+			 * early-returns when the mtx is already held by the
+			 * caller).  The port's hammer2_mtx shim now emulates
+			 * that recursion as well, but this window is KEPT
+			 * deliberately: running VOP_INACTIVE/VOP_RECLAIM
+			 * without the syncer's exclusive inode lock is the
+			 * NetBSD-VFS-correct discipline, it keeps the
+			 * "INACTIVE never runs under the syncer's exclusive
+			 * inode lock" contract testable (fw/syncselflock.py),
+			 * and it matches the documented unlock/relock intent
+			 * in hammer2_inode_get().  Release the inode lock
+			 * across the vput + vdrop, the same window already
+			 * used for vflushbuf() above.  We still hold an
+			 * inode ref, so ip remains valid, and no path takes
+			 * ip->lock before the vnode lock, so the window
+			 * cannot self-deadlock.
+			 */
+			hammer2_mtx_unlock(&ip->lock);
 			vput(vp);
 			vp_held = 0;
-			hammer2_mtx_unlock(&ip->lock); /* XXX iplock */
-			hammer2_inode_vdrop(ip, ndrop);
+			hammer2_inode_vdrop(ip, vp, ndrop);
 			hammer2_mtx_ex(&ip->lock);
 			vp = NULL; /* safety */
 		} else if (vp) {

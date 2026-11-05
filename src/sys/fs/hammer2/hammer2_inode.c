@@ -251,18 +251,20 @@ hammer2_inode_lock(hammer2_inode_t *ip, int how)
 	 * ensure that meta-data dependencies such as the nlink count and
 	 * related directory entries are not split across flushes.
 	 *
-	 * Inode locking is NOT recursive in this port: the NetBSD rwlock
-	 * shim would self-deadlock on a second exclusive acquisition by
-	 * the same thread, so there is no recursive depth to detect here.
-	 * (Upstream DragonFly returns early when mtx refs > 1, i.e. when
-	 * the lock is already held by this thread.)  The KASSERT documents
-	 * the invariant: exactly one acquisition (ours) is live.
+	 * The lock is recursive for its exclusive owner: hammer2_mtx_ex()
+	 * bumps the recursion depth when this LWP already owns it (the
+	 * rwlock(9) shim in hammer2_os.h emulates DragonFly's mtx_lock_ex
+	 * recursion contract), so hammer2_mtx_refs() is the upstream
+	 * "number of references this thread holds" value.  A recursive
+	 * acquisition returns immediately without waiting on SYNCQ, which
+	 * is upstream's behavior verbatim.
 	 *
 	 * If the vnode is locked by the current thread it must be unlocked
 	 * across the tsleep() to avoid a deadlock.
 	 */
 	hammer2_mtx_ex(&ip->lock);
-	KKASSERT(hammer2_mtx_refs(&ip->lock) == 1);
+	if (hammer2_mtx_refs(&ip->lock) > 1)
+		return;
 	while ((ip->flags & HAMMER2_INODE_SYNCQ) && pmp) {
 		hammer2_spin_ex(&pmp->list_spin);
 		if (ip->flags & HAMMER2_INODE_SYNCQ) {
@@ -325,8 +327,19 @@ hammer2_inode_lock4(hammer2_inode_t *ip1, hammer2_inode_t *ip2,
 	for (i = 0; i < count; ++i)
 		hammer2_inode_ref(ips[i]);
 restart:
-	/* Lock the inodes in order. */
-	/* XXX iplock: NetBSD HAMMER2 inode lock can't recurse. */
+	/*
+	 * Lock the inodes in order.
+	 *
+	 * NetBSD-specific: duplicate inode pointers (rename with tdip ==
+	 * fdip) are locked only once.  The hammer2_mtx shim supports
+	 * exclusive recursion, so upstream's lock-every-entry shape would
+	 * also work, but deduping keeps the SYNCQ restart balanced (exactly
+	 * one unlock per acquisition) and avoids growing the recursion depth
+	 * on every restart.  Callers must not already hold a member
+	 * exclusively: the restart loop cannot release a recursive hold, so
+	 * a member stuck on SYNCQ would never be flushed (upstream has the
+	 * same property).
+	 */
 	iplk[0] = iplk[1] = iplk[2] = iplk[3] = NULL;
 	for (i = 0; i < count; ++i) {
 		iplkd = 0;
@@ -654,7 +667,16 @@ hammer2_igetv(hammer2_inode_t *ip, int lktype, struct vnode **vpp)
 	hammer2_assert_inode_meta(ip);
 	inum = ip->meta.inum; /* without HAMMER2_DIRHASH_USERMSK mask */
 
-	/* Unlock inode, otherwise deadlocks vs syscall processes. */
+	/*
+	 * Unlock inode, otherwise deadlocks vs syscall processes.
+	 *
+	 * NOTE: temp_release releases exactly ONE exclusive level (upstream
+	 * mtx_lock_temp_release() semantics).  If the caller happens to hold
+	 * the inode recursively the lock stays held across vcache_get(); no
+	 * live caller does that -- every igetv path arrives with a single
+	 * acquisition -- but recursive callers must not rely on this
+	 * window releasing the inode.
+	 */
 	ostate = hammer2_inode_lock_temp_release(ip);
 	error = vcache_get(mp, &inum, sizeof(inum), &vp);
 	hammer2_inode_lock_temp_restore(ip, ostate);
@@ -808,8 +830,11 @@ again:
 	 * ref and lock on nip gives it state compatible to after a
 	 * hammer2_inode_lock() call.
 	 * Note that hammer2_inactive() via vput() from hammer2_vfs_sync_pmp()
-	 * recursively locks ip->lock in DragonFly and FreeBSD, but in NetBSD
-	 * this gets unlocked once and relocked.
+	 * recursively locks ip->lock in DragonFly and FreeBSD; the port's
+	 * hammer2_mtx shim emulates exclusive recursion, but the syncer still
+	 * releases ip->lock across its final vput()/vdrop() (see the vput
+	 * window there) -- NetBSD-VFS-correct VOP_INACTIVE/VOP_RECLAIM
+	 * discipline, kept deliberately.
 	 * This unlock / relock also applies to hammer2_vfs_sync_pmp() ->
 	 * vflushbuf() -> VOP_PUTPAGES() -> genfs_compat_gop_write() ->
 	 * VOP_WRITE() -> hammer2_write_file().
@@ -1489,20 +1514,26 @@ hammer2_inode_vhold(hammer2_inode_t *ip)
  * This doesn't exist in DragonFly HAMMER2.
  */
 void
-hammer2_inode_vdrop(hammer2_inode_t *ip, int n)
+hammer2_inode_vdrop(hammer2_inode_t *ip, struct vnode *vp, int n)
 {
 	KKASSERT(ip->refs > 0);
 	KKASSERT(ip->vhold >= 0);
-	KKASSERT(ip->vp);
+	KKASSERT(vp != NULL || n == 0);
 
 	if (n > ip->vhold)
 		hpanic("arg %d > vhold %d", n, ip->vhold);
 
 	hammer2_mtx_ex(&ip->vhold_lock);
 	while (n > 0) {
-		vrele(ip->vp);
+		/*
+		 * vp is the caller's saved reference target.  Forced reclaim may
+		 * clear or replace ip->vp, but the reference still belongs to vp.
+		 * Caller must not hold the inode lock here (it is taken
+		 * recursively by the reclaim path).
+		 */
 		ip->vhold--;
 		n--;
+		vrele(vp);
 	}
 	KKASSERT(ip->vhold >= 0);
 	hammer2_mtx_unlock(&ip->vhold_lock);
